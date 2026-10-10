@@ -552,7 +552,7 @@ async def business_commands(message: Message, bot: Bot):
             pass
 
 
-@router.business_messages_deleted()
+@router.deleted_business_messages()
 async def business_deleted_handler(event: BusinessMessagesDeleted, bot: Bot):
     for mid in event.message_ids:
         row = await find_message(event.chat.id, mid)
@@ -642,7 +642,7 @@ async def roulette_spin(call: CallbackQuery):
     else:
         kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
             text="🔄 Крутить", callback_data=call.data)]])
-        await call.message.edit_text("😮💨 Щёлк! Повезло. Продолжить?", reply_markup=kb)
+        await call.message.edit_text("😮‍💨 Щёлк! Повезло. Продолжить?", reply_markup=kb)
     await call.answer()
 
 
@@ -713,6 +713,7 @@ async def guess_input(message: Message):
         await message.answer("Меньше ⬇️")
 
 
+@router.business_connection()
 async def business_connections_handler(connection: BusinessConnection, bot: Bot):
     # Placeholder hook: permissions are supplied by Telegram; commands fail gracefully if missing.
     log.info("Business connection %s, enabled=%s", connection.id, connection.is_enabled)
@@ -757,4 +758,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        pass 
+        pass
