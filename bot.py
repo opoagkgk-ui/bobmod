@@ -12,13 +12,13 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatAction, ParseMode
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
-from aiogram.filters import Command
+from aiogram.filters import Command, BaseFilter
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
-    BusinessConnection, BusinessMessagesDeleted, InputMediaPhoto, InputMediaVideo,
+    BusinessConnection, BusinessMessagesDeleted,
 )
 
-# Читаем существующий .env пользователя: API_TOKEN и OWNER_ID.
+# ---------- Config ----------
 load_dotenv()
 api_token = os.getenv("API_TOKEN", "").strip()
 try:
@@ -28,19 +28,21 @@ except ValueError:
 
 DB_PATH = "bot.db"
 KEEP_PER_CHAT = 100
-MUTE_NOTICE_SECONDS = 3
+MUTE_NOTICE_SECONDS = 4
+
 router = Router()
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("secretary")
 
-# In-memory state for simple interactive games; persisted settings/messages live in SQLite.
-guess_games = {}
-roulette_games = {}
-ttt_games = {}
-pending_settings = set()
+# ---------- In-memory state ----------
+guess_games = {}          # (chat_id, mid) -> {"number":int,"tries":int,"bc":str}
+roulette_games = {}       # (chat_id, mid) -> spins
+ttt_games = {}            # (chat_id, mid) -> board/turn/...
+pending_inputs = {}       # owner_id -> action
 name_update_lock = asyncio.Lock()
 
 
+# ---------- Utilities ----------
 def utcnow():
     return datetime.now(timezone.utc)
 
@@ -52,15 +54,30 @@ def local_now(tz_name="UTC"):
         return datetime.now(timezone.utc)
 
 
-def fmt_dt(dt):
-    return dt.astimezone().strftime("%Y-%m-%d %H:%M:%S")
-
-
 def esc(s):
-    # HTML escaping for user-controlled content.
     return (str(s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
 
 
+def code(s):
+    return f"<code>{esc(s)}</code>"
+
+
+# ---------- Custom filters ----------
+class HasPendingInput(BaseFilter):
+    async def __call__(self, message: Message) -> bool:
+        return message.from_user is not None and message.from_user.id in pending_inputs
+
+
+class GuessGameActive(BaseFilter):
+    async def __call__(self, message: Message) -> bool:
+        if not message.text:
+            return False
+        if not re.fullmatch(r"\d{1,3}", message.text.strip()):
+            return False
+        return any(k[0] == message.chat.id for k in guess_games)
+
+
+# ---------- Database ----------
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executescript("""
@@ -79,6 +96,7 @@ async def init_db():
         );
         CREATE INDEX IF NOT EXISTS idx_messages_chat_mid ON messages(chat_id, message_id);
         CREATE INDEX IF NOT EXISTS idx_messages_chat_date ON messages(chat_id, date);
+
         CREATE TABLE IF NOT EXISTS settings (
             user_id INTEGER PRIMARY KEY,
             answer_first_enabled INTEGER DEFAULT 0,
@@ -89,8 +107,7 @@ async def init_db():
             off_hours_start TEXT DEFAULT '22:00',
             off_hours_end TEXT DEFAULT '08:00',
             off_hours_text TEXT DEFAULT 'Сплю, отвечу утром',
-            autotranslate_enabled INTEGER DEFAULT 0,
-            translate_lang TEXT DEFAULT 'en'
+            forward_to_owner_enabled INTEGER DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS blacklist (user_id INTEGER PRIMARY KEY);
         CREATE TABLE IF NOT EXISTS mutes (
@@ -107,11 +124,17 @@ async def init_db():
             user_name TEXT,
             username TEXT
         );
+        CREATE TABLE IF NOT EXISTS notes (
+            chat_id INTEGER PRIMARY KEY,
+            note TEXT,
+            updated_at TEXT
+        );
         """)
         await db.commit()
 
 
-async def get_settings(user=owner_id):
+async def get_settings(user=None):
+    user = user if user is not None else owner_id
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute("SELECT * FROM settings WHERE user_id=?", (user,))
@@ -124,11 +147,12 @@ async def get_settings(user=owner_id):
         return dict(await cur.fetchone())
 
 
-async def set_setting(key, value, user=owner_id):
+async def set_setting(key, value, user=None):
+    user = user if user is not None else owner_id
     allowed = {
         "answer_first_enabled", "answer_first_text", "time_in_nick_enabled", "timezone",
         "off_hours_enabled", "off_hours_start", "off_hours_end", "off_hours_text",
-        "autotranslate_enabled", "translate_lang"
+        "forward_to_owner_enabled",
     }
     if key not in allowed:
         return
@@ -156,10 +180,27 @@ async def remove_blacklist(user_id):
         await db.commit()
 
 
+async def get_note(chat_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT note, updated_at FROM notes WHERE chat_id=?", (chat_id,))
+        row = await cur.fetchone()
+        return row
+
+
+async def set_note(chat_id, text):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO notes(chat_id,note,updated_at) VALUES(?,?,?) "
+            "ON CONFLICT(chat_id) DO UPDATE SET note=excluded.note, updated_at=excluded.updated_at",
+            (chat_id, text, utcnow().isoformat())
+        )
+        await db.commit()
+
+
+# ---------- Message payload helpers ----------
 def message_payload(message: Message):
     text = message.text or message.caption or ""
-    ctype = "text"
-    file_id = None
+    ctype, file_id = "text", None
     if message.photo:
         ctype, file_id = "photo", message.photo[-1].file_id
     elif message.video:
@@ -195,15 +236,17 @@ async def save_business_message(message: Message):
     display = (sender.full_name if sender else message.chat.full_name if message.chat else "Unknown")
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            """INSERT INTO messages(chat_id,message_id,user_id,user_name,text,content_type,media_file_id,date,is_outgoing)
+            """INSERT INTO messages(chat_id,message_id,user_id,user_name,text,content_type,
+                                     media_file_id,date,is_outgoing)
                VALUES(?,?,?,?,?,?,?,?,?)""",
             (chat_id, message.message_id, uid, display, text, ctype, file_id,
              message.date.isoformat() if message.date else utcnow().isoformat(), int(outgoing))
         )
-        # Keep last 100 by insertion order per chat.
-        await db.execute("""DELETE FROM messages WHERE chat_id=? AND id NOT IN
-                          (SELECT id FROM messages WHERE chat_id=? ORDER BY id DESC LIMIT ?)""",
-                         (chat_id, chat_id, KEEP_PER_CHAT))
+        await db.execute(
+            """DELETE FROM messages WHERE chat_id=? AND id NOT IN
+               (SELECT id FROM messages WHERE chat_id=? ORDER BY id DESC LIMIT ?)""",
+            (chat_id, chat_id, KEEP_PER_CHAT)
+        )
         await db.execute(
             """INSERT INTO contacts(chat_id,first_seen,message_count,user_id,user_name,username)
                VALUES(?,?,1,?,?,?)
@@ -225,34 +268,113 @@ async def find_message(chat_id, message_id):
         return dict(row) if row else None
 
 
+# ---------- Menus ----------
 def main_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⚙️ Настройки", callback_data="settings")],
-        [InlineKeyboardButton(text="📖 Помощь", callback_data="help")],
+        [InlineKeyboardButton(text="⚙️ Настройки", callback_data="menu:settings")],
+        [InlineKeyboardButton(text="📖 Помощь", callback_data="menu:help")],
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="menu:stats")],
     ])
+
+
+def back_button(target="menu:main"):
+    return [InlineKeyboardButton(text="⬅️ Назад", callback_data=target)]
 
 
 def settings_menu(s):
+    def flag(v): return "✅" if v else "❌"
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"💬 Ответ на первое: {'ВКЛ' if s['answer_first_enabled'] else 'ВЫКЛ'}", callback_data="set:first_toggle")],
-        [InlineKeyboardButton(text="✏️ Текст первого ответа", callback_data="set:first_text")],
-        [InlineKeyboardButton(text=f"🕐 Время в имени: {'ВКЛ' if s['time_in_nick_enabled'] else 'ВЫКЛ'}", callback_data="set:name_toggle")],
-        [InlineKeyboardButton(text=f"🌍 Часовой пояс: {s['timezone']}", callback_data="set:timezone")],
-        [InlineKeyboardButton(text=f"🌙 Автоответ вне часов: {'ВКЛ' if s['off_hours_enabled'] else 'ВЫКЛ'}", callback_data="set:off_toggle")],
-        [InlineKeyboardButton(text="🕒 Часы автоответа", callback_data="set:off_hours")],
-        [InlineKeyboardButton(text="✏️ Текст автоответа", callback_data="set:off_text")],
-        [InlineKeyboardButton(text=f"🌐 Автоперевод: {'ВКЛ' if s['autotranslate_enabled'] else 'ВЫКЛ'}", callback_data="set:translate_toggle")],
-        [InlineKeyboardButton(text="🌐 Язык перевода", callback_data="set:lang")],
-        [InlineKeyboardButton(text="🚷 Чёрный список", callback_data="set:blacklist")],
+        [InlineKeyboardButton(text="💬 Ответы на первое сообщение", callback_data="menu:sec:first")],
+        [InlineKeyboardButton(text="🕐 Имя и расписание", callback_data="menu:sec:schedule")],
+        [InlineKeyboardButton(text="🚫 Приватность", callback_data="menu:sec:privacy")],
+        [InlineKeyboardButton(text="📥 Пересылка владельцу", callback_data="menu:sec:forward")],
+        back_button(),
     ])
 
+
+def settings_first(s):
+    def flag(v): return "✅ ВКЛ" if v else "❌ ВЫКЛ"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"💬 Автоответ на первое: {flag(s['answer_first_enabled'])}",
+                              callback_data="toggle:answer_first_enabled")],
+        [InlineKeyboardButton(text="✏️ Изменить текст", callback_data="prompt:answer_first_text")],
+        [InlineKeyboardButton(text=f"📄 Текущий: {(s['answer_first_text'] or '—')[:40]}",
+                              callback_data="noop")],
+        back_button("menu:settings"),
+    ])
+
+
+def settings_schedule(s):
+    def flag(v): return "✅ ВКЛ" if v else "❌ ВЫКЛ"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"🕐 Время в имени: {flag(s['time_in_nick_enabled'])}",
+                              callback_data="toggle:time_in_nick_enabled")],
+        [InlineKeyboardButton(text=f"🌍 Часовой пояс: {s['timezone']}",
+                              callback_data="prompt:timezone")],
+        [InlineKeyboardButton(text=f"🌙 Автоответ вне часов: {flag(s['off_hours_enabled'])}",
+                              callback_data="toggle:off_hours_enabled")],
+        [InlineKeyboardButton(text=f"🕒 Часы: {s['off_hours_start']}–{s['off_hours_end']}",
+                              callback_data="prompt:off_hours")],
+        [InlineKeyboardButton(text="✏️ Текст автоответа", callback_data="prompt:off_hours_text")],
+        back_button("menu:settings"),
+    ])
+
+
+def settings_privacy(s):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🚫 Чёрный список", callback_data="menu:blacklist")],
+        back_button("menu:settings"),
+    ])
+
+
+def settings_forward(s):
+    def flag(v): return "✅ ВКЛ" if v else "❌ ВЫКЛ"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"📥 Пересылать сообщения владельцу: {flag(s['forward_to_owner_enabled'])}",
+                              callback_data="toggle:forward_to_owner_enabled")],
+        [InlineKeyboardButton(text="ℹ️ Куда приходят уведомления",
+                              callback_data="noop")],
+        back_button("menu:settings"),
+    ])
+
+
+async def render_settings(msg_or_call, edit=False):
+    s = await get_settings()
+    text = (
+        "⚙️ <b>Настройки секретаря</b>\n"
+        "<i>Выбери раздел для настройки</i>\n\n"
+        f"💬 Первый ответ: {'✅' if s['answer_first_enabled'] else '❌'}\n"
+        f"🕐 Время в имени: {'✅' if s['time_in_nick_enabled'] else '❌'}\n"
+        f"🌍 Пояс: <code>{esc(s['timezone'])}</code>\n"
+        f"🌙 Автоответ: {'✅' if s['off_hours_enabled'] else '❌'} "
+        f"({esc(s['off_hours_start'])}–{esc(s['off_hours_end'])})\n"
+        f"📥 Пересылка владельцу: {'✅' if s['forward_to_owner_enabled'] else '❌'}"
+    )
+    kb = settings_menu(s)
+    if edit:
+        try:
+            await msg_or_call.edit_text(text, reply_markup=kb)
+        except TelegramBadRequest:
+            await msg_or_call.answer(text, reply_markup=kb)
+    else:
+        await msg_or_call.answer(text, reply_markup=kb)
+
+
+# ============================================================
+# PRIVATE HANDLERS (owner)
+# ============================================================
 
 @router.message(Command("start"))
 async def cmd_start(message: Message):
     await get_settings()
     await message.answer(
-        "Привет! Я бизнес-бот «Секретарь».\nИспользуй меню ниже для настроек.\n\n"
-        "Команды в бизнес-чатах начинаются с точки: .help, .whois, .typing, .mute, .unmute, .game.",
+        "👋 <b>Привет! Я твой бизнес-секретарь.</b>\n\n"
+        "Я работаю в <b>Telegram Business</b> чатах:\n"
+        "• отвечаю первым сообщением\n"
+        "• предупреждаю о нерабочих часах\n"
+        "• сохраняю удалённые сообщения\n"
+        "• выполняю команды через точку\n\n"
+        "<i>Подключи меня в Настройки → Telegram Business → Чат-автоматизация</i>",
         reply_markup=main_menu()
     )
 
@@ -260,19 +382,34 @@ async def cmd_start(message: Message):
 @router.message(Command("help"))
 async def cmd_help(message: Message):
     await message.answer(
-        "<b>Справка</b>\n/start — меню\n/help — справка\n/settings — настройки\n"
-        "/stats — статистика владельцу\n\n"
-        "В подключённых Business-чатах: .help, .whois, .typing, .mute 60, .unmute, .game."
+        "<b>📖 Помощь</b>\n\n"
+        "<b>Владельцу в личке:</b>\n"
+        "/start — меню\n"
+        "/help — эта справка\n"
+        "/settings — настройки\n"
+        "/stats — статистика\n\n"
+        "<b>Команды в Business-чатах</b> (пишутся с точки):\n"
+        "<code>.help</code> — список\n"
+        "<code>.whois</code> — карточка собеседника\n"
+        "<code>.typing</code> — показать «печатает»\n"
+        "<code>.mute 60</code> — мут на 60 сек\n"
+        "<code>.unmute</code> — снять мут\n"
+        "<code>.muted</code> — список мутов\n"
+        "<code>.id</code> — технические ID\n"
+        "<code>.note текст</code> — заметка о чате\n"
+        "<code>.note</code> — показать заметку\n"
+        "<code>.ping</code> — проверить бота\n"
+        "<code>.game</code> — игры",
+        reply_markup=main_menu()
     )
 
 
 @router.message(Command("settings"))
 async def cmd_settings(message: Message):
     if message.from_user and message.from_user.id != owner_id:
-        await message.answer("Настройки доступны только владельцу.")
+        await message.answer("⛔ Настройки доступны только владельцу.")
         return
-    s = await get_settings()
-    await message.answer("⚙️ Настройки секретаря:", reply_markup=settings_menu(s))
+    await render_settings(message)
 
 
 @router.message(Command("stats"))
@@ -287,73 +424,198 @@ async def cmd_stats(message: Message):
         chats = await count("SELECT COUNT(*) FROM contacts")
         blacklisted = await count("SELECT COUNT(*) FROM blacklist")
         mutes = await count("SELECT COUNT(*) FROM mutes")
-    await message.answer(f"📊 <b>Статистика</b>\nСообщений в архиве: {messages}\nКонтактов: {chats}\n"
-                         f"В чёрном списке: {blacklisted}\nАктивных/сохранённых мутов: {mutes}")
+        notes = await count("SELECT COUNT(*) FROM notes")
+    await message.answer(
+        "📊 <b>Статистика</b>\n"
+        "─────────────────\n"
+        f"💾 Сообщений в архиве: <b>{messages}</b>\n"
+        f"👥 Контактов: <b>{chats}</b>\n"
+        f"🚫 В чёрном списке: <b>{blacklisted}</b>\n"
+        f"🔇 Активных мутов: <b>{mutes}</b>\n"
+        f"📝 Заметок: <b>{notes}</b>"
+    )
 
 
-@router.callback_query(F.data == "help")
-async def cb_help(call: CallbackQuery):
+@router.message(Command("ping"))
+async def cmd_ping(message: Message):
+    if not message.from_user or message.from_user.id != owner_id:
+        return
+    await message.answer("🏓 Pong! Бот на связи.")
+
+
+# ----- Menu callbacks (private) -----
+@router.callback_query(F.data == "noop")
+async def cb_noop(call: CallbackQuery):
+    await call.answer()
+
+
+@router.callback_query(F.data == "menu:main")
+async def cb_menu_main(call: CallbackQuery):
+    if call.from_user.id != owner_id:
+        await call.answer("Только владелец", show_alert=True)
+        return
     await call.message.edit_text(
-        "<b>Команды</b>\n.help — список\n.whois — карточка контакта\n.typing — эффект печати\n"
-        ".mute 60 — мут на 60 секунд\n.unmute — снять мут\n.game — меню игр",
+        "🏠 <b>Главное меню</b>\n<i>Выбери действие</i>",
         reply_markup=main_menu()
     )
     await call.answer()
 
 
-@router.callback_query(F.data == "settings")
-async def cb_settings(call: CallbackQuery):
-    if not call.from_user or call.from_user.id != owner_id:
+@router.callback_query(F.data == "menu:help")
+async def cb_menu_help(call: CallbackQuery):
+    if call.from_user.id != owner_id:
         await call.answer("Только владелец", show_alert=True)
         return
-    await call.message.edit_text("⚙️ Настройки секретаря:", reply_markup=settings_menu(await get_settings()))
+    await call.message.edit_text(
+        "<b>📖 Помощь</b>\n\n"
+        "В Business-чатах используй команды с точкой:\n"
+        "<code>.help</code> · <code>.whois</code> · <code>.typing</code>\n"
+        "<code>.mute 60</code> · <code>.unmute</code> · <code>.muted</code>\n"
+        "<code>.id</code> · <code>.note</code> · <code>.ping</code> · <code>.game</code>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[back_button()])
+    )
     await call.answer()
 
 
-@router.callback_query(F.data.startswith("set:"))
-async def cb_setting(call: CallbackQuery):
-    if not call.from_user or call.from_user.id != owner_id:
+@router.callback_query(F.data == "menu:stats")
+async def cb_menu_stats(call: CallbackQuery):
+    if call.from_user.id != owner_id:
+        await call.answer("Только владелец", show_alert=True)
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        async def count(q):
+            cur = await db.execute(q)
+            return (await cur.fetchone())[0]
+        messages = await count("SELECT COUNT(*) FROM messages")
+        chats = await count("SELECT COUNT(*) FROM contacts")
+        blacklisted = await count("SELECT COUNT(*) FROM blacklist")
+        mutes = await count("SELECT COUNT(*) FROM mutes")
+    await call.message.edit_text(
+        "📊 <b>Статистика</b>\n"
+        "─────────────────\n"
+        f"💾 Сообщений: <b>{messages}</b>\n"
+        f"👥 Контактов: <b>{chats}</b>\n"
+        f"🚫 В ЧС: <b>{blacklisted}</b>\n"
+        f"🔇 Мутов: <b>{mutes}</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[back_button()])
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data == "menu:settings")
+async def cb_menu_settings(call: CallbackQuery):
+    if call.from_user.id != owner_id:
+        await call.answer("Только владелец", show_alert=True)
+        return
+    await render_settings(call.message, edit=True)
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("menu:sec:"))
+async def cb_section(call: CallbackQuery):
+    if call.from_user.id != owner_id:
+        await call.answer("Только владелец", show_alert=True)
+        return
+    section = call.data.split(":", 2)[2]
+    s = await get_settings()
+    if section == "first":
+        text = "💬 <b>Первый ответ</b>\n<i>Бот отвечает на самое первое сообщение в новом чате</i>"
+        kb = settings_first(s)
+    elif section == "schedule":
+        text = "🕐 <b>Расписание</b>\n<i>Время в имени и автоответ вне рабочих часов</i>"
+        kb = settings_schedule(s)
+    elif section == "privacy":
+        text = "🚫 <b>Приватность</b>\n<i>Чёрный список пользователей</i>"
+        kb = settings_privacy(s)
+    elif section == "forward":
+        text = "📥 <b>Пересылка владельцу</b>\n<i>Дублировать сообщения клиентов тебе в личку</i>"
+        kb = settings_forward(s)
+    else:
+        await call.answer("Неизвестный раздел", show_alert=True)
+        return
+    try:
+        await call.message.edit_text(text, reply_markup=kb)
+    except TelegramBadRequest:
+        await call.message.answer(text, reply_markup=kb)
+    await call.answer()
+
+
+@router.callback_query(F.data == "menu:blacklist")
+async def cb_blacklist(call: CallbackQuery):
+    if call.from_user.id != owner_id:
+        await call.answer("Только владелец", show_alert=True)
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT user_id FROM blacklist ORDER BY user_id LIMIT 30")
+        rows = await cur.fetchall()
+    listing = "\n".join(f"• <code>{r[0]}</code>" for r in rows) if rows else "<i>Пусто</i>"
+    await call.message.edit_text(
+        f"🚫 <b>Чёрный список</b>\n{listing}\n\n"
+        "Отправь <code>ID</code> чтобы добавить, или <code>-ID</code> чтобы удалить.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="➕ Добавить", callback_data="prompt:blacklist_add")],
+            [InlineKeyboardButton(text="➖ Удалить", callback_data="prompt:blacklist_remove")],
+            back_button("menu:settings"),
+        ])
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("toggle:"))
+async def cb_toggle(call: CallbackQuery):
+    if call.from_user.id != owner_id:
+        await call.answer("Только владелец", show_alert=True)
+        return
+    key = call.data.split(":", 1)[1]
+    s = await get_settings()
+    if key not in s:
+        await call.answer("Неизвестный параметр", show_alert=True)
+        return
+    new_val = 0 if s[key] else 1
+    await set_setting(key, new_val)
+    s = await get_settings()
+    # Re-render current section
+    if key in {"answer_first_enabled", "answer_first_text"}:
+        await call.message.edit_text("💬 <b>Первый ответ</b>", reply_markup=settings_first(s))
+    elif key in {"time_in_nick_enabled", "off_hours_enabled", "off_hours_start", "off_hours_end", "off_hours_text", "timezone"}:
+        await call.message.edit_text("🕐 <b>Расписание</b>", reply_markup=settings_schedule(s))
+    elif key == "forward_to_owner_enabled":
+        await call.message.edit_text("📥 <b>Пересылка владельцу</b>", reply_markup=settings_forward(s))
+    await call.answer("✅ Сохранено")
+
+
+@router.callback_query(F.data.startswith("prompt:"))
+async def cb_prompt(call: CallbackQuery):
+    if call.from_user.id != owner_id:
         await call.answer("Только владелец", show_alert=True)
         return
     action = call.data.split(":", 1)[1]
-    s = await get_settings()
-    if action == "first_toggle":
-        await set_setting("answer_first_enabled", 0 if s["answer_first_enabled"] else 1)
-    elif action == "name_toggle":
-        await set_setting("time_in_nick_enabled", 0 if s["time_in_nick_enabled"] else 1)
-    elif action == "off_toggle":
-        await set_setting("off_hours_enabled", 0 if s["off_hours_enabled"] else 1)
-    elif action == "translate_toggle":
-        await set_setting("autotranslate_enabled", 0 if s["autotranslate_enabled"] else 1)
-    elif action in {"first_text", "off_text", "off_hours", "timezone", "lang", "blacklist"}:
-        prompts = {
-            "first_text": "Отправь следующим сообщением текст первого ответа.",
-            "off_text": "Отправь следующим сообщением текст автоответа.",
-            "off_hours": "Отправь часы в формате ЧЧ:ММ-ЧЧ:ММ, например 22:00-08:00.",
-            "timezone": "Отправь часовой пояс из IANA, например Europe/Moscow или Europe/Stockholm.",
-            "lang": "Отправь код языка перевода, например en, ru, de, fr.",
-            "blacklist": "Отправь user_id чтобы добавить в чёрный список, либо -ID чтобы удалить. Оттуда сообщения не сохраняются."
-        }
-        pending_settings.add(action)
-        await call.message.answer(prompts[action])
+    prompts = {
+        "answer_first_text": "✏️ Отправь <b>текст первого ответа</b> следующим сообщением.",
+        "off_hours_text": "✏️ Отправь <b>текст автоответа</b> следующим сообщением.",
+        "off_hours": "🕒 Отправь часы в формате <code>ЧЧ:ММ-ЧЧ:ММ</code>, например <code>22:00-08:00</code>.",
+        "timezone": "🌍 Отправь часовой пояс IANA, например <code>Europe/Moscow</code>.",
+        "blacklist_add": "🚫 Отправь <code>user_id</code> для добавления в чёрный список.",
+        "blacklist_remove": "➖ Отправь <code>user_id</code> для удаления из чёрного списка.",
+    }
+    if action not in prompts:
         await call.answer()
         return
-    await call.message.edit_reply_markup(reply_markup=settings_menu(await get_settings()))
-    await call.answer("Сохранено")
+    pending_inputs[owner_id] = action
+    await call.message.answer(prompts[action])
+    await call.answer()
 
 
-@router.message(F.chat.type == "private", F.from_user.id == owner_id, ~F.text.startswith("/"))
+@router.message(F.chat.type == "private", F.from_user.id == owner_id, HasPendingInput())
 async def receive_setting_value(message: Message):
-    if not pending_settings:
+    action = pending_inputs.pop(owner_id, None)
+    if not action:
         return
-    # A single owner can have only one pending prompt at a time.
-    action = next(iter(pending_settings))
-    pending_settings.discard(action)
     value = (message.text or "").strip()
     try:
-        if action == "first_text":
+        if action == "answer_first_text":
             await set_setting("answer_first_text", value)
-        elif action == "off_text":
+        elif action == "off_hours_text":
             await set_setting("off_hours_text", value)
         elif action == "off_hours":
             m = re.fullmatch(r"(\d{2}:\d{2})\s*-\s*(\d{2}:\d{2})", value)
@@ -366,42 +628,251 @@ async def receive_setting_value(message: Message):
         elif action == "timezone":
             ZoneInfo(value)
             await set_setting("timezone", value)
-        elif action == "lang":
-            if not re.fullmatch(r"[a-zA-Z-]{2,12}", value):
-                raise ValueError("Укажи код языка, например en")
-            await set_setting("translate_lang", value.lower())
-        elif action == "blacklist":
+        elif action in {"blacklist_add", "blacklist_remove"}:
             target = int(value)
-            if target < 0:
-                await remove_blacklist(abs(target))
-                await message.answer(f"ID {abs(target)} удалён из чёрного списка.")
-            else:
+            if action == "blacklist_add":
                 await add_blacklist(target)
-                await message.answer(f"ID {target} добавлен в чёрный список.")
+                await message.answer(f"🚫 ID <code>{target}</code> добавлен.")
+            else:
+                await remove_blacklist(target)
+                await message.answer(f"✅ ID <code>{target}</code> удалён.")
             return
-        await message.answer("Настройка сохранена.")
+        await message.answer("✅ <b>Настройка сохранена</b>")
     except Exception as e:
-        await message.answer(f"Не удалось сохранить: {esc(e)}")
-    await message.answer("⚙️ Настройки:", reply_markup=settings_menu(await get_settings()))
+        await message.answer(f"⚠️ Не удалось сохранить: {esc(e)}")
+    await render_settings(message)
 
 
+# ============================================================
+# BUSINESS HANDLERS (order matters!)
+# ============================================================
+
+# 1) Dot-commands — должно быть ДО общего business_message
+@router.business_message(F.text.regexp(r"^\."))
+async def business_commands(message: Message, bot: Bot):
+    await save_business_message(message)
+    if not message.from_user or message.from_user.id != owner_id:
+        return
+    if not message.business_connection_id:
+        return
+
+    raw = (message.text or "").strip()
+    parts = raw.split(maxsplit=1)
+    cmd = parts[0].lower()
+    arg = parts[1].strip() if len(parts) > 1 else ""
+    chat_id = message.chat.id
+    bc = message.business_connection_id
+    mid = message.message_id
+
+    async def edit(text, kb=None):
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id, message_id=mid, text=text,
+                business_connection_id=bc, reply_markup=kb
+            )
+        except TelegramBadRequest as e:
+            log.warning("edit failed: %s", e)
+
+    try:
+        if cmd == ".help":
+            await edit(
+                "🤖 <b>Секретарь — команды</b>\n"
+                "─────────────────\n"
+                "<code>.help</code> · список команд\n"
+                "<code>.whois</code> · карточка собеседника\n"
+                "<code>.typing</code> · эффект «печатает»\n"
+                "<code>.mute 60</code> · мут на 60 сек\n"
+                "<code>.unmute</code> · снять мут\n"
+                "<code>.muted</code> · список мутов\n"
+                "<code>.id</code> · техническая информация\n"
+                "<code>.note текст</code> · сохранить заметку\n"
+                "<code>.note</code> · показать заметку\n"
+                "<code>.ping</code> · проверка связи\n"
+                "<code>.game</code> · игры"
+            )
+        elif cmd == ".ping":
+            await edit("🏓 <b>Pong!</b> Бот на связи.")
+        elif cmd == ".id":
+            await edit(
+                "🆔 <b>Технические ID</b>\n"
+                "─────────────────\n"
+                f"💬 Чат: <code>{chat_id}</code>\n"
+                f"👤 Ты: <code>{message.from_user.id}</code>\n"
+                f"🔗 Соединение: <code>{esc(bc)}</code>"
+            )
+        elif cmd == ".whois":
+            async with aiosqlite.connect(DB_PATH) as db:
+                db.row_factory = aiosqlite.Row
+                cur = await db.execute("SELECT * FROM contacts WHERE chat_id=?", (chat_id,))
+                row = await cur.fetchone()
+            if not row:
+                await edit("👤 Карточка пока пуста — нет сохранённой истории.")
+            else:
+                first = "—"
+                try:
+                    first = datetime.fromisoformat(row["first_seen"]).astimezone().strftime("%d.%m.%Y %H:%M")
+                except Exception:
+                    pass
+                uname = f"@{esc(row['username'])}" if row["username"] else "—"
+                await edit(
+                    "👤 <b>Карточка собеседника</b>\n"
+                    "─────────────────\n"
+                    f"📛 Имя: <b>{esc(row['user_name'])}</b>\n"
+                    f"🆔 ID: <code>{row['user_id']}</code>\n"
+                    f"🔗 Username: {uname}\n"
+                    f"📅 Первый контакт: {esc(first)}\n"
+                    f"💬 Сообщений: <b>{row['message_count']}</b>"
+                )
+        elif cmd == ".typing":
+            try:
+                await bot.send_chat_action(
+                    chat_id=chat_id, action=ChatAction.TYPING, business_connection_id=bc
+                )
+            except Exception:
+                pass
+            await edit("⌨️ <i>Печатает…</i>")
+        elif cmd == ".note":
+            if not arg:
+                row = await get_note(chat_id)
+                if row and row[0]:
+                    await edit(f"📝 <b>Заметка о чате</b>\n\n{esc(row[0])}")
+                else:
+                    await edit("📝 Заметки пока нет.\nИспользуй <code>.note текст</code> для сохранения.")
+            else:
+                await set_note(chat_id, arg)
+                await edit(f"📝 <b>Заметка сохранена:</b>\n\n{esc(arg)}")
+        elif cmd.startswith(".mute"):
+            seconds = 60
+            target = None
+            tokens = arg.split()
+            if tokens:
+                try:
+                    seconds = max(1, min(int(tokens[0]), 86400))
+                except ValueError:
+                    pass
+            if len(tokens) > 1:
+                try:
+                    target = int(tokens[1])
+                except ValueError:
+                    pass
+            if target is None:
+                async with aiosqlite.connect(DB_PATH) as db:
+                    cur = await db.execute(
+                        "SELECT user_id FROM messages WHERE chat_id=? AND user_id IS NOT NULL "
+                        "AND user_id!=? ORDER BY id DESC LIMIT 1",
+                        (chat_id, owner_id)
+                    )
+                    row = await cur.fetchone()
+                if not row:
+                    await edit("⚠️ Не удалось определить собеседника. Укажи ID: <code>.mute 60 123456</code>")
+                    return
+                target = row[0]
+            until = utcnow() + timedelta(seconds=seconds)
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute(
+                    "INSERT OR REPLACE INTO mutes(chat_id,target_user_id,mute_until) VALUES(?,?,?)",
+                    (chat_id, target, until.isoformat())
+                )
+                await db.commit()
+            await edit(f"🔇 <b>Мут установлен</b>\nПользователь: <code>{target}</code>\nДо: {until.astimezone().strftime('%H:%M:%S')} ({seconds} сек)")
+        elif cmd == ".unmute":
+            async with aiosqlite.connect(DB_PATH) as db:
+                cur = await db.execute(
+                    "SELECT user_id FROM messages WHERE chat_id=? AND user_id IS NOT NULL "
+                    "AND user_id!=? ORDER BY id DESC LIMIT 1",
+                    (chat_id, owner_id)
+                )
+                row = await cur.fetchone()
+                if row:
+                    await db.execute("DELETE FROM mutes WHERE chat_id=? AND target_user_id=?",
+                                     (chat_id, row[0]))
+                    await db.commit()
+            await edit("🔊 <b>Мут снят</b>")
+        elif cmd == ".muted":
+            async with aiosqlite.connect(DB_PATH) as db:
+                cur = await db.execute(
+                    "SELECT target_user_id, mute_until FROM mutes WHERE chat_id=? "
+                    "AND mute_until > ? ORDER BY mute_until",
+                    (chat_id, utcnow().isoformat())
+                )
+                rows = await cur.fetchall()
+            if not rows:
+                await edit("🔊 Активных мутов нет.")
+            else:
+                lines = []
+                for uid, until in rows:
+                    try:
+                        t = datetime.fromisoformat(until).astimezone().strftime("%H:%M:%S")
+                    except Exception:
+                        t = "—"
+                    lines.append(f"• <code>{uid}</code> до {t}")
+                await edit("🔇 <b>Активные муты</b>\n\n" + "\n".join(lines))
+        elif cmd == ".game":
+            await edit(
+                "🎮 <b>Выбери игру</b>",
+                InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="🔫 Русская рулетка",
+                                          callback_data=f"game:roulette:{chat_id}:{bc}")],
+                    [InlineKeyboardButton(text="⭕❌ Крестики-нолики",
+                                          callback_data=f"game:ttt:{chat_id}:{bc}")],
+                    [InlineKeyboardButton(text="🎲 Угадай число",
+                                          callback_data=f"game:guess:{chat_id}:{bc}")],
+                ])
+            )
+        else:
+            await edit("❓ Неизвестная команда. Напиши <code>.help</code>")
+
+    except (TelegramBadRequest, TelegramForbiddenError) as e:
+        log.warning("Business command failed: %s", e)
+        try:
+            await bot.send_message(owner_id, f"⚠️ Команда <code>{esc(cmd)}</code> не выполнена: {esc(e)}")
+        except Exception:
+            pass
+
+
+# 2) Guess number input — до общего
+@router.business_message(GuessGameActive())
+async def guess_input(message: Message):
+    await save_business_message(message)
+    if not message.from_user:
+        return
+    chat_id = message.chat.id
+    active = [(k, v) for k, v in guess_games.items() if k[0] == chat_id]
+    if not active:
+        return
+    key, game = active[-1]
+    try:
+        guess = int(message.text)
+    except (ValueError, TypeError):
+        return
+    if not 1 <= guess <= 100:
+        return
+    game["tries"] += 1
+    if guess == game["number"]:
+        await message.answer(f"🎉 <b>Верно!</b> Число <b>{guess}</b>. Попыток: {game['tries']}.")
+        guess_games.pop(key, None)
+    elif guess < game["number"]:
+        await message.answer("⬆️ Больше")
+    else:
+        await message.answer("⬇️ Меньше")
+
+
+# 3) Общий обработчик — ПОСЛЕДНИМ
 @router.business_message()
 async def business_message_handler(message: Message, bot: Bot):
-    # Business updates are available only for connections whose owner granted relevant rights.
     await save_business_message(message)
     if not message.business_connection_id:
         return
     sender = message.from_user
-    if not sender:
-        return
-    # Don't react to owner's outgoing messages.
-    if sender.id == owner_id:
+    if not sender or sender.id == owner_id:
         return
 
-    # Mute handling: delete incoming message if API rights allow it.
+    # Mute: удаление и уведомление
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT mute_until FROM mutes WHERE chat_id=? AND target_user_id=?",
-                               (message.chat.id, sender.id))
+        cur = await db.execute(
+            "SELECT mute_until FROM mutes WHERE chat_id=? AND target_user_id=?",
+            (message.chat.id, sender.id)
+        )
         row = await cur.fetchone()
     if row:
         try:
@@ -414,144 +885,86 @@ async def business_message_handler(message: Message, bot: Bot):
                     )
                 except Exception:
                     pass
-                notice = await bot.send_message(
-                    chat_id=message.chat.id,
-                    text=f"Вы замучены до {until.astimezone().strftime('%H:%M:%S')}",
-                    business_connection_id=message.business_connection_id
-                )
-                async def delete_notice():
-                    await asyncio.sleep(MUTE_NOTICE_SECONDS)
-                    try:
-                        await bot.delete_business_messages(
-                            business_connection_id=message.business_connection_id,
-                            message_ids=[notice.message_id]
-                        )
-                    except Exception:
-                        pass
-                asyncio.create_task(delete_notice())
+                try:
+                    notice = await bot.send_message(
+                        chat_id=message.chat.id,
+                        text=f"🔇 <i>Пользователь в муте до {until.astimezone().strftime('%H:%M:%S')}</i>",
+                        business_connection_id=message.business_connection_id
+                    )
+                    async def _del():
+                        await asyncio.sleep(MUTE_NOTICE_SECONDS)
+                        try:
+                            await bot.delete_business_messages(
+                                business_connection_id=message.business_connection_id,
+                                message_ids=[notice.message_id]
+                            )
+                        except Exception:
+                            pass
+                    asyncio.create_task(_del())
+                except Exception:
+                    pass
                 return
             async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute("DELETE FROM mutes WHERE chat_id=? AND target_user_id=?", (message.chat.id, sender.id))
+                await db.execute("DELETE FROM mutes WHERE chat_id=? AND target_user_id=?",
+                                 (message.chat.id, sender.id))
                 await db.commit()
         except Exception:
             pass
 
     s = await get_settings()
-    # First incoming message in this chat.
+
+    # Первый ответ
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("SELECT message_count FROM contacts WHERE chat_id=?", (message.chat.id,))
-        row = await cur.fetchone()
-    count = row[0] if row else 1
+        cnt_row = await cur.fetchone()
+    count = cnt_row[0] if cnt_row else 1
     if count == 1 and s["answer_first_enabled"] and s["answer_first_text"]:
         try:
-            await bot.send_message(message.chat.id, s["answer_first_text"],
-                                   business_connection_id=message.business_connection_id)
+            await bot.send_message(
+                message.chat.id, s["answer_first_text"],
+                business_connection_id=message.business_connection_id
+            )
         except Exception as e:
             log.info("First reply unavailable: %s", e)
 
-    # Off-hours auto-reply.
+    # Автоответ вне часов
     if s["off_hours_enabled"]:
         now = local_now(s["timezone"]).strftime("%H:%M")
         start, end = s["off_hours_start"], s["off_hours_end"]
         is_off = (start <= now < end) if start <= end else (now >= start or now < end)
         if is_off:
             try:
-                await bot.send_message(message.chat.id, s["off_hours_text"],
-                                       business_connection_id=message.business_connection_id)
+                await bot.send_message(
+                    message.chat.id, s["off_hours_text"],
+                    business_connection_id=message.business_connection_id
+                )
             except Exception as e:
                 log.info("Off-hours reply unavailable: %s", e)
 
-    # Translation is optional; this implementation uses Telegram's available text only and
-    # intentionally does not pretend to translate without a translation provider/API.
-    if s["autotranslate_enabled"] and (message.text or message.caption):
-        await bot.send_message(
-            owner_id,
-            f"🌐 Сообщение для перевода ({s['translate_lang']})\n"
-            f"От: {esc(sender.full_name)} (ID {sender.id})\n\n{esc(message.text or message.caption)}\n\n"
-            "Автоматический перевод не настроен: добавь API переводчика для настоящего перевода."
-        )
-
-
-@router.business_message(F.text.regexp(r"^\.(help|whois|typing|mute(?:\s+\d+)?|unmute|game)$"))
-async def business_commands(message: Message, bot: Bot):
-    if not message.from_user or message.from_user.id != owner_id or not message.business_connection_id:
-        return
-    command = (message.text or "").strip()
-    chat_id = message.chat.id
-    bc = message.business_connection_id
-    try:
-        if command == ".help":
-            text = "Команды: .help, .whois, .typing, .mute <сек>, .unmute, .game"
-            await bot.edit_message_text(chat_id=chat_id, message_id=message.message_id,
-                                        text=text, business_connection_id=bc)
-        elif command == ".whois":
-            async with aiosqlite.connect(DB_PATH) as db:
-                db.row_factory = aiosqlite.Row
-                cur = await db.execute("SELECT * FROM contacts WHERE chat_id=?", (chat_id,))
-                row = await cur.fetchone()
-            if row:
-                first = datetime.fromisoformat(row["first_seen"]).astimezone().strftime("%Y-%m-%d %H:%M")
-                text = (f"👤 Карточка собеседника\nИмя: {esc(row['user_name'])}\nID: {row['user_id']}\n"
-                        f"Username: @{esc(row['username']) if row['username'] else '—'}\n"
-                        f"Первый контакт: {first}\nСообщений: {row['message_count']}")
-            else:
-                text = "Карточка пока недоступна: нет сохранённой истории."
-            await bot.edit_message_text(chat_id=chat_id, message_id=message.message_id,
-                                        text=text, business_connection_id=bc)
-        elif command == ".typing":
-            await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING,
-                                       business_connection_id=bc)
-            await bot.edit_message_text(chat_id=chat_id, message_id=message.message_id,
-                                        text="⌨️ Печатает…", business_connection_id=bc)
-        elif command.startswith(".mute"):
-            parts = command.split()
-            seconds = max(1, min(int(parts[1]) if len(parts) > 1 else 60, 86400))
-            # Target is the latest known non-owner participant for this chat.
-            async with aiosqlite.connect(DB_PATH) as db:
-                cur = await db.execute(
-                    "SELECT user_id FROM messages WHERE chat_id=? AND user_id IS NOT NULL AND user_id!=? ORDER BY id DESC LIMIT 1",
-                    (chat_id, owner_id))
-                row = await cur.fetchone()
-                if not row:
-                    await bot.edit_message_text(chat_id=chat_id, message_id=message.message_id,
-                                                text="Не удалось определить собеседника.", business_connection_id=bc)
-                    return
-                target = row[0]
-                until = utcnow() + timedelta(seconds=seconds)
-                await db.execute("INSERT OR REPLACE INTO mutes(chat_id,target_user_id,mute_until) VALUES(?,?,?)",
-                                 (chat_id, target, until.isoformat()))
-                await db.commit()
-            await bot.edit_message_text(chat_id=chat_id, message_id=message.message_id,
-                                        text=f"🔇 Мут установлен на {seconds} сек.", business_connection_id=bc)
-        elif command == ".unmute":
-            async with aiosqlite.connect(DB_PATH) as db:
-                cur = await db.execute(
-                    "SELECT user_id FROM messages WHERE chat_id=? AND user_id IS NOT NULL AND user_id!=? ORDER BY id DESC LIMIT 1",
-                    (chat_id, owner_id))
-                row = await cur.fetchone()
-                if row:
-                    await db.execute("DELETE FROM mutes WHERE chat_id=? AND target_user_id=?", (chat_id, row[0]))
-                    await db.commit()
-            await bot.edit_message_text(chat_id=chat_id, message_id=message.message_id,
-                                        text="🔊 Мут снят.", business_connection_id=bc)
-        elif command == ".game":
-            await bot.edit_message_text(
-                chat_id=chat_id, message_id=message.message_id, business_connection_id=bc,
-                text="🎮 Выбери игру:",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="🔫 Русская рулетка", callback_data=f"game:roulette:{chat_id}:{bc}")],
-                    [InlineKeyboardButton(text="⭕❌ Крестики-нолики", callback_data=f"game:ttt:{chat_id}:{bc}")],
-                    [InlineKeyboardButton(text="🎲 Угадай число", callback_data=f"game:guess:{chat_id}:{bc}")],
-                ])
-            )
-    except (TelegramBadRequest, TelegramForbiddenError) as e:
-        log.warning("Business command failed: %s", e)
+    # Пересылка владельцу
+    if s["forward_to_owner_enabled"]:
         try:
-            await bot.send_message(owner_id, f"Команда {esc(command)} не выполнена: {esc(e)}")
-        except Exception:
-            pass
+            head = (
+                f"📥 <b>Новое сообщение</b>\n"
+                f"👤 {esc(sender.full_name)} <code>{sender.id}</code>\n"
+                f"💬 Чат: <code>{message.chat.id}</code>"
+            )
+            if message.text or message.caption:
+                await bot.send_message(
+                    owner_id,
+                    f"{head}\n\n{esc(message.text or message.caption)}"
+                )
+            else:
+                await bot.send_message(owner_id, head)
+                try:
+                    await bot.forward_message(owner_id, message.chat.id, message.message_id)
+                except Exception:
+                    pass
+        except Exception as e:
+            log.info("Forward to owner unavailable: %s", e)
 
 
+# ---------- Deleted messages ----------
 @router.deleted_business_messages()
 async def business_deleted_handler(event: BusinessMessagesDeleted, bot: Bot):
     for mid in event.message_ids:
@@ -560,37 +973,44 @@ async def business_deleted_handler(event: BusinessMessagesDeleted, bot: Bot):
             continue
         stamp = row["date"]
         try:
-            stamp = datetime.fromisoformat(stamp).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+            stamp = datetime.fromisoformat(stamp).astimezone().strftime("%d.%m.%Y %H:%M:%S")
         except Exception:
             pass
         direction = "исходящее" if row["is_outgoing"] else "входящее"
-        caption = (f"🗑 <b>Удалённое сообщение</b>\nЧат: {event.chat.id}\n"
-                   f"Кто: {esc(row['user_name'])} (ID {row['user_id']})\n"
-                   f"Когда: {esc(stamp)}\nТип: {esc(row['content_type'])} / {direction}\n"
-                   f"Текст: {esc(row['text'] or '—')}")
+        caption = (
+            "🗑 <b>Удалённое сообщение</b>\n"
+            "─────────────────\n"
+            f"💬 Чат: <code>{event.chat.id}</code>\n"
+            f"👤 Кто: <b>{esc(row['user_name'])}</b> <code>{row['user_id']}</code>\n"
+            f"🕐 Когда: {esc(stamp)}\n"
+            f"📎 Тип: <i>{esc(row['content_type'])}</i> ({direction})\n\n"
+            f"{esc(row['text'] or '—')}"
+        )
         try:
-            if row["media_file_id"] and row["content_type"] in {"photo", "video", "animation", "document", "voice", "audio", "sticker"}:
-                if row["content_type"] == "photo":
-                    await bot.send_photo(owner_id, row["media_file_id"], caption=caption[:1024])
-                elif row["content_type"] == "video":
-                    await bot.send_video(owner_id, row["media_file_id"], caption=caption[:1024])
-                elif row["content_type"] == "animation":
-                    await bot.send_animation(owner_id, row["media_file_id"], caption=caption[:1024])
-                elif row["content_type"] == "document":
-                    await bot.send_document(owner_id, row["media_file_id"], caption=caption[:1024])
-                elif row["content_type"] == "voice":
-                    await bot.send_voice(owner_id, row["media_file_id"], caption=caption[:1024])
-                elif row["content_type"] == "audio":
-                    await bot.send_audio(owner_id, row["media_file_id"], caption=caption[:1024])
-                elif row["content_type"] == "sticker":
-                    await bot.send_message(owner_id, caption)
-                    await bot.send_sticker(owner_id, row["media_file_id"])
+            ctype = row["content_type"]
+            fid = row["media_file_id"]
+            if fid and ctype == "photo":
+                await bot.send_photo(owner_id, fid, caption=caption[:1024])
+            elif fid and ctype == "video":
+                await bot.send_video(owner_id, fid, caption=caption[:1024])
+            elif fid and ctype == "animation":
+                await bot.send_animation(owner_id, fid, caption=caption[:1024])
+            elif fid and ctype == "document":
+                await bot.send_document(owner_id, fid, caption=caption[:1024])
+            elif fid and ctype == "voice":
+                await bot.send_voice(owner_id, fid, caption=caption[:1024])
+            elif fid and ctype == "audio":
+                await bot.send_audio(owner_id, fid, caption=caption[:1024])
+            elif fid and ctype == "sticker":
+                await bot.send_message(owner_id, caption)
+                await bot.send_sticker(owner_id, fid)
             else:
                 await bot.send_message(owner_id, caption)
         except Exception as e:
             log.warning("Could not notify deleted message %s: %s", mid, e)
 
 
+# ---------- Games ----------
 @router.callback_query(F.data.startswith("game:"))
 async def game_callback(call: CallbackQuery, bot: Bot):
     if not call.message:
@@ -603,12 +1023,17 @@ async def game_callback(call: CallbackQuery, bot: Bot):
     if kind == "roulette":
         roulette_games[(chat_id, call.message.message_id)] = 0
         kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
-            text="🔄 Крутить", callback_data=f"roulette:spin:{chat_id}:{call.message.message_id}:{bc}")]])
-        await call.message.edit_text("🔫 Русская рулетка: 6 камер, 1 патрон. Нажми «Крутить».", reply_markup=kb)
+            text="🔄 Крутить",
+            callback_data=f"roulette:spin:{chat_id}:{call.message.message_id}:{bc}"
+        )]])
+        await call.message.edit_text(
+            "🔫 <b>Русская рулетка</b>\n6 камер, 1 патрон. Нажми «Крутить».",
+            reply_markup=kb
+        )
     elif kind == "guess":
         number = random.randint(1, 100)
         guess_games[(chat_id, call.message.message_id)] = {"number": number, "tries": 0, "bc": bc}
-        await call.message.edit_text("🎲 Угадай число от 1 до 100. Отправляй число в этот чат.")
+        await call.message.edit_text("🎲 <b>Угадай число</b>\nЯ загадал от 1 до 100. Отправляй догадки в чат.")
     elif kind == "ttt":
         ttt_games[(chat_id, call.message.message_id)] = {
             "board": [""] * 9, "turn": "❌", "owner": owner_id,
@@ -622,10 +1047,16 @@ async def render_ttt(message, chat_id, mid):
     game = ttt_games[(chat_id, mid)]
     kb = []
     for r in range(3):
-        kb.append([InlineKeyboardButton(text=game["board"][r*3+c] or "·",
-                                        callback_data=f"ttt:move:{chat_id}:{mid}:{r*3+c}")
-                   for c in range(3)])
-    await message.edit_text(f"⭕❌ Крестики-нолики\nХод: {game['turn']}", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+        kb.append([
+            InlineKeyboardButton(
+                text=game["board"][r*3+c] or "·",
+                callback_data=f"ttt:move:{chat_id}:{mid}:{r*3+c}"
+            ) for c in range(3)
+        ])
+    await message.edit_text(
+        f"⭕❌ <b>Крестики-нолики</b>\nХод: <b>{game['turn']}</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb)
+    )
 
 
 @router.callback_query(F.data.startswith("roulette:spin:"))
@@ -638,10 +1069,11 @@ async def roulette_spin(call: CallbackQuery):
         return
     if random.randint(1, 6) == 1:
         roulette_games.pop(key, None)
-        await call.message.edit_text("💥 Бах! Игра окончена.")
+        await call.message.edit_text("💥 <b>Бах!</b> Игра окончена.")
     else:
         kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
-            text="🔄 Крутить", callback_data=call.data)]])
+            text="🔄 Крутить", callback_data=call.data
+        )]])
         await call.message.edit_text("😮‍💨 Щёлк! Повезло. Продолжить?", reply_markup=kb)
     await call.answer()
 
@@ -674,61 +1106,48 @@ async def ttt_move(call: CallbackQuery):
     game["board"][idx] = game["turn"]
     b = game["board"]
     wins = [(0,1,2),(3,4,5),(6,7,8),(0,3,6),(1,4,7),(2,5,8),(0,4,8),(2,4,6)]
-    winner = next((b[a] for a,c,d in wins if b[a] and b[a] == b[c] == b[d]), None)
+    winner = next((b[a] for a, c, d in wins if b[a] and b[a] == b[c] == b[d]), None)
     if winner:
         game["ended"] = True
-        await call.message.edit_text(f"⭕❌ Победили {winner}!", reply_markup=None)
+        await call.message.edit_text(f"🏆 Победили <b>{winner}</b>!", reply_markup=None)
     elif all(b):
         game["ended"] = True
-        await call.message.edit_text("⭕❌ Ничья!", reply_markup=None)
+        await call.message.edit_text("🤝 <b>Ничья!</b>", reply_markup=None)
     else:
         game["turn"] = "⭕" if game["turn"] == "❌" else "❌"
         await render_ttt(call.message, chat_id, mid)
     await call.answer()
 
 
-@router.business_message(F.text.regexp(r"^\d{1,3}$"))
-async def guess_input(message: Message):
-    # Accept guesses only in chats with an active number game.
-    if not message.from_user:
-        return
-    chat_id = message.chat.id
-    active = [(k, v) for k, v in guess_games.items() if k[0] == chat_id]
-    if not active:
-        return
-    key, game = active[-1]
-    try:
-        guess = int(message.text)
-    except ValueError:
-        return
-    if not 1 <= guess <= 100:
-        return
-    game["tries"] += 1
-    if guess == game["number"]:
-        await message.answer(f"🎉 Верно! Число {guess}. Попыток: {game['tries']}.")
-        guess_games.pop(key, None)
-    elif guess < game["number"]:
-        await message.answer("Больше ⬆️")
-    else:
-        await message.answer("Меньше ⬇️")
-
-
+# ---------- Business connection hook ----------
 @router.business_connection()
 async def business_connections_handler(connection: BusinessConnection, bot: Bot):
-    # Placeholder hook: permissions are supplied by Telegram; commands fail gracefully if missing.
     log.info("Business connection %s, enabled=%s", connection.id, connection.is_enabled)
+    try:
+        if connection.is_enabled:
+            await bot.send_message(
+                owner_id,
+                f"✅ <b>Business-подключение активно</b>\nID: <code>{esc(connection.id)}</code>"
+            )
+        else:
+            await bot.send_message(
+                owner_id,
+                f"⚠️ <b>Business-подключение отключено</b>\nID: <code>{esc(connection.id)}</code>"
+            )
+    except Exception:
+        pass
 
 
+# ---------- Background task: name with time ----------
 async def update_business_name(bot: Bot):
-    # Telegram method is exposed in some Bot API/aiogram versions; not all deployments support it.
     while True:
         try:
             s = await get_settings()
             if s["time_in_nick_enabled"]:
                 me = await bot.get_me()
-                name = me.first_name or "Secretary"
+                base = me.first_name or "Secretary"
                 clock = local_now(s["timezone"]).strftime("%H:%M")
-                desired = f"{name} [{clock}]"[:64]
+                desired = f"{base} [{clock}]"[:64]
                 method = getattr(bot, "set_business_account_name", None)
                 if method:
                     async with name_update_lock:
@@ -738,6 +1157,7 @@ async def update_business_name(bot: Bot):
         await asyncio.sleep(60)
 
 
+# ---------- Entry point ----------
 async def main():
     if not api_token:
         raise RuntimeError("Не найден API_TOKEN в .env")
@@ -747,10 +1167,10 @@ async def main():
     bot = Bot(api_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
     dp.include_router(router)
-    # Keep the optional account-name task isolated so a missing API method won't stop polling.
     asyncio.create_task(update_business_name(bot))
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types() + [
-        "business_connection", "business_message", "edited_business_message", "deleted_business_messages"
+        "business_connection", "business_message",
+        "edited_business_message", "deleted_business_messages"
     ])
 
 
