@@ -77,19 +77,25 @@ AI_PROVIDERS = [
         "name": "groq",
         "url": "https://api.groq.com/openai/v1/chat/completions",
         "key_env": "GROQ_API_KEY",
-        "model": "llama-3.1-8b-instant",
+        "model": "openai/gpt-oss-120b",       # из твоего вывода check_keys
+    },
+    {
+        "name": "groq-20b",
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "key_env": "GROQ_API_KEY",
+        "model": "openai/gpt-oss-20b",        # лёгкая версия, тоже должна быть
     },
     {
         "name": "openrouter",
         "url": "https://openrouter.ai/api/v1/chat/completions",
         "key_env": "OPENROUTER_API_KEY",
-        "model": "meta-llama/llama-3.1-8b-instruct:free",
+        "model": "openai/gpt-oss-120b:free",  # бесплатная версия той же модели
     },
     {
         "name": "mistral",
         "url": "https://api.mistral.ai/v1/chat/completions",
         "key_env": "MISTRAL_API_KEY",
-        "model": "mistral-small-latest",
+        "model": "mistral-small-latest",      # была в твоём выводе
     },
 ]
 
