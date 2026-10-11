@@ -1,24 +1,36 @@
 import asyncio
+import json
 import logging
 import os
 import random
 import re
+import shutil
+import tempfile
 from datetime import datetime, timedelta, timezone
+from io import BytesIO
 from zoneinfo import ZoneInfo
-from dotenv import load_dotenv
 
 import aiosqlite
+import httpx
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatAction, ParseMode
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
-from aiogram.filters import Command, BaseFilter
+from aiogram.filters import Command
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
     BusinessConnection, BusinessMessagesDeleted,
+    FSInputFile, BufferedInputFile, LabeledPrice, PreCheckoutQuery,
 )
+from dotenv import load_dotenv
 
-# ---------- Config ----------
+try:
+    import yt_dlp
+    YTDLP_OK = True
+except ImportError:
+    YTDLP_OK = False
+
+# ---------------- Config ----------------
 load_dotenv()
 api_token = os.getenv("API_TOKEN", "").strip()
 try:
@@ -29,20 +41,83 @@ except ValueError:
 DB_PATH = "bot.db"
 KEEP_PER_CHAT = 100
 MUTE_NOTICE_SECONDS = 4
+FREE_DAILY_LIMIT = 10
+PREMIUM_DAILY_LIMIT = 50
+PREMIUM_PRICE_STARS = 50
+PREMIUM_DAYS = 30
+DOWNLOAD_MAX_MB = 45
+ANIM_MAX_CHARS = 150
+ANIM_DELAY = 0.25
 
-router = Router()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("secretary")
+router = Router()
 
-# ---------- In-memory state ----------
-guess_games = {}          # (chat_id, mid) -> {"number":int,"tries":int,"bc":str}
-roulette_games = {}       # (chat_id, mid) -> spins
-ttt_games = {}            # (chat_id, mid) -> board/turn/...
-pending_inputs = {}       # owner_id -> action
+# ---------------- State ----------------
+guess_games = {}
+roulette_games = {}
+ttt_games = {}
+pending_inputs = {}
 name_update_lock = asyncio.Lock()
 
+# ---------------- AI providers (OpenAI-compatible, no keys required for anyone but owner) ----------------
+AI_PROVIDERS = [
+    {
+        "name": "groq",
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "key_env": "GROQ_API_KEY",
+        "model": "llama-3.3-70b-versatile",
+    },
+    {
+        "name": "openrouter",
+        "url": "https://openrouter.ai/api/v1/chat/completions",
+        "key_env": "OPENROUTER_API_KEY",
+        "model": "meta-llama/llama-3.3-70b-instruct:free",
+    },
+    {
+        "name": "mistral",
+        "url": "https://api.mistral.ai/v1/chat/completions",
+        "key_env": "MISTRAL_API_KEY",
+        "model": "mistral-small-latest",
+    },
+]
 
-# ---------- Utilities ----------
+
+async def ask_ai(prompt: str) -> str:
+    last_err = None
+    for p in AI_PROVIDERS:
+        key = os.getenv(p["key_env"], "").strip()
+        if not key:
+            continue
+        try:
+            async with httpx.AsyncClient(timeout=60) as client:
+                r = await client.post(
+                    p["url"],
+                    headers={
+                        "Authorization": f"Bearer {key}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": p["model"],
+                        "messages": [
+                            {"role": "system",
+                             "content": "Ты полезный ассистент. Отвечай кратко, дружелюбно, на русском."},
+                            {"role": "user", "content": prompt},
+                        ],
+                        "max_tokens": 1024,
+                        "temperature": 0.7,
+                    },
+                )
+            if r.status_code == 200:
+                return r.json()["choices"][0]["message"]["content"].strip()
+            last_err = f"{p['name']}: HTTP {r.status_code} {r.text[:120]}"
+        except Exception as e:
+            last_err = f"{p['name']}: {e}"
+        log.warning("AI provider %s failed: %s", p["name"], last_err)
+    raise RuntimeError(f"Все ИИ-провайдеры недоступны. Последняя ошибка: {last_err}")
+
+
+# ---------------- Utilities ----------------
 def utcnow():
     return datetime.now(timezone.utc)
 
@@ -58,26 +133,10 @@ def esc(s):
     return (str(s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
 
 
-def code(s):
-    return f"<code>{esc(s)}</code>"
+URL_RE = re.compile(r"https?://[^\s]+")
 
 
-# ---------- Custom filters ----------
-class HasPendingInput(BaseFilter):
-    async def __call__(self, message: Message) -> bool:
-        return message.from_user is not None and message.from_user.id in pending_inputs
-
-
-class GuessGameActive(BaseFilter):
-    async def __call__(self, message: Message) -> bool:
-        if not message.text:
-            return False
-        if not re.fullmatch(r"\d{1,3}", message.text.strip()):
-            return False
-        return any(k[0] == message.chat.id for k in guess_games)
-
-
-# ---------- Database ----------
+# ---------------- DB ----------------
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executescript("""
@@ -95,7 +154,6 @@ async def init_db():
             is_outgoing INTEGER DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_messages_chat_mid ON messages(chat_id, message_id);
-        CREATE INDEX IF NOT EXISTS idx_messages_chat_date ON messages(chat_id, date);
 
         CREATE TABLE IF NOT EXISTS settings (
             user_id INTEGER PRIMARY KEY,
@@ -128,6 +186,13 @@ async def init_db():
             chat_id INTEGER PRIMARY KEY,
             note TEXT,
             updated_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS user_limits (
+            user_id INTEGER PRIMARY KEY,
+            date TEXT NOT NULL,
+            requests_count INTEGER DEFAULT 0,
+            is_premium INTEGER DEFAULT 0,
+            premium_until TEXT
         );
         """)
         await db.commit()
@@ -183,8 +248,7 @@ async def remove_blacklist(user_id):
 async def get_note(chat_id):
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("SELECT note, updated_at FROM notes WHERE chat_id=?", (chat_id,))
-        row = await cur.fetchone()
-        return row
+        return await cur.fetchone()
 
 
 async def set_note(chat_id, text):
@@ -197,7 +261,70 @@ async def set_note(chat_id, text):
         await db.commit()
 
 
-# ---------- Message payload helpers ----------
+# ---------------- Limits ----------------
+async def check_limit(user_id):
+    today = utcnow().strftime("%Y-%m-%d")
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM user_limits WHERE user_id=?", (user_id,))
+        row = await cur.fetchone()
+
+        if not row or row["date"] != today:
+            await db.execute(
+                "INSERT OR REPLACE INTO user_limits(user_id, date, requests_count, is_premium, premium_until) "
+                "VALUES(?,?,0,?,?)",
+                (user_id, today,
+                 row["is_premium"] if row else 0,
+                 row["premium_until"] if row else None)
+            )
+            await db.commit()
+            used = 0
+            is_premium = bool(row["is_premium"]) if row else False
+            premium_until = row["premium_until"] if row else None
+        else:
+            used = row["requests_count"]
+            is_premium = bool(row["is_premium"])
+            premium_until = row["premium_until"]
+
+        if is_premium and premium_until:
+            try:
+                if datetime.fromisoformat(premium_until) < utcnow():
+                    await db.execute(
+                        "UPDATE user_limits SET is_premium=0, premium_until=NULL WHERE user_id=?",
+                        (user_id,)
+                    )
+                    await db.commit()
+                    is_premium = False
+            except Exception:
+                pass
+
+        limit = PREMIUM_DAILY_LIMIT if is_premium else FREE_DAILY_LIMIT
+        return used < limit, used, limit, is_premium
+
+
+async def increment_usage(user_id):
+    today = utcnow().strftime("%Y-%m-%d")
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE user_limits SET requests_count = requests_count + 1 WHERE user_id=? AND date=?",
+            (user_id, today)
+        )
+        await db.commit()
+
+
+async def activate_premium(user_id, days=PREMIUM_DAYS):
+    until = (utcnow() + timedelta(days=days)).isoformat()
+    today = utcnow().strftime("%Y-%m-%d")
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO user_limits(user_id, date, requests_count, is_premium, premium_until) "
+            "VALUES(?,?,0,1,?)",
+            (user_id, today, until)
+        )
+        await db.commit()
+
+
+# ---------------- Message payload ----------------
 def message_payload(message: Message):
     text = message.text or message.caption or ""
     ctype, file_id = "text", None
@@ -268,96 +395,17 @@ async def find_message(chat_id, message_id):
         return dict(row) if row else None
 
 
-# ---------- Menus ----------
+# ---------------- Menus ----------------
 def main_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⚙️ Настройки", callback_data="menu:settings")],
+        [InlineKeyboardButton(text="🤖 ИИ-подписка", callback_data="menu:ai")],
         [InlineKeyboardButton(text="📖 Помощь", callback_data="menu:help")],
-        [InlineKeyboardButton(text="📊 Статистика", callback_data="menu:stats")],
     ])
 
 
 def back_button(target="menu:main"):
     return [InlineKeyboardButton(text="⬅️ Назад", callback_data=target)]
-
-
-def settings_menu(s):
-    def flag(v): return "✅" if v else "❌"
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💬 Ответы на первое сообщение", callback_data="menu:sec:first")],
-        [InlineKeyboardButton(text="🕐 Имя и расписание", callback_data="menu:sec:schedule")],
-        [InlineKeyboardButton(text="🚫 Приватность", callback_data="menu:sec:privacy")],
-        [InlineKeyboardButton(text="📥 Пересылка владельцу", callback_data="menu:sec:forward")],
-        back_button(),
-    ])
-
-
-def settings_first(s):
-    def flag(v): return "✅ ВКЛ" if v else "❌ ВЫКЛ"
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"💬 Автоответ на первое: {flag(s['answer_first_enabled'])}",
-                              callback_data="toggle:answer_first_enabled")],
-        [InlineKeyboardButton(text="✏️ Изменить текст", callback_data="prompt:answer_first_text")],
-        [InlineKeyboardButton(text=f"📄 Текущий: {(s['answer_first_text'] or '—')[:40]}",
-                              callback_data="noop")],
-        back_button("menu:settings"),
-    ])
-
-
-def settings_schedule(s):
-    def flag(v): return "✅ ВКЛ" if v else "❌ ВЫКЛ"
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"🕐 Время в имени: {flag(s['time_in_nick_enabled'])}",
-                              callback_data="toggle:time_in_nick_enabled")],
-        [InlineKeyboardButton(text=f"🌍 Часовой пояс: {s['timezone']}",
-                              callback_data="prompt:timezone")],
-        [InlineKeyboardButton(text=f"🌙 Автоответ вне часов: {flag(s['off_hours_enabled'])}",
-                              callback_data="toggle:off_hours_enabled")],
-        [InlineKeyboardButton(text=f"🕒 Часы: {s['off_hours_start']}–{s['off_hours_end']}",
-                              callback_data="prompt:off_hours")],
-        [InlineKeyboardButton(text="✏️ Текст автоответа", callback_data="prompt:off_hours_text")],
-        back_button("menu:settings"),
-    ])
-
-
-def settings_privacy(s):
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🚫 Чёрный список", callback_data="menu:blacklist")],
-        back_button("menu:settings"),
-    ])
-
-
-def settings_forward(s):
-    def flag(v): return "✅ ВКЛ" if v else "❌ ВЫКЛ"
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"📥 Пересылать сообщения владельцу: {flag(s['forward_to_owner_enabled'])}",
-                              callback_data="toggle:forward_to_owner_enabled")],
-        [InlineKeyboardButton(text="ℹ️ Куда приходят уведомления",
-                              callback_data="noop")],
-        back_button("menu:settings"),
-    ])
-
-
-async def render_settings(msg_or_call, edit=False):
-    s = await get_settings()
-    text = (
-        "⚙️ <b>Настройки секретаря</b>\n"
-        "<i>Выбери раздел для настройки</i>\n\n"
-        f"💬 Первый ответ: {'✅' if s['answer_first_enabled'] else '❌'}\n"
-        f"🕐 Время в имени: {'✅' if s['time_in_nick_enabled'] else '❌'}\n"
-        f"🌍 Пояс: <code>{esc(s['timezone'])}</code>\n"
-        f"🌙 Автоответ: {'✅' if s['off_hours_enabled'] else '❌'} "
-        f"({esc(s['off_hours_start'])}–{esc(s['off_hours_end'])})\n"
-        f"📥 Пересылка владельцу: {'✅' if s['forward_to_owner_enabled'] else '❌'}"
-    )
-    kb = settings_menu(s)
-    if edit:
-        try:
-            await msg_or_call.edit_text(text, reply_markup=kb)
-        except TelegramBadRequest:
-            await msg_or_call.answer(text, reply_markup=kb)
-    else:
-        await msg_or_call.answer(text, reply_markup=kb)
 
 
 # ============================================================
@@ -369,11 +417,11 @@ async def cmd_start(message: Message):
     await get_settings()
     await message.answer(
         "👋 <b>Привет! Я твой бизнес-секретарь.</b>\n\n"
-        "Я работаю в <b>Telegram Business</b> чатах:\n"
-        "• отвечаю первым сообщением\n"
-        "• предупреждаю о нерабочих часах\n"
-        "• сохраняю удалённые сообщения\n"
-        "• выполняю команды через точку\n\n"
+        "Работаю в <b>Telegram Business</b> чатах:\n"
+        "• автоответы и пересылка\n"
+        "• сохранение удалённых\n"
+        "• команды через точку\n"
+        "• ИИ-помощник <code>.ai</code>\n\n"
         "<i>Подключи меня в Настройки → Telegram Business → Чат-автоматизация</i>",
         reply_markup=main_menu()
     )
@@ -383,23 +431,16 @@ async def cmd_start(message: Message):
 async def cmd_help(message: Message):
     await message.answer(
         "<b>📖 Помощь</b>\n\n"
-        "<b>Владельцу в личке:</b>\n"
-        "/start — меню\n"
-        "/help — эта справка\n"
-        "/settings — настройки\n"
-        "/stats — статистика\n\n"
-        "<b>Команды в Business-чатах</b> (пишутся с точки):\n"
+        "<b>Команды в Business-чатах:</b>\n"
         "<code>.help</code> — список\n"
+        "<code>.ai вопрос</code> — спросить ИИ\n"
+        "<code>.save</code> (ответом на ссылку) — скачать видео\n"
+        "<code>.anim текст</code> — анимация текста\n"
+        "<code>.qr текст</code> — QR-код\n"
         "<code>.whois</code> — карточка собеседника\n"
-        "<code>.typing</code> — показать «печатает»\n"
-        "<code>.mute 60</code> — мут на 60 сек\n"
-        "<code>.unmute</code> — снять мут\n"
-        "<code>.muted</code> — список мутов\n"
-        "<code>.id</code> — технические ID\n"
-        "<code>.note текст</code> — заметка о чате\n"
-        "<code>.note</code> — показать заметку\n"
-        "<code>.ping</code> — проверить бота\n"
-        "<code>.game</code> — игры",
+        "<code>.typing</code> — печатает…\n"
+        "<code>.mute 60</code> / <code>.unmute</code> / <code>.muted</code>\n"
+        "<code>.id</code> · <code>.ping</code> · <code>.note</code> · <code>.game</code>",
         reply_markup=main_menu()
     )
 
@@ -407,155 +448,89 @@ async def cmd_help(message: Message):
 @router.message(Command("settings"))
 async def cmd_settings(message: Message):
     if message.from_user and message.from_user.id != owner_id:
-        await message.answer("⛔ Настройки доступны только владельцу.")
+        await message.answer("⛔ Только владелец.")
         return
-    await render_settings(message)
-
-
-@router.message(Command("stats"))
-async def cmd_stats(message: Message):
-    if not message.from_user or message.from_user.id != owner_id:
-        return
-    async with aiosqlite.connect(DB_PATH) as db:
-        async def count(q):
-            cur = await db.execute(q)
-            return (await cur.fetchone())[0]
-        messages = await count("SELECT COUNT(*) FROM messages")
-        chats = await count("SELECT COUNT(*) FROM contacts")
-        blacklisted = await count("SELECT COUNT(*) FROM blacklist")
-        mutes = await count("SELECT COUNT(*) FROM mutes")
-        notes = await count("SELECT COUNT(*) FROM notes")
-    await message.answer(
-        "📊 <b>Статистика</b>\n"
-        "─────────────────\n"
-        f"💾 Сообщений в архиве: <b>{messages}</b>\n"
-        f"👥 Контактов: <b>{chats}</b>\n"
-        f"🚫 В чёрном списке: <b>{blacklisted}</b>\n"
-        f"🔇 Активных мутов: <b>{mutes}</b>\n"
-        f"📝 Заметок: <b>{notes}</b>"
-    )
-
-
-@router.message(Command("ping"))
-async def cmd_ping(message: Message):
-    if not message.from_user or message.from_user.id != owner_id:
-        return
-    await message.answer("🏓 Pong! Бот на связи.")
-
-
-# ----- Menu callbacks (private) -----
-@router.callback_query(F.data == "noop")
-async def cb_noop(call: CallbackQuery):
-    await call.answer()
+    s = await get_settings()
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"💬 Первый ответ: {'✅' if s['answer_first_enabled'] else '❌'}",
+                              callback_data="toggle:answer_first_enabled")],
+        [InlineKeyboardButton(text="✏️ Текст первого ответа", callback_data="prompt:answer_first_text")],
+        [InlineKeyboardButton(text=f"🌙 Автоответ вне часов: {'✅' if s['off_hours_enabled'] else '❌'}",
+                              callback_data="toggle:off_hours_enabled")],
+        [InlineKeyboardButton(text=f"🕒 Часы: {s['off_hours_start']}–{s['off_hours_end']}",
+                              callback_data="prompt:off_hours")],
+        [InlineKeyboardButton(text="✏️ Текст автоответа", callback_data="prompt:off_hours_text")],
+        [InlineKeyboardButton(text=f"📥 Пересылка мне: {'✅' if s['forward_to_owner_enabled'] else '❌'}",
+                              callback_data="toggle:forward_to_owner_enabled")],
+        [InlineKeyboardButton(text=f"🌍 Пояс: {s['timezone']}", callback_data="prompt:timezone")],
+        back_button(),
+    ])
+    await message.answer("⚙️ <b>Настройки</b>", reply_markup=kb)
 
 
 @router.callback_query(F.data == "menu:main")
-async def cb_menu_main(call: CallbackQuery):
+async def cb_main(call: CallbackQuery):
     if call.from_user.id != owner_id:
         await call.answer("Только владелец", show_alert=True)
         return
-    await call.message.edit_text(
-        "🏠 <b>Главное меню</b>\n<i>Выбери действие</i>",
-        reply_markup=main_menu()
-    )
+    await call.message.edit_text("🏠 <b>Главное меню</b>", reply_markup=main_menu())
     await call.answer()
 
 
 @router.callback_query(F.data == "menu:help")
-async def cb_menu_help(call: CallbackQuery):
+async def cb_help(call: CallbackQuery):
     if call.from_user.id != owner_id:
         await call.answer("Только владелец", show_alert=True)
         return
     await call.message.edit_text(
         "<b>📖 Помощь</b>\n\n"
-        "В Business-чатах используй команды с точкой:\n"
-        "<code>.help</code> · <code>.whois</code> · <code>.typing</code>\n"
-        "<code>.mute 60</code> · <code>.unmute</code> · <code>.muted</code>\n"
-        "<code>.id</code> · <code>.note</code> · <code>.ping</code> · <code>.game</code>",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[back_button()])
-    )
-    await call.answer()
-
-
-@router.callback_query(F.data == "menu:stats")
-async def cb_menu_stats(call: CallbackQuery):
-    if call.from_user.id != owner_id:
-        await call.answer("Только владелец", show_alert=True)
-        return
-    async with aiosqlite.connect(DB_PATH) as db:
-        async def count(q):
-            cur = await db.execute(q)
-            return (await cur.fetchone())[0]
-        messages = await count("SELECT COUNT(*) FROM messages")
-        chats = await count("SELECT COUNT(*) FROM contacts")
-        blacklisted = await count("SELECT COUNT(*) FROM blacklist")
-        mutes = await count("SELECT COUNT(*) FROM mutes")
-    await call.message.edit_text(
-        "📊 <b>Статистика</b>\n"
-        "─────────────────\n"
-        f"💾 Сообщений: <b>{messages}</b>\n"
-        f"👥 Контактов: <b>{chats}</b>\n"
-        f"🚫 В ЧС: <b>{blacklisted}</b>\n"
-        f"🔇 Мутов: <b>{mutes}</b>",
+        "В бизнес-чатах пиши команды с точки:\n"
+        "<code>.ai</code> · <code>.save</code> · <code>.anim</code> · <code>.qr</code>\n"
+        "<code>.whois</code> · <code>.typing</code> · <code>.mute</code>\n"
+        "<code>.id</code> · <code>.ping</code> · <code>.note</code> · <code>.game</code>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[back_button()])
     )
     await call.answer()
 
 
 @router.callback_query(F.data == "menu:settings")
-async def cb_menu_settings(call: CallbackQuery):
+async def cb_settings(call: CallbackQuery):
     if call.from_user.id != owner_id:
         await call.answer("Только владелец", show_alert=True)
         return
-    await render_settings(call.message, edit=True)
+    await cmd_settings(call.message)
     await call.answer()
 
 
-@router.callback_query(F.data.startswith("menu:sec:"))
-async def cb_section(call: CallbackQuery):
+@router.callback_query(F.data == "menu:ai")
+async def cb_ai_menu(call: CallbackQuery):
     if call.from_user.id != owner_id:
         await call.answer("Только владелец", show_alert=True)
         return
-    section = call.data.split(":", 2)[2]
-    s = await get_settings()
-    if section == "first":
-        text = "💬 <b>Первый ответ</b>\n<i>Бот отвечает на самое первое сообщение в новом чате</i>"
-        kb = settings_first(s)
-    elif section == "schedule":
-        text = "🕐 <b>Расписание</b>\n<i>Время в имени и автоответ вне рабочих часов</i>"
-        kb = settings_schedule(s)
-    elif section == "privacy":
-        text = "🚫 <b>Приватность</b>\n<i>Чёрный список пользователей</i>"
-        kb = settings_privacy(s)
-    elif section == "forward":
-        text = "📥 <b>Пересылка владельцу</b>\n<i>Дублировать сообщения клиентов тебе в личку</i>"
-        kb = settings_forward(s)
-    else:
-        await call.answer("Неизвестный раздел", show_alert=True)
-        return
-    try:
-        await call.message.edit_text(text, reply_markup=kb)
-    except TelegramBadRequest:
-        await call.message.answer(text, reply_markup=kb)
-    await call.answer()
-
-
-@router.callback_query(F.data == "menu:blacklist")
-async def cb_blacklist(call: CallbackQuery):
-    if call.from_user.id != owner_id:
-        await call.answer("Только владелец", show_alert=True)
-        return
+    used, limit, is_premium = 0, FREE_DAILY_LIMIT, False
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT user_id FROM blacklist ORDER BY user_id LIMIT 30")
-        rows = await cur.fetchall()
-    listing = "\n".join(f"• <code>{r[0]}</code>" for r in rows) if rows else "<i>Пусто</i>"
+        today = utcnow().strftime("%Y-%m-%d")
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM user_limits WHERE user_id=?", (owner_id,))
+        row = await cur.fetchone()
+        if row and row["date"] == today:
+            used = row["requests_count"]
+            is_premium = bool(row["is_premium"])
+        if is_premium:
+            limit = PREMIUM_DAILY_LIMIT
+    status = "💎 <b>Premium активен</b>" if is_premium else "🆓 <b>Бесплатный тариф</b>"
     await call.message.edit_text(
-        f"🚫 <b>Чёрный список</b>\n{listing}\n\n"
-        "Отправь <code>ID</code> чтобы добавить, или <code>-ID</code> чтобы удалить.",
+        f"🤖 <b>ИИ-доступ</b>\n"
+        f"─────────────────\n"
+        f"{status}\n"
+        f"Использовано сегодня: <b>{used}/{limit}</b>\n\n"
+        f"💎 Premium: <b>{PREMIUM_DAILY_LIMIT} запросов/день</b>\n"
+        f"Цена: <b>{PREMIUM_PRICE_STARS} ⭐</b> / {PREMIUM_DAYS} дней\n\n"
+        f"Используй <code>.ai вопрос</code> в бизнес-чате.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="➕ Добавить", callback_data="prompt:blacklist_add")],
-            [InlineKeyboardButton(text="➖ Удалить", callback_data="prompt:blacklist_remove")],
-            back_button("menu:settings"),
+            [InlineKeyboardButton(text=f"⭐ Купить Premium ({PREMIUM_PRICE_STARS}⭐)",
+                                  callback_data="buy_premium")],
+            back_button(),
         ])
     )
     await call.answer()
@@ -569,19 +544,11 @@ async def cb_toggle(call: CallbackQuery):
     key = call.data.split(":", 1)[1]
     s = await get_settings()
     if key not in s:
-        await call.answer("Неизвестный параметр", show_alert=True)
+        await call.answer("?", show_alert=True)
         return
-    new_val = 0 if s[key] else 1
-    await set_setting(key, new_val)
-    s = await get_settings()
-    # Re-render current section
-    if key in {"answer_first_enabled", "answer_first_text"}:
-        await call.message.edit_text("💬 <b>Первый ответ</b>", reply_markup=settings_first(s))
-    elif key in {"time_in_nick_enabled", "off_hours_enabled", "off_hours_start", "off_hours_end", "off_hours_text", "timezone"}:
-        await call.message.edit_text("🕐 <b>Расписание</b>", reply_markup=settings_schedule(s))
-    elif key == "forward_to_owner_enabled":
-        await call.message.edit_text("📥 <b>Пересылка владельцу</b>", reply_markup=settings_forward(s))
-    await call.answer("✅ Сохранено")
+    await set_setting(key, 0 if s[key] else 1)
+    await cmd_settings(call.message)
+    await call.answer("✅")
 
 
 @router.callback_query(F.data.startswith("prompt:"))
@@ -591,12 +558,10 @@ async def cb_prompt(call: CallbackQuery):
         return
     action = call.data.split(":", 1)[1]
     prompts = {
-        "answer_first_text": "✏️ Отправь <b>текст первого ответа</b> следующим сообщением.",
-        "off_hours_text": "✏️ Отправь <b>текст автоответа</b> следующим сообщением.",
-        "off_hours": "🕒 Отправь часы в формате <code>ЧЧ:ММ-ЧЧ:ММ</code>, например <code>22:00-08:00</code>.",
-        "timezone": "🌍 Отправь часовой пояс IANA, например <code>Europe/Moscow</code>.",
-        "blacklist_add": "🚫 Отправь <code>user_id</code> для добавления в чёрный список.",
-        "blacklist_remove": "➖ Отправь <code>user_id</code> для удаления из чёрного списка.",
+        "answer_first_text": "✏️ Отправь <b>текст первого ответа</b>.",
+        "off_hours_text": "✏️ Отправь <b>текст автоответа</b>.",
+        "off_hours": "🕒 Отправь часы в формате <code>ЧЧ:ММ-ЧЧ:ММ</code>.",
+        "timezone": "🌍 Отправь IANA-пояс, например <code>Europe/Moscow</code>.",
     }
     if action not in prompts:
         await call.answer()
@@ -606,11 +571,11 @@ async def cb_prompt(call: CallbackQuery):
     await call.answer()
 
 
-@router.message(F.chat.type == "private", F.from_user.id == owner_id, HasPendingInput())
+@router.message(F.chat.type == "private", F.from_user.id == owner_id, ~F.text.startswith("/"))
 async def receive_setting_value(message: Message):
-    action = pending_inputs.pop(owner_id, None)
-    if not action:
+    if owner_id not in pending_inputs:
         return
+    action = pending_inputs.pop(owner_id)
     value = (message.text or "").strip()
     try:
         if action == "answer_first_text":
@@ -620,7 +585,7 @@ async def receive_setting_value(message: Message):
         elif action == "off_hours":
             m = re.fullmatch(r"(\d{2}:\d{2})\s*-\s*(\d{2}:\d{2})", value)
             if not m:
-                raise ValueError("Нужен формат ЧЧ:ММ-ЧЧ:ММ")
+                raise ValueError("Формат: ЧЧ:ММ-ЧЧ:ММ")
             for t in m.groups():
                 datetime.strptime(t, "%H:%M")
             await set_setting("off_hours_start", m.group(1))
@@ -628,27 +593,429 @@ async def receive_setting_value(message: Message):
         elif action == "timezone":
             ZoneInfo(value)
             await set_setting("timezone", value)
-        elif action in {"blacklist_add", "blacklist_remove"}:
-            target = int(value)
-            if action == "blacklist_add":
-                await add_blacklist(target)
-                await message.answer(f"🚫 ID <code>{target}</code> добавлен.")
-            else:
-                await remove_blacklist(target)
-                await message.answer(f"✅ ID <code>{target}</code> удалён.")
-            return
-        await message.answer("✅ <b>Настройка сохранена</b>")
+        await message.answer("✅ Сохранено.")
     except Exception as e:
-        await message.answer(f"⚠️ Не удалось сохранить: {esc(e)}")
-    await render_settings(message)
+        await message.answer(f"⚠️ Ошибка: {esc(e)}")
+    await cmd_settings(message)
+
+
+# ---------------- Payments ----------------
+@router.callback_query(F.data == "buy_premium")
+async def cb_buy_premium(call: CallbackQuery, bot: Bot):
+    if call.from_user.id != owner_id:
+        await call.answer("Покупка только для владельца", show_alert=True)
+        return
+    try:
+        await bot.send_invoice(
+            chat_id=call.from_user.id,
+            title="Premium доступ к ИИ",
+            description=f"{PREMIUM_DAILY_LIMIT} запросов в день на {PREMIUM_DAYS} дней",
+            payload="premium_30d",
+            provider_token="",
+            currency="XTR",
+            prices=[LabeledPrice(label=f"Premium {PREMIUM_DAYS} дней",
+                                 amount=PREMIUM_PRICE_STARS)],
+        )
+    except Exception as e:
+        await call.answer(f"Ошибка: {e}", show_alert=True)
+    await call.answer()
+
+
+@router.pre_checkout_query()
+async def pre_checkout(query: PreCheckoutQuery):
+    await query.answer(ok=True)
+
+
+@router.message(F.successful_payment)
+async def payment_ok(message: Message):
+    p = message.successful_payment
+    if p.invoice_payload == "premium_30d":
+        await activate_premium(message.from_user.id, PREMIUM_DAYS)
+        await message.answer(
+            f"✅ <b>Premium активирован!</b>\n\n"
+            f"Теперь <b>{PREMIUM_DAILY_LIMIT} запросов в день</b> на {PREMIUM_DAYS} дней. 🚀"
+        )
 
 
 # ============================================================
-# BUSINESS HANDLERS (order matters!)
+# VIDEO DOWNLOAD HELPERS (без API-ключей)
 # ============================================================
 
-# 1) Dot-commands — должно быть ДО общего business_message
-@router.business_message(F.text.regexp(r"^\."))
+def _ytdlp_download(url: str, outdir: str) -> tuple[str, str]:
+    """Скачивание через yt-dlp — поддерживает ~1000 сайтов без ключей."""
+    opts = {
+        "outtmpl": os.path.join(outdir, "%(id)s.%(ext)s"),
+        "format": "mp4/best[ext=mp4]/best",
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "max_filesize": DOWNLOAD_MAX_MB * 1024 * 1024,
+        "retries": 2,
+        "socket_timeout": 30,
+    }
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        return ydl.prepare_filename(info), info.get("title", "") or "Видео"
+
+
+async def _cobalt_download(url: str, outdir: str) -> tuple[str, str]:
+    """Публичный Cobalt API (без ключа). Несколько инстансов на fallback."""
+    endpoints = [
+        "https://api.cobalt.tools/",
+        "https://co.wuk.sh/api/json",
+        "https://cobalt-api.kwiatekmiki.com/",
+        "https://cobalt-api.meowing.de/",
+    ]
+    headers = {"Accept": "application/json", "Content-Type": "application/json"}
+    last_err = None
+    async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+        for ep in endpoints:
+            try:
+                r = await client.post(ep, headers=headers, json={"url": url})
+                if r.status_code != 200:
+                    last_err = f"{ep}: HTTP {r.status_code}"
+                    continue
+                data = r.json()
+                link = data.get("url") or data.get("audio")
+                if not link:
+                    last_err = f"{ep}: no url"
+                    continue
+                filepath = os.path.join(outdir, f"cobalt_{random.randint(1000, 9999)}.mp4")
+                total = 0
+                async with client.stream("GET", link) as resp:
+                    resp.raise_for_status()
+                    with open(filepath, "wb") as f:
+                        async for chunk in resp.aiter_bytes(65536):
+                            f.write(chunk)
+                            total += len(chunk)
+                            if total > DOWNLOAD_MAX_MB * 1024 * 1024:
+                                raise RuntimeError("Файл слишком большой")
+                return filepath, "Видео"
+            except Exception as e:
+                last_err = f"{ep}: {e}"
+                log.debug("cobalt %s: %s", ep, e)
+                continue
+    raise RuntimeError(f"Cobalt: {last_err}")
+
+
+async def _tikwm_download(url: str, outdir: str) -> tuple[str, str]:
+    """TikWM — публичный API для TikTok (без ключа)."""
+    api = "https://www.tikwm.com/api/"
+    async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+        r = await client.get(api, params={"url": url, "hd": 1})
+        r.raise_for_status()
+        data = r.json()
+        if data.get("code") != 0:
+            raise RuntimeError(data.get("msg", "tikwm error"))
+        info = data.get("data", {})
+        link = info.get("hdplay") or info.get("play")
+        if not link:
+            raise RuntimeError("tikwm: нет ссылки")
+        if not link.startswith("http"):
+            link = "https://www.tikwm.com" + link
+        filepath = os.path.join(outdir, f"tt_{random.randint(1000, 9999)}.mp4")
+        async with client.stream("GET", link) as resp:
+            resp.raise_for_status()
+            with open(filepath, "wb") as f:
+                async for chunk in resp.aiter_bytes(65536):
+                    f.write(chunk)
+        title = info.get("title", "TikTok") or "TikTok"
+        return filepath, title
+
+
+async def download_video(url: str, outdir: str) -> tuple[str, str]:
+    """Пытается скачать тремя способами (без ключей)."""
+    errors = []
+
+    # 1. yt-dlp
+    if YTDLP_OK:
+        try:
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(None, _ytdlp_download, url, outdir)
+        except Exception as e:
+            errors.append(f"yt-dlp: {str(e)[:100]}")
+            log.info("yt-dlp failed: %s", e)
+
+    # 2. Cobalt
+    try:
+        return await _cobalt_download(url, outdir)
+    except Exception as e:
+        errors.append(f"cobalt: {str(e)[:100]}")
+        log.info("cobalt failed: %s", e)
+
+    # 3. TikWM (только TikTok)
+    if "tiktok.com" in url or "vt.tiktok" in url:
+        try:
+            return await _tikwm_download(url, outdir)
+        except Exception as e:
+            errors.append(f"tikwm: {str(e)[:100]}")
+            log.info("tikwm failed: %s", e)
+
+    raise RuntimeError("Не удалось скачать. " + " | ".join(errors)[:300])
+
+
+# ============================================================
+# BUSINESS HANDLERS (порядок важен!)
+# ============================================================
+
+# --- .save ---
+@router.business_message(F.text.regexp(r"^\.save\s*$"))
+async def business_save(message: Message, bot: Bot):
+    await save_business_message(message)
+    if not message.from_user or message.from_user.id != owner_id:
+        return
+    if not message.business_connection_id:
+        return
+
+    target_text = ""
+    if message.reply_to_message and message.reply_to_message.text:
+        target_text = message.reply_to_message.text
+    else:
+        target_text = message.text or ""
+    match = URL_RE.search(target_text)
+    if not match:
+        await bot.edit_message_text(
+            chat_id=message.chat.id, message_id=message.message_id,
+            text="⚠️ Ответь командой <code>.save</code> на сообщение со ссылкой.",
+            business_connection_id=message.business_connection_id
+        )
+        return
+
+    url = match.group(0).rstrip(".,)")
+
+    await bot.edit_message_text(
+        chat_id=message.chat.id, message_id=message.message_id,
+        text="📥 <i>Скачиваю видео…</i>",
+        business_connection_id=message.business_connection_id
+    )
+
+    tmpdir = tempfile.mkdtemp(prefix="save_")
+    try:
+        filepath, title = await download_video(url, tmpdir)
+        if not filepath or not os.path.exists(filepath):
+            raise RuntimeError("Файл не найден после скачивания")
+
+        size_mb = os.path.getsize(filepath) / 1024 / 1024
+        if size_mb > DOWNLOAD_MAX_MB:
+            raise RuntimeError(f"Файл слишком большой ({size_mb:.1f} МБ)")
+
+        await bot.send_video(
+            chat_id=message.chat.id,
+            video=FSInputFile(filepath),
+            caption=f"🎬 <b>{esc(title) or 'Видео'}</b>",
+            business_connection_id=message.business_connection_id
+        )
+        try:
+            await bot.delete_business_messages(
+                business_connection_id=message.business_connection_id,
+                message_ids=[message.message_id]
+            )
+        except Exception:
+            pass
+    except Exception as e:
+        log.error("save failed: %s", e)
+        await bot.edit_message_text(
+            chat_id=message.chat.id, message_id=message.message_id,
+            text=f"⚠️ Не удалось скачать: <code>{esc(str(e)[:200])}</code>",
+            business_connection_id=message.business_connection_id
+        )
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# --- .anim ---
+@router.business_message(F.text.regexp(r"^\.anim(\s+.+)?$"))
+async def business_anim(message: Message, bot: Bot):
+    await save_business_message(message)
+    if not message.from_user or message.from_user.id != owner_id:
+        return
+    if not message.business_connection_id:
+        return
+
+    text = (message.text or "")[5:].strip()
+    if not text:
+        await bot.edit_message_text(
+            chat_id=message.chat.id, message_id=message.message_id,
+            text="⚠️ Используй: <code>.anim Твой текст</code>",
+            business_connection_id=message.business_connection_id
+        )
+        return
+
+    if len(text) > ANIM_MAX_CHARS:
+        text = text[:ANIM_MAX_CHARS]
+
+    bc = message.business_connection_id
+    chat_id = message.chat.id
+
+    try:
+        sent = await bot.send_message(chat_id=chat_id, text="▱", business_connection_id=bc)
+    except Exception as e:
+        log.warning("anim send failed: %s", e)
+        return
+
+    try:
+        await bot.delete_business_messages(business_connection_id=bc, message_ids=[message.message_id])
+    except Exception:
+        pass
+
+    n = len(text)
+    for i in range(1, n + 1):
+        partial = text[:i]
+        ratio = i / n
+        if ratio < 0.3:
+            styled = f"<i>{esc(partial)}</i>"
+        elif ratio < 0.55:
+            styled = f"<b>{esc(partial)}</b>"
+        elif ratio < 0.75:
+            styled = f"<s>{esc(partial)}</s>"
+        elif ratio < 0.9:
+            styled = f"<b><i>{esc(partial)}</i></b>"
+        else:
+            styled = f"<code>{esc(partial)}</code>"
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id, message_id=sent.message_id,
+                text=styled, business_connection_id=bc
+            )
+        except TelegramBadRequest:
+            pass
+        except Exception as e:
+            log.debug("anim edit: %s", e)
+        await asyncio.sleep(ANIM_DELAY)
+
+    try:
+        await bot.edit_message_text(
+            chat_id=chat_id, message_id=sent.message_id,
+            text=esc(text), business_connection_id=bc
+        )
+    except Exception:
+        pass
+
+
+# --- .ai ---
+@router.business_message(F.text.regexp(r"^\.ai(\s+.+)?$"))
+async def business_ai(message: Message, bot: Bot):
+    await save_business_message(message)
+    if not message.from_user or message.from_user.id != owner_id:
+        return
+    if not message.business_connection_id:
+        return
+
+    bc = message.business_connection_id
+    chat_id = message.chat.id
+
+    can, used, limit, is_premium = await check_limit(owner_id)
+    if not can:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text=f"⭐ Купить Premium ({PREMIUM_PRICE_STARS}⭐)",
+                callback_data="buy_premium"
+            )]
+        ])
+        await bot.edit_message_text(
+            chat_id=chat_id, message_id=message.message_id,
+            text=(f"⚠️ <b>Лимит исчерпан</b>\n"
+                  f"Использовано: <b>{used}/{limit}</b> за сегодня.\n\n"
+                  f"Купи Premium в личке с ботом → /start → 🤖 ИИ-подписка."),
+            business_connection_id=bc, reply_markup=kb
+        )
+        return
+
+    prompt = (message.text or "")[3:].strip()
+    if not prompt:
+        await bot.edit_message_text(
+            chat_id=chat_id, message_id=message.message_id,
+            text=f"🤖 Используй: <code>.ai Твой вопрос</code>\n"
+                 f"Осталось сегодня: <b>{limit - used}</b>",
+            business_connection_id=bc
+        )
+        return
+
+    try:
+        thinking = await bot.send_message(
+            chat_id=chat_id, text="🤖 <i>Думаю…</i>",
+            business_connection_id=bc
+        )
+    except Exception as e:
+        log.warning("ai send failed: %s", e)
+        return
+
+    try:
+        await bot.delete_business_messages(business_connection_id=bc, message_ids=[message.message_id])
+    except Exception:
+        pass
+
+    try:
+        answer = await ask_ai(prompt)
+        answer = answer[:4000]
+        await bot.edit_message_text(
+            chat_id=chat_id, message_id=thinking.message_id,
+            text=f"🤖 {esc(answer)}",
+            business_connection_id=bc
+        )
+        await increment_usage(owner_id)
+    except Exception as e:
+        log.error("AI error: %s", e)
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id, message_id=thinking.message_id,
+                text=f"⚠️ Ошибка: <code>{esc(str(e)[:200])}</code>",
+                business_connection_id=bc
+            )
+        except Exception:
+            pass
+
+
+# --- .qr ---
+@router.business_message(F.text.regexp(r"^\.qr(\s+.+)?$"))
+async def business_qr(message: Message, bot: Bot):
+    await save_business_message(message)
+    if not message.from_user or message.from_user.id != owner_id:
+        return
+    if not message.business_connection_id:
+        return
+
+    bc = message.business_connection_id
+    text = (message.text or "")[3:].strip()
+    if not text:
+        await bot.edit_message_text(
+            chat_id=message.chat.id, message_id=message.message_id,
+            text="⚠️ Используй: <code>.qr текст или ссылка</code>",
+            business_connection_id=bc
+        )
+        return
+
+    try:
+        import qrcode
+        buf = BytesIO()
+        qrcode.make(text).save(buf, format="PNG")
+        buf.seek(0)
+        await bot.send_photo(
+            chat_id=message.chat.id,
+            photo=BufferedInputFile(buf.read(), filename="qr.png"),
+            caption=f"🔳 QR для: <code>{esc(text[:200])}</code>",
+            business_connection_id=bc
+        )
+        try:
+            await bot.delete_business_messages(business_connection_id=bc, message_ids=[message.message_id])
+        except Exception:
+            pass
+    except ImportError:
+        await bot.edit_message_text(
+            chat_id=message.chat.id, message_id=message.message_id,
+            text="⚠️ Установи <code>qrcode[pil]</code> на сервере.",
+            business_connection_id=bc
+        )
+    except Exception as e:
+        await bot.edit_message_text(
+            chat_id=message.chat.id, message_id=message.message_id,
+            text=f"⚠️ {esc(str(e)[:200])}",
+            business_connection_id=bc
+        )
+
+
+# --- Остальные команды ---
+@router.business_message(F.text.regexp(r"^\.(help|whois|typing|mute(?:\s+\d+)?|unmute|muted|id|ping|note(?:\s+.+)?|game)$"))
 async def business_commands(message: Message, bot: Bot):
     await save_business_message(message)
     if not message.from_user or message.from_user.id != owner_id:
@@ -671,34 +1038,28 @@ async def business_commands(message: Message, bot: Bot):
                 business_connection_id=bc, reply_markup=kb
             )
         except TelegramBadRequest as e:
-            log.warning("edit failed: %s", e)
+            log.warning("edit: %s", e)
 
     try:
         if cmd == ".help":
             await edit(
-                "🤖 <b>Секретарь — команды</b>\n"
-                "─────────────────\n"
-                "<code>.help</code> · список команд\n"
-                "<code>.whois</code> · карточка собеседника\n"
-                "<code>.typing</code> · эффект «печатает»\n"
-                "<code>.mute 60</code> · мут на 60 сек\n"
-                "<code>.unmute</code> · снять мут\n"
-                "<code>.muted</code> · список мутов\n"
-                "<code>.id</code> · техническая информация\n"
-                "<code>.note текст</code> · сохранить заметку\n"
-                "<code>.note</code> · показать заметку\n"
-                "<code>.ping</code> · проверка связи\n"
-                "<code>.game</code> · игры"
+                "🤖 <b>Команды</b>\n"
+                "<code>.ai вопрос</code> · ИИ\n"
+                "<code>.save</code> (ответом) · скачать видео\n"
+                "<code>.anim текст</code> · анимация\n"
+                "<code>.qr текст</code> · QR\n"
+                "<code>.whois</code> · карточка\n"
+                "<code>.typing</code> · печатает…\n"
+                "<code>.mute 60</code> · <code>.unmute</code> · <code>.muted</code>\n"
+                "<code>.id</code> · <code>.ping</code> · <code>.note</code> · <code>.game</code>"
             )
         elif cmd == ".ping":
-            await edit("🏓 <b>Pong!</b> Бот на связи.")
+            await edit("🏓 <b>Pong!</b>")
         elif cmd == ".id":
             await edit(
-                "🆔 <b>Технические ID</b>\n"
-                "─────────────────\n"
-                f"💬 Чат: <code>{chat_id}</code>\n"
+                f"🆔 Чат: <code>{chat_id}</code>\n"
                 f"👤 Ты: <code>{message.from_user.id}</code>\n"
-                f"🔗 Соединение: <code>{esc(bc)}</code>"
+                f"🔗 BC: <code>{esc(bc)}</code>"
             )
         elif cmd == ".whois":
             async with aiosqlite.connect(DB_PATH) as db:
@@ -706,7 +1067,7 @@ async def business_commands(message: Message, bot: Bot):
                 cur = await db.execute("SELECT * FROM contacts WHERE chat_id=?", (chat_id,))
                 row = await cur.fetchone()
             if not row:
-                await edit("👤 Карточка пока пуста — нет сохранённой истории.")
+                await edit("👤 Карточка пуста.")
             else:
                 first = "—"
                 try:
@@ -715,19 +1076,16 @@ async def business_commands(message: Message, bot: Bot):
                     pass
                 uname = f"@{esc(row['username'])}" if row["username"] else "—"
                 await edit(
-                    "👤 <b>Карточка собеседника</b>\n"
-                    "─────────────────\n"
-                    f"📛 Имя: <b>{esc(row['user_name'])}</b>\n"
-                    f"🆔 ID: <code>{row['user_id']}</code>\n"
-                    f"🔗 Username: {uname}\n"
-                    f"📅 Первый контакт: {esc(first)}\n"
+                    "👤 <b>Карточка</b>\n"
+                    f"📛 <b>{esc(row['user_name'])}</b>\n"
+                    f"🆔 <code>{row['user_id']}</code>\n"
+                    f"🔗 {uname}\n"
+                    f"📅 {esc(first)}\n"
                     f"💬 Сообщений: <b>{row['message_count']}</b>"
                 )
         elif cmd == ".typing":
             try:
-                await bot.send_chat_action(
-                    chat_id=chat_id, action=ChatAction.TYPING, business_connection_id=bc
-                )
+                await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING, business_connection_id=bc)
             except Exception:
                 pass
             await edit("⌨️ <i>Печатает…</i>")
@@ -735,16 +1093,16 @@ async def business_commands(message: Message, bot: Bot):
             if not arg:
                 row = await get_note(chat_id)
                 if row and row[0]:
-                    await edit(f"📝 <b>Заметка о чате</b>\n\n{esc(row[0])}")
+                    await edit(f"📝 {esc(row[0])}")
                 else:
-                    await edit("📝 Заметки пока нет.\nИспользуй <code>.note текст</code> для сохранения.")
+                    await edit("📝 Заметок нет.")
             else:
                 await set_note(chat_id, arg)
-                await edit(f"📝 <b>Заметка сохранена:</b>\n\n{esc(arg)}")
+                await edit(f"📝 Сохранено: {esc(arg)}")
         elif cmd.startswith(".mute"):
+            tokens = arg.split()
             seconds = 60
             target = None
-            tokens = arg.split()
             if tokens:
                 try:
                     seconds = max(1, min(int(tokens[0]), 86400))
@@ -764,7 +1122,7 @@ async def business_commands(message: Message, bot: Bot):
                     )
                     row = await cur.fetchone()
                 if not row:
-                    await edit("⚠️ Не удалось определить собеседника. Укажи ID: <code>.mute 60 123456</code>")
+                    await edit("⚠️ Укажи ID: <code>.mute 60 123456</code>")
                     return
                 target = row[0]
             until = utcnow() + timedelta(seconds=seconds)
@@ -774,7 +1132,7 @@ async def business_commands(message: Message, bot: Bot):
                     (chat_id, target, until.isoformat())
                 )
                 await db.commit()
-            await edit(f"🔇 <b>Мут установлен</b>\nПользователь: <code>{target}</code>\nДо: {until.astimezone().strftime('%H:%M:%S')} ({seconds} сек)")
+            await edit(f"🔇 Мут <code>{target}</code> до {until.astimezone().strftime('%H:%M:%S')}")
         elif cmd == ".unmute":
             async with aiosqlite.connect(DB_PATH) as db:
                 cur = await db.execute(
@@ -787,17 +1145,16 @@ async def business_commands(message: Message, bot: Bot):
                     await db.execute("DELETE FROM mutes WHERE chat_id=? AND target_user_id=?",
                                      (chat_id, row[0]))
                     await db.commit()
-            await edit("🔊 <b>Мут снят</b>")
+            await edit("🔊 Мут снят.")
         elif cmd == ".muted":
             async with aiosqlite.connect(DB_PATH) as db:
                 cur = await db.execute(
-                    "SELECT target_user_id, mute_until FROM mutes WHERE chat_id=? "
-                    "AND mute_until > ? ORDER BY mute_until",
+                    "SELECT target_user_id, mute_until FROM mutes WHERE chat_id=? AND mute_until > ?",
                     (chat_id, utcnow().isoformat())
                 )
                 rows = await cur.fetchall()
             if not rows:
-                await edit("🔊 Активных мутов нет.")
+                await edit("🔊 Мутов нет.")
             else:
                 lines = []
                 for uid, until in rows:
@@ -806,12 +1163,12 @@ async def business_commands(message: Message, bot: Bot):
                     except Exception:
                         t = "—"
                     lines.append(f"• <code>{uid}</code> до {t}")
-                await edit("🔇 <b>Активные муты</b>\n\n" + "\n".join(lines))
+                await edit("🔇 <b>Муты</b>\n" + "\n".join(lines))
         elif cmd == ".game":
             await edit(
-                "🎮 <b>Выбери игру</b>",
+                "🎮 <b>Игры</b>",
                 InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="🔫 Русская рулетка",
+                    [InlineKeyboardButton(text="🔫 Рулетка",
                                           callback_data=f"game:roulette:{chat_id}:{bc}")],
                     [InlineKeyboardButton(text="⭕❌ Крестики-нолики",
                                           callback_data=f"game:ttt:{chat_id}:{bc}")],
@@ -819,21 +1176,13 @@ async def business_commands(message: Message, bot: Bot):
                                           callback_data=f"game:guess:{chat_id}:{bc}")],
                 ])
             )
-        else:
-            await edit("❓ Неизвестная команда. Напиши <code>.help</code>")
-
     except (TelegramBadRequest, TelegramForbiddenError) as e:
-        log.warning("Business command failed: %s", e)
-        try:
-            await bot.send_message(owner_id, f"⚠️ Команда <code>{esc(cmd)}</code> не выполнена: {esc(e)}")
-        except Exception:
-            pass
+        log.warning("command failed: %s", e)
 
 
-# 2) Guess number input — до общего
-@router.business_message(GuessGameActive())
+# --- Угадай число ---
+@router.business_message(F.text.regexp(r"^\d{1,3}$"))
 async def guess_input(message: Message):
-    await save_business_message(message)
     if not message.from_user:
         return
     chat_id = message.chat.id
@@ -843,13 +1192,13 @@ async def guess_input(message: Message):
     key, game = active[-1]
     try:
         guess = int(message.text)
-    except (ValueError, TypeError):
+    except ValueError:
         return
     if not 1 <= guess <= 100:
         return
     game["tries"] += 1
     if guess == game["number"]:
-        await message.answer(f"🎉 <b>Верно!</b> Число <b>{guess}</b>. Попыток: {game['tries']}.")
+        await message.answer(f"🎉 Верно! {guess}. Попыток: {game['tries']}.")
         guess_games.pop(key, None)
     elif guess < game["number"]:
         await message.answer("⬆️ Больше")
@@ -857,7 +1206,7 @@ async def guess_input(message: Message):
         await message.answer("⬇️ Меньше")
 
 
-# 3) Общий обработчик — ПОСЛЕДНИМ
+# --- Общий обработчик (ПОСЛЕДНИМ) ---
 @router.business_message()
 async def business_message_handler(message: Message, bot: Bot):
     await save_business_message(message)
@@ -867,7 +1216,7 @@ async def business_message_handler(message: Message, bot: Bot):
     if not sender or sender.id == owner_id:
         return
 
-    # Mute: удаление и уведомление
+    # Mute
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
             "SELECT mute_until FROM mutes WHERE chat_id=? AND target_user_id=?",
@@ -888,7 +1237,7 @@ async def business_message_handler(message: Message, bot: Bot):
                 try:
                     notice = await bot.send_message(
                         chat_id=message.chat.id,
-                        text=f"🔇 <i>Пользователь в муте до {until.astimezone().strftime('%H:%M:%S')}</i>",
+                        text=f"🔇 <i>Мут до {until.astimezone().strftime('%H:%M:%S')}</i>",
                         business_connection_id=message.business_connection_id
                     )
                     async def _del():
@@ -904,10 +1253,6 @@ async def business_message_handler(message: Message, bot: Bot):
                 except Exception:
                     pass
                 return
-            async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute("DELETE FROM mutes WHERE chat_id=? AND target_user_id=?",
-                                 (message.chat.id, sender.id))
-                await db.commit()
         except Exception:
             pass
 
@@ -925,9 +1270,9 @@ async def business_message_handler(message: Message, bot: Bot):
                 business_connection_id=message.business_connection_id
             )
         except Exception as e:
-            log.info("First reply unavailable: %s", e)
+            log.info("first reply: %s", e)
 
-    # Автоответ вне часов
+    # Off-hours
     if s["off_hours_enabled"]:
         now = local_now(s["timezone"]).strftime("%H:%M")
         start, end = s["off_hours_start"], s["off_hours_end"]
@@ -939,32 +1284,21 @@ async def business_message_handler(message: Message, bot: Bot):
                     business_connection_id=message.business_connection_id
                 )
             except Exception as e:
-                log.info("Off-hours reply unavailable: %s", e)
+                log.info("off-hours: %s", e)
 
-    # Пересылка владельцу
+    # Forward to owner
     if s["forward_to_owner_enabled"]:
         try:
-            head = (
-                f"📥 <b>Новое сообщение</b>\n"
-                f"👤 {esc(sender.full_name)} <code>{sender.id}</code>\n"
-                f"💬 Чат: <code>{message.chat.id}</code>"
-            )
+            head = f"📥 <b>{esc(sender.full_name)}</b> <code>{sender.id}</code>"
             if message.text or message.caption:
-                await bot.send_message(
-                    owner_id,
-                    f"{head}\n\n{esc(message.text or message.caption)}"
-                )
+                await bot.send_message(owner_id, f"{head}\n\n{esc(message.text or message.caption)}")
             else:
                 await bot.send_message(owner_id, head)
-                try:
-                    await bot.forward_message(owner_id, message.chat.id, message.message_id)
-                except Exception:
-                    pass
         except Exception as e:
-            log.info("Forward to owner unavailable: %s", e)
+            log.info("forward: %s", e)
 
 
-# ---------- Deleted messages ----------
+# --- Удалённые сообщения ---
 @router.deleted_business_messages()
 async def business_deleted_handler(event: BusinessMessagesDeleted, bot: Bot):
     for mid in event.message_ids:
@@ -979,11 +1313,10 @@ async def business_deleted_handler(event: BusinessMessagesDeleted, bot: Bot):
         direction = "исходящее" if row["is_outgoing"] else "входящее"
         caption = (
             "🗑 <b>Удалённое сообщение</b>\n"
-            "─────────────────\n"
-            f"💬 Чат: <code>{event.chat.id}</code>\n"
-            f"👤 Кто: <b>{esc(row['user_name'])}</b> <code>{row['user_id']}</code>\n"
-            f"🕐 Когда: {esc(stamp)}\n"
-            f"📎 Тип: <i>{esc(row['content_type'])}</i> ({direction})\n\n"
+            f"💬 <code>{event.chat.id}</code>\n"
+            f"👤 <b>{esc(row['user_name'])}</b> <code>{row['user_id']}</code>\n"
+            f"🕐 {esc(stamp)}\n"
+            f"📎 <i>{esc(row['content_type'])}</i> ({direction})\n\n"
             f"{esc(row['text'] or '—')}"
         )
         try:
@@ -1007,10 +1340,10 @@ async def business_deleted_handler(event: BusinessMessagesDeleted, bot: Bot):
             else:
                 await bot.send_message(owner_id, caption)
         except Exception as e:
-            log.warning("Could not notify deleted message %s: %s", mid, e)
+            log.warning("deleted notify: %s", e)
 
 
-# ---------- Games ----------
+# --- Игры ---
 @router.callback_query(F.data.startswith("game:"))
 async def game_callback(call: CallbackQuery, bot: Bot):
     if not call.message:
@@ -1024,16 +1357,13 @@ async def game_callback(call: CallbackQuery, bot: Bot):
         roulette_games[(chat_id, call.message.message_id)] = 0
         kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
             text="🔄 Крутить",
-            callback_data=f"roulette:spin:{chat_id}:{call.message.message_id}:{bc}"
-        )]])
-        await call.message.edit_text(
-            "🔫 <b>Русская рулетка</b>\n6 камер, 1 патрон. Нажми «Крутить».",
-            reply_markup=kb
-        )
+            callback_data=f"roulette:spin:{chat_id}:{call.message.message_id}:{bc}")]])
+        await call.message.edit_text("🔫 <b>Русская рулетка</b>\n6 камер, 1 патрон.", reply_markup=kb)
     elif kind == "guess":
-        number = random.randint(1, 100)
-        guess_games[(chat_id, call.message.message_id)] = {"number": number, "tries": 0, "bc": bc}
-        await call.message.edit_text("🎲 <b>Угадай число</b>\nЯ загадал от 1 до 100. Отправляй догадки в чат.")
+        guess_games[(chat_id, call.message.message_id)] = {
+            "number": random.randint(1, 100), "tries": 0, "bc": bc
+        }
+        await call.message.edit_text("🎲 <b>Угадай число</b> от 1 до 100.")
     elif kind == "ttt":
         ttt_games[(chat_id, call.message.message_id)] = {
             "board": [""] * 9, "turn": "❌", "owner": owner_id,
@@ -1047,16 +1377,12 @@ async def render_ttt(message, chat_id, mid):
     game = ttt_games[(chat_id, mid)]
     kb = []
     for r in range(3):
-        kb.append([
-            InlineKeyboardButton(
-                text=game["board"][r*3+c] or "·",
-                callback_data=f"ttt:move:{chat_id}:{mid}:{r*3+c}"
-            ) for c in range(3)
-        ])
-    await message.edit_text(
-        f"⭕❌ <b>Крестики-нолики</b>\nХод: <b>{game['turn']}</b>",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb)
-    )
+        kb.append([InlineKeyboardButton(
+            text=game["board"][r*3+c] or "·",
+            callback_data=f"ttt:move:{chat_id}:{mid}:{r*3+c}"
+        ) for c in range(3)])
+    await message.edit_text(f"⭕❌ Ход: <b>{game['turn']}</b>",
+                            reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
 
 @router.callback_query(F.data.startswith("roulette:spin:"))
@@ -1065,16 +1391,15 @@ async def roulette_spin(call: CallbackQuery):
     chat_id, mid = int(p[2]), int(p[3])
     key = (chat_id, mid)
     if key not in roulette_games:
-        await call.answer("Игра уже закончена", show_alert=True)
+        await call.answer("Игра окончена", show_alert=True)
         return
     if random.randint(1, 6) == 1:
         roulette_games.pop(key, None)
         await call.message.edit_text("💥 <b>Бах!</b> Игра окончена.")
     else:
         kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
-            text="🔄 Крутить", callback_data=call.data
-        )]])
-        await call.message.edit_text("😮‍💨 Щёлк! Повезло. Продолжить?", reply_markup=kb)
+            text="🔄 Крутить", callback_data=call.data)]])
+        await call.message.edit_text("😮‍💨 Щёлк! Ещё?", reply_markup=kb)
     await call.answer()
 
 
@@ -1094,19 +1419,19 @@ async def ttt_move(call: CallbackQuery):
             return
         game["opponent"] = uid
     elif uid not in {owner_id, game["opponent"]}:
-        await call.answer("Ты не участвуешь в этой игре", show_alert=True)
+        await call.answer("Не твоя игра", show_alert=True)
         return
-    expected_uid = owner_id if game["turn"] == "❌" else game["opponent"]
-    if uid != expected_uid:
-        await call.answer("Сейчас ход другого игрока", show_alert=True)
+    expected = owner_id if game["turn"] == "❌" else game["opponent"]
+    if uid != expected:
+        await call.answer("Сейчас ход другого", show_alert=True)
         return
     if game["board"][idx]:
-        await call.answer("Клетка занята", show_alert=True)
+        await call.answer("Занято", show_alert=True)
         return
     game["board"][idx] = game["turn"]
     b = game["board"]
     wins = [(0,1,2),(3,4,5),(6,7,8),(0,3,6),(1,4,7),(2,5,8),(0,4,8),(2,4,6)]
-    winner = next((b[a] for a, c, d in wins if b[a] and b[a] == b[c] == b[d]), None)
+    winner = next((b[a] for a,c,d in wins if b[a] and b[a]==b[c]==b[d]), None)
     if winner:
         game["ended"] = True
         await call.message.edit_text(f"🏆 Победили <b>{winner}</b>!", reply_markup=None)
@@ -1119,50 +1444,33 @@ async def ttt_move(call: CallbackQuery):
     await call.answer()
 
 
-# ---------- Business connection hook ----------
 @router.business_connection()
-async def business_connections_handler(connection: BusinessConnection, bot: Bot):
-    log.info("Business connection %s, enabled=%s", connection.id, connection.is_enabled)
-    try:
-        if connection.is_enabled:
-            await bot.send_message(
-                owner_id,
-                f"✅ <b>Business-подключение активно</b>\nID: <code>{esc(connection.id)}</code>"
-            )
-        else:
-            await bot.send_message(
-                owner_id,
-                f"⚠️ <b>Business-подключение отключено</b>\nID: <code>{esc(connection.id)}</code>"
-            )
-    except Exception:
-        pass
+async def business_connection_handler(connection: BusinessConnection, bot: Bot):
+    log.info("Business connection %s enabled=%s", connection.id, connection.is_enabled)
 
 
-# ---------- Background task: name with time ----------
 async def update_business_name(bot: Bot):
     while True:
         try:
             s = await get_settings()
             if s["time_in_nick_enabled"]:
                 me = await bot.get_me()
-                base = me.first_name or "Secretary"
                 clock = local_now(s["timezone"]).strftime("%H:%M")
-                desired = f"{base} [{clock}]"[:64]
+                desired = f"{me.first_name or 'Secretary'} [{clock}]"[:64]
                 method = getattr(bot, "set_business_account_name", None)
                 if method:
                     async with name_update_lock:
                         await method(name=desired)
-        except Exception as e:
-            log.info("Business account name update unavailable: %s", e)
+        except Exception:
+            pass
         await asyncio.sleep(60)
 
 
-# ---------- Entry point ----------
 async def main():
     if not api_token:
-        raise RuntimeError("Не найден API_TOKEN в .env")
-    if not isinstance(owner_id, int) or owner_id <= 0:
-        raise RuntimeError("Укажи корректный числовой OWNER_ID в .env")
+        raise RuntimeError("Нет API_TOKEN в .env")
+    if owner_id <= 0:
+        raise RuntimeError("Некорректный OWNER_ID в .env")
     await init_db()
     bot = Bot(api_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
