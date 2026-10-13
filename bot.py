@@ -2216,29 +2216,50 @@ async def download_video(url: str, outdir: str) -> tuple[str, str]:
 # BUSINESS HANDLERS (мультиюзер)
 # ============================================================
 
+# In-memory кэш: business_connection_id → user_id
+connection_cache = {}
+
+
 async def _resolve_owner(message: Message):
-    """Возвращает user_id владельца бизнес-коннекта для этого сообщения."""
+    """
+    Возвращает user_id владельца бизнес-коннекта.
+    Приоритет: in-memory кэш → БД → fallback на owner_id.
+    """
     if not message.business_connection_id:
         return None
-    owner_uid = await get_connection_owner(message.business_connection_id)
-    return owner_uid
+    bc = message.business_connection_id
+    # 1. In-memory кэш
+    if bc in connection_cache:
+        return connection_cache[bc]
+    # 2. БД
+    owner_uid = await get_connection_owner(bc)
+    if owner_uid:
+        connection_cache[bc] = owner_uid
+        return owner_uid
+    # 3. Fallback — работаем как владелец из .env
+    log.warning("Connection %s not in DB, fallback to owner_id", bc)
+    connection_cache[bc] = owner_id
+    return owner_id
 
 
 async def _check_owner_command(message: Message):
     """
-    Проверяет, что команду пишет владелец бизнес-аккаунта (автор сообщения).
-    Возвращает owner_uid или None.
+    Проверяет, что команда пришла от владельца бизнес-аккаунта.
+    Мягкая проверка: пропускает, но блокирует чужие dot-команды.
     """
     if not message.from_user or not message.business_connection_id:
         return None
-    owner_uid = await get_connection_owner(message.business_connection_id)
+    owner_uid = await _resolve_owner(message)
     if not owner_uid:
         return None
-    # Команда считается "от владельца", если её написал сам владелец ИЛИ
-    # сообщение исходящее (from_user == owner)
-    if message.from_user.id != owner_uid:
-        return None
-    if await is_banned(owner_uid):
+    # Если команда от самого владельца — точно ОК
+    if message.from_user.id == owner_uid:
+        if await is_banned(owner_uid):
+            return None
+        return owner_uid
+    # Если нет — блокируем только dot-команды от чужих
+    text = (message.text or "").strip()
+    if text.startswith("."):
         return None
     return owner_uid
 
@@ -2385,7 +2406,6 @@ async def business_ai(message: Message, bot: Bot):
     bc = message.business_connection_id
     chat_id = message.chat.id
 
-    # Cooldown
     ok, seconds = await check_cooldown(owner_uid)
     if not ok:
         await bot.edit_message_text(
@@ -2395,7 +2415,6 @@ async def business_ai(message: Message, bot: Bot):
         )
         return
 
-    # Лимит
     can, used, limit, premium = await check_limit(owner_uid)
     if not can:
         kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -2506,7 +2525,7 @@ async def business_qr(message: Message, bot: Bot):
         )
 
 
-# ---------- .help / .ping / .id / .whois / .typing / .note / .mute / .unmute / .muted / .game ----------
+# ---------- Остальные команды ----------
 @router.business_message(F.text.regexp(r"^\.(help|whois|typing|mute(?:\s+\d+(?:\s+\d+)?)?|unmute|muted|id|ping|note(?:\s+.+)?|game)$"))
 async def business_commands(message: Message, bot: Bot):
     owner_uid = await _check_owner_command(message)
@@ -2621,7 +2640,7 @@ async def business_commands(message: Message, bot: Bot):
                     return
                 target = row[0]
 
-            # ===== ИММУНИТЕТ PREMIUM =====
+            # ИММУНИТЕТ PREMIUM
             if await is_premium(target):
                 await edit("⛔ Пользователь защищён Premium-иммунитетом")
                 return
@@ -2805,10 +2824,11 @@ async def business_message_handler(message: Message, bot: Bot):
 # ---------- Удалённые сообщения ----------
 @router.deleted_business_messages()
 async def business_deleted_handler(event: BusinessMessagesDeleted, bot: Bot):
-    owner_uid = await get_connection_owner(event.business_connection_id)
+    owner_uid = connection_cache.get(event.business_connection_id)
     if not owner_uid:
-        return
-    premium_owner = await is_premium(owner_uid)
+        owner_uid = await get_connection_owner(event.business_connection_id)
+    if not owner_uid:
+        owner_uid = owner_id
 
     for mid in event.message_ids:
         row = await find_message(event.chat.id, mid)
@@ -2863,7 +2883,7 @@ async def game_callback(call: CallbackQuery, bot: Bot):
     kind = parts[1]
     chat_id = int(parts[2])
     bc = ":".join(parts[3:])
-    owner_uid = await get_connection_owner(bc)
+    owner_uid = connection_cache.get(bc) or await get_connection_owner(bc) or owner_id
     if kind == "roulette":
         roulette_games[(chat_id, call.message.message_id)] = 0
         kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
@@ -2967,13 +2987,28 @@ async def business_connection_handler(connection: BusinessConnection, bot: Bot):
     if not connection.user:
         return
     user_id = connection.user.id
+
+    # Кэшируем в память
+    connection_cache[connection.id] = user_id
+
+    # Узнаём предыдущий статус
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT enabled FROM business_connections WHERE id=?",
+            (connection.id,)
+        )
+        row = await cur.fetchone()
+    prev_enabled = bool(row[0]) if row else None
+
     await save_connection(connection.id, user_id, connection.is_enabled)
     await ensure_user(user_id, connection.user.first_name, connection.user.username)
 
-    # Сообщение юзеру
+    # Уведомляем только при смене статуса
+    if prev_enabled == connection.is_enabled:
+        return
+
     try:
         if connection.is_enabled:
-            # Проверка подписки на канал — только для новых
             if user_id != owner_id and not await check_subscription(user_id):
                 await bot.send_message(
                     user_id,
@@ -2985,14 +3020,13 @@ async def business_connection_handler(connection: BusinessConnection, bot: Bot):
                 await bot.send_message(
                     user_id,
                     "✅ <b>BobMod подключён к вашему бизнес-аккаунту</b>\n\n"
-                    "Теперь бот работает в ваших чатах.\n"
                     "Команды: /start · /settings · /ref"
                 )
         else:
             await bot.send_message(
                 user_id,
                 "⚠️ <b>BobMod отключён от бизнес-аккаунта</b>\n\n"
-                "Чтобы вернуть — подключите бота заново в настройках Telegram Business."
+                "Чтобы вернуть — подключите бота заново."
             )
     except Exception as e:
         log.info("notify business: %s", e)
