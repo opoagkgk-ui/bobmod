@@ -1996,3 +1996,858 @@ async def weekly_publish_loop():
         except Exception as e:
             log.warning("weekly publish err: %s", e)
             await asyncio.sleep(3600)
+
+# ============================================================
+# VIDEO DOWNLOAD HELPERS
+# ============================================================
+
+def _ytdlp_download(url: str, outdir: str) -> tuple[str, str]:
+    opts = {
+        "outtmpl": os.path.join(outdir, "%(id)s.%(ext)s"),
+        "format": "mp4/best[ext=mp4]/best",
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "max_filesize": DOWNLOAD_MAX_MB * 1024 * 1024,
+        "retries": 2,
+        "socket_timeout": 30,
+    }
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        return ydl.prepare_filename(info), info.get("title", "") or "Видео"
+
+
+async def _cobalt_download(url: str, outdir: str) -> tuple[str, str]:
+    endpoints = [
+        "https://api.cobalt.tools/",
+        "https://co.wuk.sh/api/json",
+        "https://cobalt-api.kwiatekmiki.com/",
+    ]
+    headers = {"Accept": "application/json", "Content-Type": "application/json"}
+    last_err = None
+    async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+        for ep in endpoints:
+            try:
+                r = await client.post(ep, headers=headers, json={"url": url})
+                if r.status_code != 200:
+                    last_err = f"{ep}: HTTP {r.status_code}"
+                    continue
+                data = r.json()
+                link = data.get("url") or data.get("audio")
+                if not link:
+                    last_err = f"{ep}: нет ссылки"
+                    continue
+                filepath = os.path.join(outdir, f"cobalt_{random.randint(1000, 9999)}.mp4")
+                total = 0
+                async with client.stream("GET", link) as resp:
+                    resp.raise_for_status()
+                    with open(filepath, "wb") as f:
+                        async for chunk in resp.aiter_bytes(65536):
+                            f.write(chunk)
+                            total += len(chunk)
+                            if total > DOWNLOAD_MAX_MB * 1024 * 1024:
+                                raise RuntimeError("Файл превышает допустимый размер")
+                return filepath, "Видео"
+            except Exception as e:
+                last_err = f"{ep}: {e}"
+                continue
+    raise RuntimeError(f"Cobalt: {last_err}")
+
+
+async def _tikwm_download(url: str, outdir: str) -> tuple[str, str]:
+    api = "https://www.tikwm.com/api/"
+    async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+        r = await client.get(api, params={"url": url, "hd": 1})
+        r.raise_for_status()
+        data = r.json()
+        if data.get("code") != 0:
+            raise RuntimeError(data.get("msg", "tikwm error"))
+        info = data.get("data", {})
+        link = info.get("hdplay") or info.get("play")
+        if not link:
+            raise RuntimeError("Ссылка не найдена")
+        if not link.startswith("http"):
+            link = "https://www.tikwm.com" + link
+        filepath = os.path.join(outdir, f"tt_{random.randint(1000, 9999)}.mp4")
+        async with client.stream("GET", link) as resp:
+            resp.raise_for_status()
+            with open(filepath, "wb") as f:
+                async for chunk in resp.aiter_bytes(65536):
+                    f.write(chunk)
+        return filepath, info.get("title", "TikTok") or "TikTok"
+
+
+async def download_video(url: str, outdir: str) -> tuple[str, str]:
+    errors = []
+    if YTDLP_OK:
+        try:
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(None, _ytdlp_download, url, outdir)
+        except Exception as e:
+            errors.append(f"yt-dlp: {str(e)[:100]}")
+    try:
+        return await _cobalt_download(url, outdir)
+    except Exception as e:
+        errors.append(f"cobalt: {str(e)[:100]}")
+    if "tiktok.com" in url or "vt.tiktok" in url:
+        try:
+            return await _tikwm_download(url, outdir)
+        except Exception as e:
+            errors.append(f"tikwm: {str(e)[:100]}")
+    raise RuntimeError("Не удалось загрузить. " + " | ".join(errors)[:300])
+
+
+# ============================================================
+# BUSINESS HANDLERS
+# ============================================================
+
+async def _check_owner_business(message: Message) -> bool:
+    """Проверка: владелец + business-контекст."""
+    if not message.from_user or message.from_user.id != owner_id:
+        return False
+    if not message.business_connection_id:
+        return False
+    return True
+
+
+# ---------- .save ----------
+@router.business_message(F.text.regexp(r"^\.save\s*$"))
+async def business_save(message: Message, bot: Bot):
+    if not await _check_owner_business(message):
+        return
+    await save_business_message(message)
+
+    target_text = ""
+    if message.reply_to_message and message.reply_to_message.text:
+        target_text = message.reply_to_message.text
+    else:
+        target_text = message.text or ""
+    match = URL_RE.search(target_text)
+    if not match:
+        await bot.edit_message_text(
+            chat_id=message.chat.id, message_id=message.message_id,
+            text="⚠️ Ответьте командой <code>.save</code> на сообщение со ссылкой.",
+            business_connection_id=message.business_connection_id
+        )
+        return
+
+    url = match.group(0).rstrip(".,)")
+    await bot.edit_message_text(
+        chat_id=message.chat.id, message_id=message.message_id,
+        text="📥 <i>Загружаю видео…</i>",
+        business_connection_id=message.business_connection_id
+    )
+
+    tmpdir = tempfile.mkdtemp(prefix="save_")
+    try:
+        filepath, title = await download_video(url, tmpdir)
+        if not filepath or not os.path.exists(filepath):
+            raise RuntimeError("Файл не найден")
+        size_mb = os.path.getsize(filepath) / 1024 / 1024
+        if size_mb > DOWNLOAD_MAX_MB:
+            raise RuntimeError(f"Файл слишком большой ({size_mb:.1f} МБ)")
+        await bot.send_video(
+            chat_id=message.chat.id,
+            video=FSInputFile(filepath),
+            caption=f"🎬 <b>{esc(title) or 'Видео'}</b>",
+            business_connection_id=message.business_connection_id
+        )
+        try:
+            await bot.delete_business_messages(
+                business_connection_id=message.business_connection_id,
+                message_ids=[message.message_id]
+            )
+        except Exception:
+            pass
+    except Exception as e:
+        log.error("save failed: %s", e)
+        await bot.edit_message_text(
+            chat_id=message.chat.id, message_id=message.message_id,
+            text=f"⚠️ Не удалось загрузить: <code>{esc(str(e)[:200])}</code>",
+            business_connection_id=message.business_connection_id
+        )
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# ---------- .anim ----------
+@router.business_message(F.text.regexp(r"^\.anim(\s+.+)?$"))
+async def business_anim(message: Message, bot: Bot):
+    if not await _check_owner_business(message):
+        return
+    await save_business_message(message)
+
+    text = (message.text or "")[5:].strip()
+    if not text:
+        await bot.edit_message_text(
+            chat_id=message.chat.id, message_id=message.message_id,
+            text="⚠️ Использование: <code>.anim текст</code>",
+            business_connection_id=message.business_connection_id
+        )
+        return
+    if len(text) > ANIM_MAX_CHARS:
+        text = text[:ANIM_MAX_CHARS]
+
+    bc = message.business_connection_id
+    chat_id = message.chat.id
+
+    try:
+        sent = await bot.send_message(chat_id=chat_id, text="▱", business_connection_id=bc)
+    except Exception as e:
+        log.warning("anim send failed: %s", e)
+        return
+
+    try:
+        await bot.delete_business_messages(business_connection_id=bc, message_ids=[message.message_id])
+    except Exception:
+        pass
+
+    n = len(text)
+    for i in range(1, n + 1):
+        partial = text[:i]
+        ratio = i / n
+        if ratio < 0.3:
+            styled = f"<i>{esc(partial)}</i>"
+        elif ratio < 0.55:
+            styled = f"<b>{esc(partial)}</b>"
+        elif ratio < 0.75:
+            styled = f"<s>{esc(partial)}</s>"
+        elif ratio < 0.9:
+            styled = f"<b><i>{esc(partial)}</i></b>"
+        else:
+            styled = f"<code>{esc(partial)}</code>"
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id, message_id=sent.message_id,
+                text=styled, business_connection_id=bc
+            )
+        except TelegramBadRequest:
+            pass
+        except Exception:
+            pass
+        await asyncio.sleep(ANIM_DELAY)
+
+    try:
+        await bot.edit_message_text(
+            chat_id=chat_id, message_id=sent.message_id,
+            text=esc(text), business_connection_id=bc
+        )
+    except Exception:
+        pass
+
+
+# ---------- .ai ----------
+@router.business_message(F.text.regexp(r"^\.ai(\s+.+)?$"))
+async def business_ai(message: Message, bot: Bot):
+    if not await _check_owner_business(message):
+        return
+    await save_business_message(message)
+
+    bc = message.business_connection_id
+    chat_id = message.chat.id
+
+    ok, seconds = await check_cooldown(owner_id)
+    if not ok:
+        await bot.edit_message_text(
+            chat_id=chat_id, message_id=message.message_id,
+            text=f"⏱ <b>Подождите {seconds} сек.</b>\nЗадержка между запросами.",
+            business_connection_id=bc
+        )
+        return
+
+    can, used, limit, premium = await check_limit(owner_id)
+    if not can:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"⭐ Купить Premium ({PREMIUM_PRICE_STARS}⭐)",
+                                  callback_data="buy_premium")]
+        ])
+        await bot.edit_message_text(
+            chat_id=chat_id, message_id=message.message_id,
+            text=(f"⚠️ <b>Лимит исчерпан</b>\n"
+                  f"Использовано: <b>{used}/{limit}</b>\n\n"
+                  f"Оформить Premium: /start → 🤖 Bob AI"),
+            business_connection_id=bc, reply_markup=kb
+        )
+        return
+
+    prompt = (message.text or "")[3:].strip()
+    if not prompt:
+        await bot.edit_message_text(
+            chat_id=chat_id, message_id=message.message_id,
+            text=f"🤖 Использование: <code>.ai вопрос</code>\n"
+                 f"Осталось запросов: <b>{limit - used}</b>",
+            business_connection_id=bc
+        )
+        return
+
+    try:
+        thinking = await bot.send_message(
+            chat_id=chat_id, text="🤖 <i>Обрабатываю запрос…</i>",
+            business_connection_id=bc
+        )
+    except Exception as e:
+        log.warning("ai send failed: %s", e)
+        return
+
+    try:
+        await bot.delete_business_messages(business_connection_id=bc, message_ids=[message.message_id])
+    except Exception:
+        pass
+
+    try:
+        answer = await ask_ai(prompt)
+        answer = answer[:4000]
+        text = f"🤖 {esc(answer)}"
+        text = with_watermark(text, premium)
+        await bot.edit_message_text(
+            chat_id=chat_id, message_id=thinking.message_id,
+            text=text, business_connection_id=bc
+        )
+        await increment_usage(owner_id)
+    except Exception as e:
+        log.error("AI error: %s", e)
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id, message_id=thinking.message_id,
+                text=f"⚠️ Ошибка: <code>{esc(str(e)[:200])}</code>",
+                business_connection_id=bc
+            )
+        except Exception:
+            pass
+
+
+# ---------- .qr ----------
+@router.business_message(F.text.regexp(r"^\.qr(\s+.+)?$"))
+async def business_qr(message: Message, bot: Bot):
+    if not await _check_owner_business(message):
+        return
+    await save_business_message(message)
+
+    bc = message.business_connection_id
+    text = (message.text or "")[3:].strip()
+    if not text:
+        await bot.edit_message_text(
+            chat_id=message.chat.id, message_id=message.message_id,
+            text="⚠️ Использование: <code>.qr текст или ссылка</code>",
+            business_connection_id=bc
+        )
+        return
+    try:
+        import qrcode
+        buf = BytesIO()
+        qrcode.make(text).save(buf, format="PNG")
+        buf.seek(0)
+        await bot.send_photo(
+            chat_id=message.chat.id,
+            photo=BufferedInputFile(buf.read(), filename="qr.png"),
+            caption=f"🔳 QR-код: <code>{esc(text[:200])}</code>",
+            business_connection_id=bc
+        )
+        try:
+            await bot.delete_business_messages(business_connection_id=bc, message_ids=[message.message_id])
+        except Exception:
+            pass
+    except ImportError:
+        await bot.edit_message_text(
+            chat_id=message.chat.id, message_id=message.message_id,
+            text="⚠️ Требуется пакет <code>qrcode[pil]</code>.",
+            business_connection_id=bc
+        )
+    except Exception as e:
+        await bot.edit_message_text(
+            chat_id=message.chat.id, message_id=message.message_id,
+            text=f"⚠️ Ошибка: <code>{esc(str(e)[:200])}</code>",
+            business_connection_id=bc
+        )
+
+
+# ---------- .mute (с иммунитетом) ----------
+async def _find_target_user(chat_id):
+    """Находит последнего не-владельца в чате."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT user_id FROM messages WHERE chat_id=? AND user_id IS NOT NULL "
+            "AND user_id!=? ORDER BY id DESC LIMIT 1",
+            (chat_id, owner_id)
+        )
+        row = await cur.fetchone()
+    return row[0] if row else None
+
+
+# ---------- .game ----------
+@router.business_message(F.text.regexp(r"^\.(help|whois|typing|mute(?:\s+\d+(?:\s+\d+)?)?|unmute|muted|id|ping|note(?:\s+.+)?|game)$"))
+async def business_commands(message: Message, bot: Bot):
+    if not await _check_owner_business(message):
+        return
+    await save_business_message(message)
+
+    raw = (message.text or "").strip()
+    parts = raw.split(maxsplit=2)
+    cmd = parts[0].lower()
+    arg = parts[1].strip() if len(parts) > 1 else ""
+    arg2 = parts[2].strip() if len(parts) > 2 else ""
+    chat_id = message.chat.id
+    bc = message.business_connection_id
+    mid = message.message_id
+
+    async def edit(text, kb=None):
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id, message_id=mid, text=text,
+                business_connection_id=bc, reply_markup=kb
+            )
+        except TelegramBadRequest as e:
+            log.warning("edit: %s", e)
+
+    try:
+        if cmd == ".help":
+            await edit(
+                "🤖 <b>BobMod команды</b>\n"
+                "─────────────\n"
+                "<code>.ai вопрос</code> · запрос к ИИ\n"
+                "<code>.save</code> (ответом) · загрузка видео\n"
+                "<code>.anim текст</code> · анимация\n"
+                "<code>.qr текст</code> · QR-код\n"
+                "<code>.whois</code> · инфо о собеседнике\n"
+                "<code>.typing</code> · показать «печатает»\n"
+                "<code>.mute 60</code> · <code>.unmute</code> · <code>.muted</code>\n"
+                "<code>.note</code> · <code>.id</code> · <code>.ping</code> · <code>.game</code>"
+            )
+        elif cmd == ".ping":
+            await edit("🏓 <b>Бот работает</b>")
+        elif cmd == ".id":
+            await edit(
+                f"🆔 ID чата: <code>{chat_id}</code>\n"
+                f"👤 Ваш ID: <code>{message.from_user.id}</code>\n"
+                f"🔗 Соединение: <code>{esc(bc)}</code>"
+            )
+        elif cmd == ".whois":
+            async with aiosqlite.connect(DB_PATH) as db:
+                db.row_factory = aiosqlite.Row
+                cur = await db.execute("SELECT * FROM contacts WHERE chat_id=?", (chat_id,))
+                row = await cur.fetchone()
+            if not row:
+                await edit("👤 Информации пока нет.")
+            else:
+                first = "—"
+                try:
+                    first = datetime.fromisoformat(row["first_seen"]).astimezone().strftime("%d.%m.%Y %H:%M")
+                except Exception:
+                    pass
+                uname = f"@{esc(row['username'])}" if row["username"] else "—"
+                await edit(
+                    "👤 <b>Информация о собеседнике</b>\n"
+                    "─────────────\n"
+                    f"📛 Имя: <b>{esc(row['user_name'])}</b>\n"
+                    f"🆔 ID: <code>{row['user_id']}</code>\n"
+                    f"🔗 Username: {uname}\n"
+                    f"📅 Первый контакт: {esc(first)}\n"
+                    f"💬 Сообщений: <b>{row['message_count']}</b>"
+                )
+        elif cmd == ".typing":
+            try:
+                await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING, business_connection_id=bc)
+            except Exception:
+                pass
+            await edit("⌨️ <i>Печатает…</i>")
+        elif cmd == ".note":
+            if not arg:
+                row = await get_note(chat_id)
+                if row and row[0]:
+                    await edit(f"📝 {esc(row[0])}")
+                else:
+                    await edit("📝 Заметок нет.")
+            else:
+                full_note = (arg + " " + arg2).strip() if arg2 else arg
+                await set_note(chat_id, full_note)
+                await edit(f"📝 Заметка сохранена: {esc(full_note)}")
+        elif cmd.startswith(".mute"):
+            # Парсим аргументы: .mute 60 [user_id]
+            tokens = (arg + " " + arg2).split()
+            seconds = 60
+            target = None
+            if tokens:
+                try:
+                    seconds = max(1, min(int(tokens[0]), 86400))
+                except ValueError:
+                    pass
+            if len(tokens) > 1:
+                try:
+                    target = int(tokens[1])
+                except ValueError:
+                    pass
+            if target is None:
+                target = await _find_target_user(chat_id)
+                if not target:
+                    await edit("⚠️ Укажите ID: <code>.mute 60 123456</code>")
+                    return
+
+            # === ИММУНИТЕТ PREMIUM ===
+            if await is_premium(target):
+                await edit("⛔ Пользователь защищён Premium-иммунитетом")
+                return
+
+            until = utcnow() + timedelta(seconds=seconds)
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute(
+                    "INSERT OR REPLACE INTO mutes(chat_id,target_user_id,mute_until) VALUES(?,?,?)",
+                    (chat_id, target, until.isoformat())
+                )
+                await db.commit()
+            await edit(f"🔇 Пользователь заглушён на {seconds} сек.")
+        elif cmd == ".unmute":
+            target = await _find_target_user(chat_id)
+            if target:
+                async with aiosqlite.connect(DB_PATH) as db:
+                    await db.execute("DELETE FROM mutes WHERE chat_id=? AND target_user_id=?",
+                                     (chat_id, target))
+                    await db.commit()
+                await edit("🔊 Мут снят")
+            else:
+                await edit("🔊 Активных мутов нет")
+        elif cmd == ".muted":
+            async with aiosqlite.connect(DB_PATH) as db:
+                cur = await db.execute(
+                    "SELECT target_user_id, mute_until FROM mutes WHERE chat_id=? AND mute_until > ?",
+                    (chat_id, utcnow().isoformat())
+                )
+                rows = await cur.fetchall()
+            if not rows:
+                await edit("🔊 Активных мутов нет")
+            else:
+                lines = []
+                for uid, until in rows:
+                    try:
+                        t = datetime.fromisoformat(until).astimezone().strftime("%H:%M:%S")
+                    except Exception:
+                        t = "—"
+                    lines.append(f"• <code>{uid}</code> до {t}")
+                await edit("🔇 <b>Активные муты</b>\n" + "\n".join(lines))
+        elif cmd == ".game":
+            await edit(
+                "🎮 <b>Выберите игру</b>",
+                InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="🔫 Русская рулетка",
+                                          callback_data=f"game:roulette:{chat_id}:{bc}")],
+                    [InlineKeyboardButton(text="⭕❌ Крестики-нолики",
+                                          callback_data=f"game:ttt:{chat_id}:{bc}")],
+                    [InlineKeyboardButton(text="🎲 Угадай число",
+                                          callback_data=f"game:guess:{chat_id}:{bc}")],
+                ])
+            )
+    except (TelegramBadRequest, TelegramForbiddenError) as e:
+        log.warning("command failed: %s", e)
+
+
+# ---------- Guess game ----------
+@router.business_message(F.text.regexp(r"^\d{1,3}$"))
+async def guess_input(message: Message):
+    if not message.from_user:
+        return
+    chat_id = message.chat.id
+    active = [(k, v) for k, v in guess_games.items() if k[0] == chat_id]
+    if not active:
+        return
+    key, game = active[-1]
+    try:
+        guess = int(message.text)
+    except ValueError:
+        return
+    if not 1 <= guess <= 100:
+        return
+    game["tries"] += 1
+    if guess == game["number"]:
+        await message.answer(f"🎉 Верно! Это {guess}. Попыток: {game['tries']}.")
+        guess_games.pop(key, None)
+    elif guess < game["number"]:
+        await message.answer("⬆️ Больше")
+    else:
+        await message.answer("⬇️ Меньше")
+
+
+# ---------- Общий обработчик бизнес-сообщений ----------
+@router.business_message()
+async def business_message_handler(message: Message, bot: Bot):
+    await save_business_message(message)
+    if not message.business_connection_id:
+        return
+    sender = message.from_user
+    if not sender or sender.id == owner_id:
+        return
+
+    # Mute
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT mute_until FROM mutes WHERE chat_id=? AND target_user_id=?",
+            (message.chat.id, sender.id)
+        )
+        row = await cur.fetchone()
+    if row:
+        try:
+            until = datetime.fromisoformat(row[0])
+            if until > utcnow():
+                try:
+                    await bot.delete_business_messages(
+                        business_connection_id=message.business_connection_id,
+                        message_ids=[message.message_id]
+                    )
+                except Exception:
+                    pass
+                try:
+                    notice = await bot.send_message(
+                        chat_id=message.chat.id,
+                        text=f"🔇 <i>Вы в муте до {until.astimezone().strftime('%H:%M:%S')}</i>",
+                        business_connection_id=message.business_connection_id
+                    )
+                    async def _del():
+                        await asyncio.sleep(MUTE_NOTICE_SECONDS)
+                        try:
+                            await bot.delete_business_messages(
+                                business_connection_id=message.business_connection_id,
+                                message_ids=[notice.message_id]
+                            )
+                        except Exception:
+                            pass
+                    asyncio.create_task(_del())
+                except Exception:
+                    pass
+                return
+        except Exception:
+            pass
+
+    s = await get_settings()
+    premium_owner = await is_premium(owner_id)
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT message_count FROM contacts WHERE chat_id=?", (message.chat.id,))
+        cnt_row = await cur.fetchone()
+    count = cnt_row[0] if cnt_row else 1
+    if count == 1 and s["answer_first_enabled"] and s["answer_first_text"]:
+        try:
+            text = with_watermark(s["answer_first_text"], premium_owner)
+            await bot.send_message(
+                message.chat.id, text,
+                business_connection_id=message.business_connection_id
+            )
+        except Exception as e:
+            log.info("first reply: %s", e)
+
+    if s["off_hours_enabled"]:
+        now = local_now(s["timezone"]).strftime("%H:%M")
+        start, end = s["off_hours_start"], s["off_hours_end"]
+        is_off = (start <= now < end) if start <= end else (now >= start or now < end)
+        if is_off:
+            try:
+                text = with_watermark(s["off_hours_text"], premium_owner)
+                await bot.send_message(
+                    message.chat.id, text,
+                    business_connection_id=message.business_connection_id
+                )
+            except Exception as e:
+                log.info("off-hours: %s", e)
+
+    if s["forward_to_owner_enabled"]:
+        try:
+            head = f"📥 <b>{esc(sender.full_name)}</b> <code>{sender.id}</code>"
+            if message.text or message.caption:
+                await bot.send_message(owner_id, f"{head}\n\n{esc(message.text or message.caption)}")
+            else:
+                await bot.send_message(owner_id, head)
+        except Exception as e:
+            log.info("forward: %s", e)
+
+
+# ---------- Удалённые сообщения ----------
+@router.deleted_business_messages()
+async def business_deleted_handler(event: BusinessMessagesDeleted, bot: Bot):
+    for mid in event.message_ids:
+        row = await find_message(event.chat.id, mid)
+        if not row:
+            continue
+        stamp = row["date"]
+        try:
+            stamp = datetime.fromisoformat(stamp).astimezone().strftime("%d.%m.%Y %H:%M:%S")
+        except Exception:
+            pass
+        direction = "исходящее" if row["is_outgoing"] else "входящее"
+        caption = (
+            "🗑 <b>Удалённое сообщение</b>\n"
+            "─────────────\n"
+            f"💬 Чат: <code>{event.chat.id}</code>\n"
+            f"👤 От: <b>{esc(row['user_name'])}</b> <code>{row['user_id']}</code>\n"
+            f"🕐 Время: {esc(stamp)}\n"
+            f"📎 Тип: <i>{esc(row['content_type'])}</i> ({direction})\n\n"
+            f"{esc(row['text'] or '—')}"
+        )
+        try:
+            ctype = row["content_type"]
+            fid = row["media_file_id"]
+            if fid and ctype == "photo":
+                await bot.send_photo(owner_id, fid, caption=caption[:1024])
+            elif fid and ctype == "video":
+                await bot.send_video(owner_id, fid, caption=caption[:1024])
+            elif fid and ctype == "animation":
+                await bot.send_animation(owner_id, fid, caption=caption[:1024])
+            elif fid and ctype == "document":
+                await bot.send_document(owner_id, fid, caption=caption[:1024])
+            elif fid and ctype == "voice":
+                await bot.send_voice(owner_id, fid, caption=caption[:1024])
+            elif fid and ctype == "audio":
+                await bot.send_audio(owner_id, fid, caption=caption[:1024])
+            elif fid and ctype == "sticker":
+                await bot.send_message(owner_id, caption)
+                await bot.send_sticker(owner_id, fid)
+            else:
+                await bot.send_message(owner_id, caption)
+        except Exception as e:
+            log.warning("deleted notify: %s", e)
+
+
+# ---------- Игры ----------
+@router.callback_query(F.data.startswith("game:"))
+async def game_callback(call: CallbackQuery, bot: Bot):
+    if not call.message:
+        await call.answer()
+        return
+    parts = call.data.split(":")
+    kind = parts[1]
+    chat_id = int(parts[2])
+    bc = ":".join(parts[3:])
+    if kind == "roulette":
+        roulette_games[(chat_id, call.message.message_id)] = 0
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+            text="🔄 Крутить",
+            callback_data=f"roulette:spin:{chat_id}:{call.message.message_id}:{bc}")]])
+        await call.message.edit_text("🔫 <b>Русская рулетка</b>\n6 камер, 1 патрон.", reply_markup=kb)
+    elif kind == "guess":
+        guess_games[(chat_id, call.message.message_id)] = {
+            "number": random.randint(1, 100), "tries": 0, "bc": bc
+        }
+        await call.message.edit_text("🎲 <b>Угадай число</b> от 1 до 100. Пишите в чат.")
+    elif kind == "ttt":
+        ttt_games[(chat_id, call.message.message_id)] = {
+            "board": [""] * 9, "turn": "❌", "owner": owner_id,
+            "opponent": None, "bc": bc, "ended": False
+        }
+        await render_ttt(call.message, chat_id, call.message.message_id)
+    await call.answer()
+
+
+async def render_ttt(message, chat_id, mid):
+    game = ttt_games[(chat_id, mid)]
+    kb = []
+    for r in range(3):
+        kb.append([InlineKeyboardButton(
+            text=game["board"][r*3+c] or "·",
+            callback_data=f"ttt:move:{chat_id}:{mid}:{r*3+c}"
+        ) for c in range(3)])
+    await message.edit_text(f"⭕❌ Ход: <b>{game['turn']}</b>",
+                            reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+
+
+@router.callback_query(F.data.startswith("roulette:spin:"))
+async def roulette_spin(call: CallbackQuery):
+    p = call.data.split(":")
+    chat_id, mid = int(p[2]), int(p[3])
+    key = (chat_id, mid)
+    if key not in roulette_games:
+        await call.answer("Игра завершена", show_alert=True)
+        return
+    if random.randint(1, 6) == 1:
+        roulette_games.pop(key, None)
+        await call.message.edit_text("💥 <b>Бах!</b> Игра окончена.")
+    else:
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+            text="🔄 Крутить", callback_data=call.data)]])
+        await call.message.edit_text("😮‍💨 Щёлк. Продолжить?", reply_markup=kb)
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("ttt:move:"))
+async def ttt_move(call: CallbackQuery):
+    p = call.data.split(":")
+    chat_id, mid, idx = int(p[2]), int(p[3]), int(p[4])
+    key = (chat_id, mid)
+    game = ttt_games.get(key)
+    if not game or game["ended"]:
+        await call.answer("Игра завершена", show_alert=True)
+        return
+    uid = call.from_user.id
+    if game["opponent"] is None:
+        if uid == owner_id:
+            await call.answer("Ожидается ход собеседника", show_alert=True)
+            return
+        game["opponent"] = uid
+    elif uid not in {owner_id, game["opponent"]}:
+        await call.answer("Вы не участвуете в игре", show_alert=True)
+        return
+    expected = owner_id if game["turn"] == "❌" else game["opponent"]
+    if uid != expected:
+        await call.answer("Сейчас ход другого игрока", show_alert=True)
+        return
+    if game["board"][idx]:
+        await call.answer("Клетка занята", show_alert=True)
+        return
+    game["board"][idx] = game["turn"]
+    b = game["board"]
+    wins = [(0,1,2),(3,4,5),(6,7,8),(0,3,6),(1,4,7),(2,5,8),(0,4,8),(2,4,6)]
+    winner = next((b[a] for a,c,d in wins if b[a] and b[a]==b[c]==b[d]), None)
+    if winner:
+        game["ended"] = True
+        await call.message.edit_text(f"🏆 Победили <b>{winner}</b>!", reply_markup=None)
+    elif all(b):
+        game["ended"] = True
+        await call.message.edit_text("🤝 Ничья!", reply_markup=None)
+    else:
+        game["turn"] = "⭕" if game["turn"] == "❌" else "❌"
+        await render_ttt(call.message, chat_id, mid)
+    await call.answer()
+
+
+# ---------- Business connection ----------
+@router.business_connection()
+async def business_connection_handler(connection: BusinessConnection, bot: Bot):
+    log.info("Business connection %s enabled=%s", connection.id, connection.is_enabled)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO business_connections(id, user_id, enabled, added_at) VALUES(?,?,?,?)",
+            (connection.id, connection.user.id if connection.user else owner_id,
+             int(connection.is_enabled), utcnow().isoformat())
+        )
+        await db.commit()
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
+
+async def main():
+    global bot_ref
+    if not api_token:
+        raise RuntimeError("Не найден API_TOKEN в .env")
+    if owner_id <= 0:
+        raise RuntimeError("Некорректный OWNER_ID в .env")
+
+    await init_db()
+
+    bot_ref = Bot(api_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    dp = Dispatcher()
+    dp.include_router(router)
+
+    # Фоновые задачи
+    asyncio.create_task(backup_loop())
+    asyncio.create_task(update_business_name())
+    asyncio.create_task(weekly_publish_loop())
+
+    log.info("BobMod started. Owner: %s", owner_id)
+    await dp.start_polling(bot_ref, allowed_updates=dp.resolve_used_update_types() + [
+        "business_connection", "business_message",
+        "edited_business_message", "deleted_business_messages"
+    ])
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        pass 
