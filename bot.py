@@ -7,10 +7,11 @@ import shutil
 import tempfile
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
-import aiosqlite
 import httpx
+import libsql_client
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatAction, ParseMode
@@ -37,6 +38,9 @@ try:
 except ValueError:
     owner_id = 0
 
+TURSO_URL = os.getenv("TURSO_DATABASE_URL", "").strip()
+TURSO_TOKEN = os.getenv("TURSO_AUTH_TOKEN", "").strip()
+
 BOT_NAME = "BobMod"
 BOT_USERNAME = "bobmod_robot"
 CHANNEL_USERNAME = "bobmodinfo"
@@ -49,8 +53,6 @@ SYSTEM_PROMPT = (
     "Если не знаешь ответа — скажи прямо, не выдумывай."
 )
 
-DB_PATH = "bot.db"
-BACKUP_DIR = "backups"
 KEEP_PER_CHAT = 100
 MUTE_NOTICE_SECONDS = 4
 FREE_DAILY_LIMIT = 5
@@ -65,7 +67,6 @@ ANIM_DELAY = 0.25
 REF_BONUS_HOURS = 12
 REF_BONUS_PURCHASE_DAYS = 5
 SUB_CACHE_TTL = 60
-BACKUP_INTERVAL = 3600
 
 TIMEZONES = [
     ("🇷🇺 Москва (UTC+3)", "Europe/Moscow"),
@@ -95,86 +96,165 @@ router = Router()
 guess_games = {}
 roulette_games = {}
 ttt_games = {}
-pending_inputs = {}      # user_id -> action
-pending_admin = {}       # owner_id -> admin action
-sub_cache = {}           # user_id -> (is_subscribed, ts)
+pending_inputs = {}
+pending_admin = {}
+sub_cache = {}
+connection_cache = {}
 name_update_lock = asyncio.Lock()
 bot_ref: Bot = None
 
-
-# ---------------- AI providers ----------------
-AI_PROVIDERS = [
-    {
-        "name": "groq",
-        "url": "https://api.groq.com/openai/v1/chat/completions",
-        "key_env": "GROQ_API_KEY",
-        "model": "openai/gpt-oss-120b",
-    },
-    {
-        "name": "groq-20b",
-        "url": "https://api.groq.com/openai/v1/chat/completions",
-        "key_env": "GROQ_API_KEY",
-        "model": "openai/gpt-oss-20b",
-    },
-    {
-        "name": "openrouter",
-        "url": "https://openrouter.ai/api/v1/chat/completions",
-        "key_env": "OPENROUTER_API_KEY",
-        "model": "openai/gpt-oss-120b:free",
-    },
-    {
-        "name": "mistral",
-        "url": "https://api.mistral.ai/v1/chat/completions",
-        "key_env": "MISTRAL_API_KEY",
-        "model": "mistral-small-latest",
-    },
-]
+# Глобальный Turso-клиент
+db_client: libsql_client.Client = None
 
 
-async def ask_ai(prompt: str) -> str:
-    last_err = None
-    errors_log = []
-    for p in AI_PROVIDERS:
-        key = os.getenv(p["key_env"], "").strip()
-        if not key:
-            errors_log.append(f"{p['name']}: нет ключа")
-            continue
-        for attempt in (1, 2):
-            try:
-                if p["name"] == "mistral":
-                    await asyncio.sleep(1.1)
-                async with httpx.AsyncClient(timeout=60) as client:
-                    r = await client.post(
-                        p["url"],
-                        headers={
-                            "Authorization": f"Bearer {key}",
-                            "Content-Type": "application/json",
-                        },
-                        json={
-                            "model": p["model"],
-                            "messages": [
-                                {"role": "system", "content": SYSTEM_PROMPT},
-                                {"role": "user", "content": prompt},
-                            ],
-                            "max_tokens": 1024,
-                            "temperature": 0.8,
-                        },
-                    )
-                if r.status_code == 200:
-                    log.info("AI ответил через %s", p["name"])
-                    return r.json()["choices"][0]["message"]["content"].strip()
-                if r.status_code == 429 and attempt == 1:
-                    await asyncio.sleep(3)
-                    continue
-                last_err = f"{p['name']}: HTTP {r.status_code} {r.text[:120]}"
-                errors_log.append(last_err)
-                break
-            except Exception as e:
-                last_err = f"{p['name']}: {e}"
-                errors_log.append(last_err)
-                break
-    log.error("Все ИИ упали: %s", " | ".join(errors_log))
-    raise RuntimeError("ИИ недоступен. " + " | ".join(errors_log)[:300])
+# ---------------- Turso DB ----------------
+async def db_execute(sql: str, args: tuple = ()):
+    """Выполнить один запрос. Возвращает ResultSet."""
+    return await db_client.execute(sql, args)
+
+
+async def db_executemany(sql: str, args_list):
+    """Выполнить много запросов."""
+    return await db_client.executemany(sql, args_list)
+
+
+async def db_fetchone(sql: str, args: tuple = ()):
+    """Возвращает первую строку как кортеж или None."""
+    result = await db_client.execute(sql, args)
+    return result.rows[0] if result.rows else None
+
+
+async def db_fetchall(sql: str, args: tuple = ()):
+    """Возвращает все строки как список кортежей."""
+    result = await db_client.execute(sql, args)
+    return list(result.rows)
+
+
+async def db_fetchval(sql: str, args: tuple = (), default=None):
+    """Возвращает одно значение из первой строки."""
+    row = await db_fetchone(sql, args)
+    if not row:
+        return default
+    return row[0] if row else default
+
+
+async def init_db():
+    """Создаёт все таблицы в Turso."""
+    statements = [
+        """CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            message_id INTEGER NOT NULL,
+            user_id INTEGER,
+            user_name TEXT,
+            text TEXT,
+            content_type TEXT,
+            media_file_id TEXT,
+            date TEXT,
+            is_outgoing INTEGER DEFAULT 0
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_messages_chat_mid ON messages(chat_id, message_id)",
+        """CREATE TABLE IF NOT EXISTS settings (
+            user_id INTEGER PRIMARY KEY,
+            answer_first_enabled INTEGER DEFAULT 0,
+            answer_first_text TEXT DEFAULT '',
+            time_in_nick_enabled INTEGER DEFAULT 0,
+            timezone TEXT DEFAULT 'UTC',
+            off_hours_enabled INTEGER DEFAULT 0,
+            off_hours_start TEXT DEFAULT '22:00',
+            off_hours_end TEXT DEFAULT '08:00',
+            off_hours_text TEXT DEFAULT 'Сплю, отвечу утром',
+            forward_to_owner_enabled INTEGER DEFAULT 0
+        )""",
+        """CREATE TABLE IF NOT EXISTS blacklist (
+            owner_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            PRIMARY KEY(owner_id, user_id)
+        )""",
+        """CREATE TABLE IF NOT EXISTS mutes (
+            chat_id INTEGER NOT NULL,
+            target_user_id INTEGER NOT NULL,
+            mute_until TEXT NOT NULL,
+            PRIMARY KEY(chat_id, target_user_id)
+        )""",
+        """CREATE TABLE IF NOT EXISTS contacts (
+            chat_id INTEGER PRIMARY KEY,
+            first_seen TEXT NOT NULL,
+            message_count INTEGER DEFAULT 0,
+            user_id INTEGER,
+            user_name TEXT,
+            username TEXT
+        )""",
+        """CREATE TABLE IF NOT EXISTS notes (
+            chat_id INTEGER PRIMARY KEY,
+            note TEXT,
+            updated_at TEXT
+        )""",
+        """CREATE TABLE IF NOT EXISTS user_limits (
+            user_id INTEGER PRIMARY KEY,
+            date TEXT NOT NULL,
+            requests_count INTEGER DEFAULT 0,
+            is_premium INTEGER DEFAULT 0,
+            premium_until TEXT,
+            last_ai_request TEXT
+        )""",
+        """CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            first_name TEXT,
+            username TEXT,
+            joined_at TEXT NOT NULL,
+            is_banned INTEGER DEFAULT 0,
+            banned_at TEXT,
+            banned_reason TEXT,
+            banned_ref INTEGER DEFAULT 0
+        )""",
+        """CREATE TABLE IF NOT EXISTS referrals (
+            user_id INTEGER PRIMARY KEY,
+            referrer_id INTEGER NOT NULL,
+            joined_at TEXT NOT NULL,
+            rewarded_join INTEGER DEFAULT 0,
+            rewarded_purchase INTEGER DEFAULT 0
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_ref_referrer ON referrals(referrer_id)",
+        """CREATE TABLE IF NOT EXISTS pending_referrals (
+            user_id INTEGER PRIMARY KEY,
+            referrer_id INTEGER NOT NULL,
+            ts TEXT NOT NULL
+        )""",
+        """CREATE TABLE IF NOT EXISTS business_connections (
+            id TEXT PRIMARY KEY,
+            user_id INTEGER,
+            enabled INTEGER DEFAULT 1,
+            added_at TEXT
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_bc_user ON business_connections(user_id)",
+        """CREATE TABLE IF NOT EXISTS business_names (
+            connection_id TEXT PRIMARY KEY,
+            base_name TEXT NOT NULL,
+            saved_at TEXT NOT NULL
+        )""",
+        """CREATE TABLE IF NOT EXISTS admin_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            admin_id INTEGER NOT NULL,
+            action TEXT NOT NULL,
+            target_id INTEGER,
+            details TEXT,
+            ts TEXT NOT NULL
+        )""",
+        """CREATE TABLE IF NOT EXISTS payments_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            stars INTEGER NOT NULL,
+            days INTEGER NOT NULL,
+            ts TEXT NOT NULL
+        )""",
+    ]
+    for stmt in statements:
+        try:
+            await db_execute(stmt)
+        except Exception as e:
+            log.warning("DDL error: %s — %s", stmt[:60], e)
+    log.info("Turso DB initialized")
 
 
 # ---------------- Utilities ----------------
@@ -209,149 +289,81 @@ def week_start():
     return (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
 
 
-# ---------------- DB ----------------
-async def init_db():
-    os.makedirs(BACKUP_DIR, exist_ok=True)
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.executescript("""
-        PRAGMA journal_mode=WAL;
-
-        CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id INTEGER NOT NULL,
-            message_id INTEGER NOT NULL,
-            user_id INTEGER,
-            user_name TEXT,
-            text TEXT,
-            content_type TEXT,
-            media_file_id TEXT,
-            date TEXT,
-            is_outgoing INTEGER DEFAULT 0
-        );
-        CREATE INDEX IF NOT EXISTS idx_messages_chat_mid ON messages(chat_id, message_id);
-
-        CREATE TABLE IF NOT EXISTS settings (
-            user_id INTEGER PRIMARY KEY,
-            answer_first_enabled INTEGER DEFAULT 0,
-            answer_first_text TEXT DEFAULT '',
-            time_in_nick_enabled INTEGER DEFAULT 0,
-            timezone TEXT DEFAULT 'UTC',
-            off_hours_enabled INTEGER DEFAULT 0,
-            off_hours_start TEXT DEFAULT '22:00',
-            off_hours_end TEXT DEFAULT '08:00',
-            off_hours_text TEXT DEFAULT 'Сплю, отвечу утром',
-            forward_to_owner_enabled INTEGER DEFAULT 0
-        );
-
-        CREATE TABLE IF NOT EXISTS blacklist (
-            owner_id INTEGER NOT NULL,
-            user_id INTEGER NOT NULL,
-            PRIMARY KEY(owner_id, user_id)
-        );
-
-        CREATE TABLE IF NOT EXISTS mutes (
-            chat_id INTEGER NOT NULL,
-            target_user_id INTEGER NOT NULL,
-            mute_until TEXT NOT NULL,
-            PRIMARY KEY(chat_id, target_user_id)
-        );
-
-        CREATE TABLE IF NOT EXISTS contacts (
-            chat_id INTEGER PRIMARY KEY,
-            first_seen TEXT NOT NULL,
-            message_count INTEGER DEFAULT 0,
-            user_id INTEGER,
-            user_name TEXT,
-            username TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS notes (
-            chat_id INTEGER PRIMARY KEY,
-            note TEXT,
-            updated_at TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS user_limits (
-            user_id INTEGER PRIMARY KEY,
-            date TEXT NOT NULL,
-            requests_count INTEGER DEFAULT 0,
-            is_premium INTEGER DEFAULT 0,
-            premium_until TEXT,
-            last_ai_request TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            first_name TEXT,
-            username TEXT,
-            joined_at TEXT NOT NULL,
-            is_banned INTEGER DEFAULT 0,
-            banned_at TEXT,
-            banned_reason TEXT,
-            banned_ref INTEGER DEFAULT 0
-        );
-
-        CREATE TABLE IF NOT EXISTS referrals (
-            user_id INTEGER PRIMARY KEY,
-            referrer_id INTEGER NOT NULL,
-            joined_at TEXT NOT NULL,
-            rewarded_join INTEGER DEFAULT 0,
-            rewarded_purchase INTEGER DEFAULT 0
-        );
-        CREATE INDEX IF NOT EXISTS idx_ref_referrer ON referrals(referrer_id);
-
-        CREATE TABLE IF NOT EXISTS pending_referrals (
-            user_id INTEGER PRIMARY KEY,
-            referrer_id INTEGER NOT NULL,
-            ts TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS business_connections (
-            id TEXT PRIMARY KEY,
-            user_id INTEGER,
-            enabled INTEGER DEFAULT 1,
-            added_at TEXT
-        );
-        CREATE INDEX IF NOT EXISTS idx_bc_user ON business_connections(user_id);
-
-        CREATE TABLE IF NOT EXISTS business_names (
-            connection_id TEXT PRIMARY KEY,
-            base_name TEXT NOT NULL,
-            saved_at TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS admin_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            admin_id INTEGER NOT NULL,
-            action TEXT NOT NULL,
-            target_id INTEGER,
-            details TEXT,
-            ts TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS payments_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            stars INTEGER NOT NULL,
-            days INTEGER NOT NULL,
-            ts TEXT NOT NULL
-        );
-        """)
-        await db.commit()
+def row_to_dict(row, columns):
+    """Turso возвращает кортежи. Преобразуем в dict."""
+    if not row:
+        return None
+    return {col: row[i] for i, col in enumerate(columns)}
 
 
-# ---------------- Settings (per user) ----------------
+# ---------------- AI providers ----------------
+AI_PROVIDERS = [
+    {"name": "groq", "url": "https://api.groq.com/openai/v1/chat/completions",
+     "key_env": "GROQ_API_KEY", "model": "openai/gpt-oss-120b"},
+    {"name": "groq-20b", "url": "https://api.groq.com/openai/v1/chat/completions",
+     "key_env": "GROQ_API_KEY", "model": "openai/gpt-oss-20b"},
+    {"name": "openrouter", "url": "https://openrouter.ai/api/v1/chat/completions",
+     "key_env": "OPENROUTER_API_KEY", "model": "openai/gpt-oss-120b:free"},
+    {"name": "mistral", "url": "https://api.mistral.ai/v1/chat/completions",
+     "key_env": "MISTRAL_API_KEY", "model": "mistral-small-latest"},
+]
+
+
+async def ask_ai(prompt: str) -> str:
+    last_err = None
+    errors_log = []
+    for p in AI_PROVIDERS:
+        key = os.getenv(p["key_env"], "").strip()
+        if not key:
+            errors_log.append(f"{p['name']}: нет ключа")
+            continue
+        for attempt in (1, 2):
+            try:
+                if p["name"] == "mistral":
+                    await asyncio.sleep(1.1)
+                async with httpx.AsyncClient(timeout=60) as client:
+                    r = await client.post(
+                        p["url"],
+                        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                        json={
+                            "model": p["model"],
+                            "messages": [
+                                {"role": "system", "content": SYSTEM_PROMPT},
+                                {"role": "user", "content": prompt},
+                            ],
+                            "max_tokens": 1024,
+                            "temperature": 0.8,
+                        },
+                    )
+                if r.status_code == 200:
+                    return r.json()["choices"][0]["message"]["content"].strip()
+                if r.status_code == 429 and attempt == 1:
+                    await asyncio.sleep(3)
+                    continue
+                last_err = f"{p['name']}: HTTP {r.status_code} {r.text[:120]}"
+                errors_log.append(last_err)
+                break
+            except Exception as e:
+                last_err = f"{p['name']}: {e}"
+                errors_log.append(last_err)
+                break
+    raise RuntimeError("ИИ недоступен. " + " | ".join(errors_log)[:300])
+
+
+# ---------------- Settings ----------------
+SETTINGS_COLS = ["user_id", "answer_first_enabled", "answer_first_text",
+                 "time_in_nick_enabled", "timezone", "off_hours_enabled",
+                 "off_hours_start", "off_hours_end", "off_hours_text",
+                 "forward_to_owner_enabled"]
+
+
 async def get_settings(user):
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute("SELECT * FROM settings WHERE user_id=?", (user,))
-        row = await cur.fetchone()
-        if row:
-            return dict(row)
-        await db.execute("INSERT OR IGNORE INTO settings(user_id) VALUES(?)", (user,))
-        await db.commit()
-        cur = await db.execute("SELECT * FROM settings WHERE user_id=?", (user,))
-        return dict(await cur.fetchone())
+    row = await db_fetchone("SELECT * FROM settings WHERE user_id=?", (user,))
+    if row:
+        return row_to_dict(row, SETTINGS_COLS)
+    await db_execute("INSERT OR IGNORE INTO settings(user_id) VALUES(?)", (user,))
+    row = await db_fetchone("SELECT * FROM settings WHERE user_id=?", (user,))
+    return row_to_dict(row, SETTINGS_COLS)
 
 
 async def set_setting(user, key, value):
@@ -363,248 +375,195 @@ async def set_setting(user, key, value):
     if key not in allowed:
         return
     await get_settings(user)
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(f"UPDATE settings SET {key}=? WHERE user_id=?", (value, user))
-        await db.commit()
+    await db_execute(f"UPDATE settings SET {key}=? WHERE user_id=?", (value, user))
 
 
-# ---------------- Blacklist (per owner) ----------------
+# ---------------- Blacklist ----------------
 async def is_blacklisted(owner, user_id):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "SELECT 1 FROM blacklist WHERE owner_id=? AND user_id=?",
-            (owner, user_id)
-        )
-        return await cur.fetchone() is not None
+    row = await db_fetchone("SELECT 1 FROM blacklist WHERE owner_id=? AND user_id=?", (owner, user_id))
+    return row is not None
 
 
 async def add_blacklist(owner, user_id):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT OR IGNORE INTO blacklist(owner_id, user_id) VALUES(?,?)",
-            (owner, user_id)
-        )
-        await db.commit()
+    await db_execute("INSERT OR IGNORE INTO blacklist(owner_id, user_id) VALUES(?,?)", (owner, user_id))
 
 
 async def remove_blacklist(owner, user_id):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "DELETE FROM blacklist WHERE owner_id=? AND user_id=?",
-            (owner, user_id)
-        )
-        await db.commit()
+    await db_execute("DELETE FROM blacklist WHERE owner_id=? AND user_id=?", (owner, user_id))
 
 
 # ---------------- Notes ----------------
 async def get_note(chat_id):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT note, updated_at FROM notes WHERE chat_id=?", (chat_id,))
-        return await cur.fetchone()
+    return await db_fetchone("SELECT note, updated_at FROM notes WHERE chat_id=?", (chat_id,))
 
 
 async def set_note(chat_id, text):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT INTO notes(chat_id,note,updated_at) VALUES(?,?,?) "
-            "ON CONFLICT(chat_id) DO UPDATE SET note=excluded.note, updated_at=excluded.updated_at",
-            (chat_id, text, utcnow().isoformat())
-        )
-        await db.commit()
+    await db_execute(
+        "INSERT INTO notes(chat_id,note,updated_at) VALUES(?,?,?) "
+        "ON CONFLICT(chat_id) DO UPDATE SET note=excluded.note, updated_at=excluded.updated_at",
+        (chat_id, text, utcnow().isoformat())
+    )
 
 
 # ---------------- Admin log ----------------
 async def log_admin(action, target_id=None, details=""):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT INTO admin_log(admin_id, action, target_id, details, ts) VALUES(?,?,?,?,?)",
-            (owner_id, action, target_id, details, utcnow().isoformat())
-        )
-        await db.commit()
+    await db_execute(
+        "INSERT INTO admin_log(admin_id, action, target_id, details, ts) VALUES(?,?,?,?,?)",
+        (owner_id, action, target_id, details, utcnow().isoformat())
+    )
 
 
 # ---------------- Users ----------------
 async def ensure_user(user_id, first_name=None, username=None):
     today = utcnow().strftime("%Y-%m-%d")
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT OR IGNORE INTO user_limits(user_id, date, requests_count) VALUES(?,?,0)",
-            (user_id, today)
-        )
-        await db.execute(
-            "INSERT INTO users(user_id, first_name, username, joined_at) VALUES(?,?,?,?) "
-            "ON CONFLICT(user_id) DO UPDATE SET first_name=excluded.first_name, username=excluded.username",
-            (user_id, first_name or "", username or "", utcnow().isoformat())
-        )
-        await db.commit()
+    await db_execute(
+        "INSERT OR IGNORE INTO user_limits(user_id, date, requests_count) VALUES(?,?,0)",
+        (user_id, today)
+    )
+    await db_execute(
+        "INSERT INTO users(user_id, first_name, username, joined_at) VALUES(?,?,?,?) "
+        "ON CONFLICT(user_id) DO UPDATE SET first_name=excluded.first_name, username=excluded.username",
+        (user_id, first_name or "", username or "", utcnow().isoformat())
+    )
 
 
 async def is_banned(user_id):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT is_banned FROM users WHERE user_id=?", (user_id,))
-        row = await cur.fetchone()
-        return bool(row and row[0])
+    val = await db_fetchval("SELECT is_banned FROM users WHERE user_id=?", (user_id,), 0)
+    return bool(val)
 
 
 async def is_ref_banned(user_id):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT banned_ref FROM users WHERE user_id=?", (user_id,))
-        row = await cur.fetchone()
-        return bool(row and row[0])
+    val = await db_fetchval("SELECT banned_ref FROM users WHERE user_id=?", (user_id,), 0)
+    return bool(val)
 
 
 async def ban_user(user_id, reason=""):
     await ensure_user(user_id)
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE users SET is_banned=1, banned_at=?, banned_reason=? WHERE user_id=?",
-            (utcnow().isoformat(), reason, user_id)
-        )
-        await db.commit()
+    await db_execute(
+        "UPDATE users SET is_banned=1, banned_at=?, banned_reason=? WHERE user_id=?",
+        (utcnow().isoformat(), reason, user_id)
+    )
     await log_admin("ban", user_id, reason)
 
 
 async def unban_user(user_id):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE users SET is_banned=0, banned_at=NULL, banned_reason=NULL WHERE user_id=?",
-            (user_id,)
-        )
-        await db.commit()
+    await db_execute(
+        "UPDATE users SET is_banned=0, banned_at=NULL, banned_reason=NULL WHERE user_id=?",
+        (user_id,)
+    )
     await log_admin("unban", user_id)
 
 
 async def ban_ref(user_id, flag=True):
     await ensure_user(user_id)
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE users SET banned_ref=? WHERE user_id=?", (int(flag), user_id))
-        await db.commit()
+    await db_execute("UPDATE users SET banned_ref=? WHERE user_id=?", (int(flag), user_id))
     await log_admin("ban_ref" if flag else "unban_ref", user_id)
 
 
+USERS_COLS = ["user_id", "first_name", "username", "joined_at",
+              "is_banned", "banned_at", "banned_reason", "banned_ref"]
+
+
 async def get_user_card(user_id):
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
-        u = await cur.fetchone()
-        cur = await db.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id=?", (user_id,))
-        refs = (await cur.fetchone())[0]
-        cur = await db.execute("SELECT COUNT(*) FROM messages WHERE user_id=?", (user_id,))
-        msgs = (await cur.fetchone())[0]
-    return dict(u) if u else None, refs, msgs
+    row = await db_fetchone("SELECT * FROM users WHERE user_id=?", (user_id,))
+    if not row:
+        return None, 0, 0
+    refs = await db_fetchval("SELECT COUNT(*) FROM referrals WHERE referrer_id=?", (user_id,), 0)
+    msgs = await db_fetchval("SELECT COUNT(*) FROM messages WHERE user_id=?", (user_id,), 0)
+    return row_to_dict(row, USERS_COLS), refs, msgs
 
 
 # ---------------- Premium ----------------
 async def is_premium(user_id):
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute(
-            "SELECT is_premium, premium_until FROM user_limits WHERE user_id=?",
-            (user_id,)
-        )
-        row = await cur.fetchone()
-        if not row or not row["is_premium"] or not row["premium_until"]:
+    row = await db_fetchone(
+        "SELECT is_premium, premium_until FROM user_limits WHERE user_id=?",
+        (user_id,)
+    )
+    if not row or not row[0] or not row[1]:
+        return False
+    try:
+        if datetime.fromisoformat(row[1]) < utcnow():
+            await db_execute(
+                "UPDATE user_limits SET is_premium=0, premium_until=NULL WHERE user_id=?",
+                (user_id,)
+            )
             return False
-        try:
-            if datetime.fromisoformat(row["premium_until"]) < utcnow():
-                await db.execute(
-                    "UPDATE user_limits SET is_premium=0, premium_until=NULL WHERE user_id=?",
-                    (user_id,)
-                )
-                await db.commit()
-                return False
-            return True
-        except Exception:
-            return False
+        return True
+    except Exception:
+        return False
 
 
 async def grant_premium(user_id, hours=0, days=0):
     await ensure_user(user_id)
     delta = timedelta(hours=hours, days=days)
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute("SELECT premium_until FROM user_limits WHERE user_id=?", (user_id,))
-        row = await cur.fetchone()
-        base = utcnow()
-        if row and row["premium_until"]:
-            try:
-                cur_until = datetime.fromisoformat(row["premium_until"])
-                if cur_until > base:
-                    base = cur_until
-            except Exception:
-                pass
-        new_until = base + delta
-        await db.execute(
-            "UPDATE user_limits SET is_premium=1, premium_until=? WHERE user_id=?",
-            (new_until.isoformat(), user_id)
-        )
-        await db.commit()
-        return new_until
+    row = await db_fetchone("SELECT premium_until FROM user_limits WHERE user_id=?", (user_id,))
+    base = utcnow()
+    if row and row[0]:
+        try:
+            cur_until = datetime.fromisoformat(row[0])
+            if cur_until > base:
+                base = cur_until
+        except Exception:
+            pass
+    new_until = base + delta
+    await db_execute(
+        "UPDATE user_limits SET is_premium=1, premium_until=? WHERE user_id=?",
+        (new_until.isoformat(), user_id)
+    )
+    return new_until
 
 
 async def revoke_premium(user_id):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE user_limits SET is_premium=0, premium_until=NULL WHERE user_id=?",
-            (user_id,)
-        )
-        await db.commit()
+    await db_execute(
+        "UPDATE user_limits SET is_premium=0, premium_until=NULL WHERE user_id=?",
+        (user_id,)
+    )
     await log_admin("revoke_premium", user_id)
 
 
-# ---------------- Limits + cooldown ----------------
+# ---------------- Limits ----------------
 async def check_limit(user_id):
     today = utcnow().strftime("%Y-%m-%d")
     premium = await is_premium(user_id)
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute("SELECT * FROM user_limits WHERE user_id=?", (user_id,))
-        row = await cur.fetchone()
-        if not row or row["date"] != today:
-            await db.execute(
-                "INSERT OR REPLACE INTO user_limits(user_id, date, requests_count, is_premium, premium_until, last_ai_request) "
-                "VALUES(?,?,0,?,?,?)",
-                (user_id, today,
-                 row["is_premium"] if row else 0,
-                 row["premium_until"] if row else None,
-                 None)
-            )
-            await db.commit()
-            used = 0
-        else:
-            used = row["requests_count"]
-        limit = PREMIUM_DAILY_LIMIT if premium else FREE_DAILY_LIMIT
-        return used < limit, used, limit, premium
+    row = await db_fetchone("SELECT date, requests_count FROM user_limits WHERE user_id=?", (user_id,))
+    if not row or row[0] != today:
+        await db_execute(
+            "INSERT OR REPLACE INTO user_limits(user_id, date, requests_count, is_premium, premium_until, last_ai_request) "
+            "VALUES(?,?,0,?,?,?)",
+            (user_id, today,
+             (row[0] if row else 0),
+             None, None)
+        )
+        used = 0
+    else:
+        used = row[1]
+    limit = PREMIUM_DAILY_LIMIT if premium else FREE_DAILY_LIMIT
+    return used < limit, used, limit, premium
 
 
 async def check_cooldown(user_id):
     premium = await is_premium(user_id)
     cooldown = AI_COOLDOWN_PREMIUM if premium else AI_COOLDOWN_FREE
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute("SELECT last_ai_request FROM user_limits WHERE user_id=?", (user_id,))
-        row = await cur.fetchone()
-        if not row or not row["last_ai_request"]:
-            return True, 0
-        try:
-            last = datetime.fromisoformat(row["last_ai_request"])
-            elapsed = (utcnow() - last).total_seconds()
-            if elapsed < cooldown:
-                return False, int(cooldown - elapsed) + 1
-            return True, 0
-        except Exception:
-            return True, 0
+    row = await db_fetchone("SELECT last_ai_request FROM user_limits WHERE user_id=?", (user_id,))
+    if not row or not row[0]:
+        return True, 0
+    try:
+        last = datetime.fromisoformat(row[0])
+        elapsed = (utcnow() - last).total_seconds()
+        if elapsed < cooldown:
+            return False, int(cooldown - elapsed) + 1
+        return True, 0
+    except Exception:
+        return True, 0
 
 
 async def increment_usage(user_id):
     today = utcnow().strftime("%Y-%m-%d")
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE user_limits SET requests_count = requests_count + 1, last_ai_request=? "
-            "WHERE user_id=? AND date=?",
-            (utcnow().isoformat(), user_id, today)
-        )
-        await db.commit()
+    await db_execute(
+        "UPDATE user_limits SET requests_count = requests_count + 1, last_ai_request=? "
+        "WHERE user_id=? AND date=?",
+        (utcnow().isoformat(), user_id, today)
+    )
 
 
 # ---------------- Referrals ----------------
@@ -615,114 +574,93 @@ async def register_referral(new_user_id, referrer_id):
         return False
     if await is_banned(referrer_id):
         return False
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT 1 FROM referrals WHERE user_id=?", (new_user_id,))
-        if await cur.fetchone():
-            return False
-        await db.execute(
-            "INSERT INTO referrals(user_id, referrer_id, joined_at, rewarded_join) VALUES(?,?,?,0)",
-            (new_user_id, referrer_id, utcnow().isoformat())
-        )
-        await db.commit()
+    existing = await db_fetchone("SELECT 1 FROM referrals WHERE user_id=?", (new_user_id,))
+    if existing:
+        return False
+    await db_execute(
+        "INSERT INTO referrals(user_id, referrer_id, joined_at, rewarded_join) VALUES(?,?,?,0)",
+        (new_user_id, referrer_id, utcnow().isoformat())
+    )
     return True
 
 
 async def mark_referral_rewarded(new_user_id):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE referrals SET rewarded_join=1 WHERE user_id=?", (new_user_id,))
-        await db.commit()
+    await db_execute("UPDATE referrals SET rewarded_join=1 WHERE user_id=?", (new_user_id,))
 
 
 async def referral_stats(user_id):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "SELECT COUNT(*), SUM(rewarded_purchase) FROM referrals WHERE referrer_id=?",
-            (user_id,)
-        )
-        row = await cur.fetchone()
-        return (row[0] or 0), (row[1] or 0)
+    row = await db_fetchone(
+        "SELECT COUNT(*), SUM(rewarded_purchase) FROM referrals WHERE referrer_id=?",
+        (user_id,)
+    )
+    if not row:
+        return 0, 0
+    return (row[0] or 0), (row[1] or 0)
 
 
 async def referral_leaderboard(limit=5, week_only=True):
     if week_only:
         start = week_start().isoformat()
-        q = """SELECT r.referrer_id, COUNT(*) as cnt
+        rows = await db_fetchall(
+            """SELECT r.referrer_id, COUNT(*) as cnt
                FROM referrals r
                WHERE r.joined_at >= ? AND r.referrer_id != ?
                GROUP BY r.referrer_id
-               ORDER BY cnt DESC LIMIT ?"""
-        args = (start, owner_id, limit)
+               ORDER BY cnt DESC LIMIT ?""",
+            (start, owner_id, limit)
+        )
     else:
-        q = """SELECT referrer_id, COUNT(*) as cnt
+        rows = await db_fetchall(
+            """SELECT referrer_id, COUNT(*) as cnt
                FROM referrals
                WHERE referrer_id != ?
                GROUP BY referrer_id
-               ORDER BY cnt DESC LIMIT ?"""
-        args = (owner_id, limit)
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute(q, args)
-        rows = await cur.fetchall()
+               ORDER BY cnt DESC LIMIT ?""",
+            (owner_id, limit)
+        )
     result = []
     for row in rows:
-        async with aiosqlite.connect(DB_PATH) as db:
-            cur2 = await db.execute("SELECT first_name, username FROM users WHERE user_id=?", (row["referrer_id"],))
-            r2 = await cur2.fetchone()
-            if r2:
-                name = r2[1] or r2[0] or f"id{row['referrer_id']}"
-            else:
-                name = f"id{row['referrer_id']}"
-        result.append((row["referrer_id"], name, row["cnt"]))
+        referrer_id = row[0]
+        cnt = row[1]
+        urow = await db_fetchone("SELECT first_name, username FROM users WHERE user_id=?", (referrer_id,))
+        if urow:
+            name = urow[1] or urow[0] or f"id{referrer_id}"
+        else:
+            name = f"id{referrer_id}"
+        result.append((referrer_id, name, cnt))
     return result
 
 
 # ---------------- Business connections ----------------
 async def get_connection_owner(connection_id):
-    """Возвращает user_id владельца бизнес-коннекта."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT user_id FROM business_connections WHERE id=?", (connection_id,))
-        row = await cur.fetchone()
-    return row[0] if row else None
+    val = await db_fetchval("SELECT user_id FROM business_connections WHERE id=?", (connection_id,))
+    return val
 
 
 async def get_user_connection(user_id):
-    """Возвращает активный connection_id для юзера."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "SELECT id FROM business_connections WHERE user_id=? AND enabled=1 LIMIT 1",
-            (user_id,)
-        )
-        row = await cur.fetchone()
-    return row[0] if row else None
+    val = await db_fetchval(
+        "SELECT id FROM business_connections WHERE user_id=? AND enabled=1 LIMIT 1",
+        (user_id,)
+    )
+    return val
 
 
 async def save_connection(connection_id, user_id, enabled):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT OR REPLACE INTO business_connections(id, user_id, enabled, added_at) VALUES(?,?,?,?)",
-            (connection_id, user_id, int(enabled), utcnow().isoformat())
-        )
-        await db.commit()
+    await db_execute(
+        "INSERT OR REPLACE INTO business_connections(id, user_id, enabled, added_at) VALUES(?,?,?,?)",
+        (connection_id, user_id, int(enabled), utcnow().isoformat())
+    )
 
 
-# ---------------- Base name для бизнес-аккаунта ----------------
 async def get_base_name(connection_id):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "SELECT base_name FROM business_names WHERE connection_id=?",
-            (connection_id,)
-        )
-        row = await cur.fetchone()
-    return row[0] if row else None
+    return await db_fetchval("SELECT base_name FROM business_names WHERE connection_id=?", (connection_id,))
 
 
 async def save_base_name(connection_id, name):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT OR REPLACE INTO business_names(connection_id, base_name, saved_at) VALUES(?,?,?)",
-            (connection_id, name, utcnow().isoformat())
-        )
-        await db.commit()
+    await db_execute(
+        "INSERT OR REPLACE INTO business_names(connection_id, base_name, saved_at) VALUES(?,?,?)",
+        (connection_id, name, utcnow().isoformat())
+    )
 
 
 # ---------------- Message payload / save ----------------
@@ -753,7 +691,6 @@ def message_payload(message: Message):
 
 
 async def save_business_message(message: Message, owner_uid: int):
-    """Сохраняет сообщение. owner_uid — владелец бизнес-аккаунта."""
     chat_id = message.chat.id
     sender = message.from_user
     uid = sender.id if sender else None
@@ -763,38 +700,41 @@ async def save_business_message(message: Message, owner_uid: int):
     text, ctype, file_id = message_payload(message)
     username = sender.username if sender else None
     display = (sender.full_name if sender else message.chat.full_name if message.chat else "Unknown")
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            """INSERT INTO messages(chat_id,message_id,user_id,user_name,text,content_type,
-                                     media_file_id,date,is_outgoing)
-               VALUES(?,?,?,?,?,?,?,?,?)""",
-            (chat_id, message.message_id, uid, display, text, ctype, file_id,
-             message.date.isoformat() if message.date else utcnow().isoformat(), int(outgoing))
-        )
-        await db.execute(
-            """DELETE FROM messages WHERE chat_id=? AND id NOT IN
-               (SELECT id FROM messages WHERE chat_id=? ORDER BY id DESC LIMIT ?)""",
-            (chat_id, chat_id, KEEP_PER_CHAT)
-        )
-        await db.execute(
-            """INSERT INTO contacts(chat_id,first_seen,message_count,user_id,user_name,username)
-               VALUES(?,?,1,?,?,?)
-               ON CONFLICT(chat_id) DO UPDATE SET message_count=message_count+1,
-               user_id=excluded.user_id,user_name=excluded.user_name,username=excluded.username""",
-            (chat_id, utcnow().isoformat(), uid, display, username)
-        )
-        await db.commit()
+
+    await db_execute(
+        """INSERT INTO messages(chat_id,message_id,user_id,user_name,text,content_type,
+                                 media_file_id,date,is_outgoing)
+           VALUES(?,?,?,?,?,?,?,?,?)""",
+        (chat_id, message.message_id, uid, display, text, ctype, file_id,
+         message.date.isoformat() if message.date else utcnow().isoformat(), int(outgoing))
+    )
+
+    # Ограничение KEEP_PER_CHAT
+    await db_execute(
+        """DELETE FROM messages WHERE chat_id=? AND id NOT IN
+           (SELECT id FROM messages WHERE chat_id=? ORDER BY id DESC LIMIT ?)""",
+        (chat_id, chat_id, KEEP_PER_CHAT)
+    )
+
+    await db_execute(
+        """INSERT INTO contacts(chat_id,first_seen,message_count,user_id,user_name,username)
+           VALUES(?,?,1,?,?,?)
+           ON CONFLICT(chat_id) DO UPDATE SET message_count=message_count+1,
+           user_id=excluded.user_id,user_name=excluded.user_name,username=excluded.username""",
+        (chat_id, utcnow().isoformat(), uid, display, username)
+    )
+
+
+MESSAGES_COLS = ["id", "chat_id", "message_id", "user_id", "user_name", "text",
+                 "content_type", "media_file_id", "date", "is_outgoing"]
 
 
 async def find_message(chat_id, message_id):
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute(
-            "SELECT * FROM messages WHERE chat_id=? AND message_id=? ORDER BY id DESC LIMIT 1",
-            (chat_id, message_id)
-        )
-        row = await cur.fetchone()
-        return dict(row) if row else None
+    row = await db_fetchone(
+        "SELECT * FROM messages WHERE chat_id=? AND message_id=? ORDER BY id DESC LIMIT 1",
+        (chat_id, message_id)
+    )
+    return row_to_dict(row, MESSAGES_COLS)
 
 
 # ---------------- Subscription ----------------
@@ -867,19 +807,12 @@ async def cb_check_sub(call: CallbackQuery):
         return
     await ensure_user(user_id, call.from_user.first_name, call.from_user.username)
 
-    # Обработка отложенного реферала
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "SELECT referrer_id FROM pending_referrals WHERE user_id=?",
-            (user_id,)
-        )
-        pending = await cur.fetchone()
+    pending = await db_fetchone("SELECT referrer_id FROM pending_referrals WHERE user_id=?", (user_id,))
     if pending:
         referrer_id = pending[0]
         if await register_referral(user_id, referrer_id):
             until = await grant_premium(referrer_id, hours=REF_BONUS_HOURS)
             await mark_referral_rewarded(user_id)
-            log.info("Referral (after sub): %s → %s (+%dh)", user_id, referrer_id, REF_BONUS_HOURS)
             try:
                 await bot_ref.send_message(
                     referrer_id,
@@ -889,9 +822,7 @@ async def cb_check_sub(call: CallbackQuery):
                 )
             except Exception:
                 pass
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("DELETE FROM pending_referrals WHERE user_id=?", (user_id,))
-            await db.commit()
+        await db_execute("DELETE FROM pending_referrals WHERE user_id=?", (user_id,))
 
     await call.answer("✅ Спасибо за подписку!", show_alert=True)
     try:
@@ -928,7 +859,7 @@ def admin_menu():
     ])
 
 # ============================================================
-# PRIVATE HANDLERS (все юзеры)
+# PRIVATE HANDLERS
 # ============================================================
 
 @router.message(Command("start"))
@@ -943,26 +874,17 @@ async def cmd_start(message: Message, command: Command):
 
     await ensure_user(user.id, user.first_name, user.username)
 
-    # Реф-ссылка: сохраняем сразу (вдруг ещё не подписан — обработается после)
     if command.args and command.args.startswith("ref_"):
         try:
             referrer_id = int(command.args[4:])
-            async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute(
-                    "INSERT OR REPLACE INTO pending_referrals(user_id, referrer_id, ts) VALUES(?,?,?)",
-                    (user.id, referrer_id, utcnow().isoformat())
-                )
-                await db.commit()
+            await db_execute(
+                "INSERT OR REPLACE INTO pending_referrals(user_id, referrer_id, ts) VALUES(?,?,?)",
+                (user.id, referrer_id, utcnow().isoformat())
+            )
         except (ValueError, IndexError):
             pass
 
-    # Обрабатываем отложенный реферал
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "SELECT referrer_id FROM pending_referrals WHERE user_id=?",
-            (user.id,)
-        )
-        pending = await cur.fetchone()
+    pending = await db_fetchone("SELECT referrer_id FROM pending_referrals WHERE user_id=?", (user.id,))
     if pending:
         referrer_id = pending[0]
         if await register_referral(user.id, referrer_id):
@@ -978,25 +900,20 @@ async def cmd_start(message: Message, command: Command):
                 )
             except Exception:
                 pass
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("DELETE FROM pending_referrals WHERE user_id=?", (user.id,))
-            await db.commit()
+        await db_execute("DELETE FROM pending_referrals WHERE user_id=?", (user.id,))
 
-    s = await get_settings(user.id)
     premium = await is_premium(user.id)
     status = "💎 Premium" if premium else "🆓 Бесплатный тариф"
-    conn = await get_user_connection(user.id)
-    conn_line = "✅ Бизнес подключён" if conn else "⚠️ Бизнес не подключён"
 
     await message.answer(
         f"👋 <b>Привет! Я {BOT_NAME}.</b>\n"
-        f"{conn_line}\n\n"
+        f"Статус: {status}\n\n"
         "Помогаю в ваших Telegram-чатах:\n"
         "• автоматические ответы\n"
         "• сохранение удалённых сообщений\n"
         "• ИИ-помощник через <code>.ai</code>\n"
         "• и другие команды\n\n"
-        "<i>Подключение: Аккаунт → Изменить → Автоматизация чатов</i>",
+        "<i>Подключение: Настройки → Telegram Business → Чат-автоматизация</i>",
         reply_markup=main_menu()
     )
 
@@ -1086,15 +1003,11 @@ async def cmd_stats(message: Message):
         return
     if not message.from_user or message.from_user.id != owner_id:
         return
-    async with aiosqlite.connect(DB_PATH) as db:
-        async def count(q, args=()):
-            cur = await db.execute(q, args)
-            return (await cur.fetchone())[0]
-        messages = await count("SELECT COUNT(*) FROM messages")
-        chats = await count("SELECT COUNT(*) FROM contacts")
-        users = await count("SELECT COUNT(*) FROM users")
-        conns = await count("SELECT COUNT(*) FROM business_connections WHERE enabled=1")
-        refs_total = await count("SELECT COUNT(*) FROM referrals")
+    messages = await db_fetchval("SELECT COUNT(*) FROM messages", default=0)
+    chats = await db_fetchval("SELECT COUNT(*) FROM contacts", default=0)
+    users = await db_fetchval("SELECT COUNT(*) FROM users", default=0)
+    conns = await db_fetchval("SELECT COUNT(*) FROM business_connections WHERE enabled=1", default=0)
+    refs_total = await db_fetchval("SELECT COUNT(*) FROM referrals", default=0)
     await message.answer(
         "📊 <b>Статистика BobMod</b>\n"
         "─────────────\n"
@@ -1310,7 +1223,6 @@ async def receive_setting_value(message: Message):
     if not user:
         return
 
-    # Админские вводы (только owner)
     if user.id == owner_id and owner_id in pending_admin:
         action = pending_admin.pop(owner_id)
         value = (message.text or "").strip()
@@ -1423,12 +1335,10 @@ async def payment_ok(message: Message):
     if p.invoice_payload == "premium_30d":
         until = await grant_premium(user_id, days=PREMIUM_DAYS)
 
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute(
-                "INSERT INTO payments_log(user_id, stars, days, ts) VALUES(?,?,?,?)",
-                (user_id, PREMIUM_PRICE_STARS, PREMIUM_DAYS, utcnow().isoformat())
-            )
-            await db.commit()
+        await db_execute(
+            "INSERT INTO payments_log(user_id, stars, days, ts) VALUES(?,?,?,?)",
+            (user_id, PREMIUM_PRICE_STARS, PREMIUM_DAYS, utcnow().isoformat())
+        )
 
         await message.answer(
             f"✅ <b>Premium активирован</b>\n\n"
@@ -1437,7 +1347,6 @@ async def payment_ok(message: Message):
             "Спасибо за поддержку!"
         )
 
-        # Уведомление админу
         try:
             name = message.from_user.full_name or f"id{user_id}"
             await bot_ref.send_message(
@@ -1449,22 +1358,14 @@ async def payment_ok(message: Message):
         except Exception:
             pass
 
-        # Бонус рефереру
-        async with aiosqlite.connect(DB_PATH) as db:
-            cur = await db.execute(
-                "SELECT referrer_id, rewarded_purchase FROM referrals WHERE user_id=?",
-                (user_id,)
-            )
-            row = await cur.fetchone()
+        row = await db_fetchone(
+            "SELECT referrer_id, rewarded_purchase FROM referrals WHERE user_id=?",
+            (user_id,)
+        )
         if row and not row[1]:
             referrer_id = row[0]
             new_until = await grant_premium(referrer_id, days=REF_BONUS_PURCHASE_DAYS)
-            async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute(
-                    "UPDATE referrals SET rewarded_purchase=1 WHERE user_id=?",
-                    (user_id,)
-                )
-                await db.commit()
+            await db_execute("UPDATE referrals SET rewarded_purchase=1 WHERE user_id=?", (user_id,))
             try:
                 await bot_ref.send_message(
                     referrer_id,
@@ -1477,7 +1378,7 @@ async def payment_ok(message: Message):
 
 
 # ============================================================
-# ADMIN PANEL (только для owner_id)
+# ADMIN PANEL
 # ============================================================
 
 @router.callback_query(F.data == "adm:menu")
@@ -1505,27 +1406,22 @@ async def cb_adm_stats(call: CallbackQuery):
     day_ago = (now - timedelta(days=1)).isoformat()
     week_ago = (now - timedelta(days=7)).isoformat()
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        async def count(q, args=()):
-            cur = await db.execute(q, args)
-            return (await cur.fetchone())[0]
-
-        users_total = await count("SELECT COUNT(*) FROM users")
-        users_24h = await count("SELECT COUNT(*) FROM users WHERE joined_at >= ?", (day_ago,))
-        users_7d = await count("SELECT COUNT(*) FROM users WHERE joined_at >= ?", (week_ago,))
-        users_banned = await count("SELECT COUNT(*) FROM users WHERE is_banned=1")
-        premium_active = await count(
-            "SELECT COUNT(*) FROM user_limits WHERE is_premium=1 AND premium_until > ?",
-            (now.isoformat(),)
-        )
-        conns = await count("SELECT COUNT(*) FROM business_connections WHERE enabled=1")
-        chats = await count("SELECT COUNT(*) FROM contacts")
-        msgs = await count("SELECT COUNT(*) FROM messages")
-        mutes = await count("SELECT COUNT(*) FROM mutes")
-        refs_total = await count("SELECT COUNT(*) FROM referrals")
-        refs_week = await count("SELECT COUNT(*) FROM referrals WHERE joined_at >= ?", (week_ago,))
-        stars_total = await count("SELECT COALESCE(SUM(stars),0) FROM payments_log")
-        purchases = await count("SELECT COUNT(*) FROM payments_log")
+    users_total = await db_fetchval("SELECT COUNT(*) FROM users", default=0)
+    users_24h = await db_fetchval("SELECT COUNT(*) FROM users WHERE joined_at >= ?", (day_ago,), 0)
+    users_7d = await db_fetchval("SELECT COUNT(*) FROM users WHERE joined_at >= ?", (week_ago,), 0)
+    users_banned = await db_fetchval("SELECT COUNT(*) FROM users WHERE is_banned=1", default=0)
+    premium_active = await db_fetchval(
+        "SELECT COUNT(*) FROM user_limits WHERE is_premium=1 AND premium_until > ?",
+        (now.isoformat(),), 0
+    )
+    conns = await db_fetchval("SELECT COUNT(*) FROM business_connections WHERE enabled=1", default=0)
+    chats = await db_fetchval("SELECT COUNT(*) FROM contacts", default=0)
+    msgs = await db_fetchval("SELECT COUNT(*) FROM messages", default=0)
+    mutes = await db_fetchval("SELECT COUNT(*) FROM mutes", default=0)
+    refs_total = await db_fetchval("SELECT COUNT(*) FROM referrals", default=0)
+    refs_week = await db_fetchval("SELECT COUNT(*) FROM referrals WHERE joined_at >= ?", (week_ago,), 0)
+    stars_total = await db_fetchval("SELECT COALESCE(SUM(stars),0) FROM payments_log", default=0)
+    purchases = await db_fetchval("SELECT COUNT(*) FROM payments_log", default=0)
 
     text = (
         "📊 <b>Статистика</b>\n"
@@ -1604,13 +1500,11 @@ async def cb_adm_refs_publish(call: CallbackQuery):
 async def cb_adm_users(call: CallbackQuery):
     if call.from_user.id != owner_id:
         return
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute("SELECT * FROM users ORDER BY joined_at DESC LIMIT 20")
-        rows = await cur.fetchall()
+    rows = await db_fetchall("SELECT * FROM users ORDER BY joined_at DESC LIMIT 20")
 
     lines = []
-    for u in rows:
+    for row in rows:
+        u = row_to_dict(row, USERS_COLS)
         name = u["username"] or u["first_name"] or f"id{u['user_id']}"
         try:
             d = datetime.fromisoformat(u["joined_at"]).astimezone().strftime("%d.%m")
@@ -1841,12 +1735,12 @@ async def cb_adm_reset_ref(call: CallbackQuery):
     if call.from_user.id != owner_id:
         return
     uid = int(call.data.split(":")[2])
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM referrals WHERE user_id=?", (uid,))
-        await db.execute("DELETE FROM pending_referrals WHERE user_id=?", (uid,))
-        await db.commit()
+    await db_execute("DELETE FROM referrals WHERE referrer_id=?", (uid,))
+    await db_execute("DELETE FROM referrals WHERE user_id=?", (uid,))
+    await db_execute("DELETE FROM pending_referrals WHERE referrer_id=?", (uid,))
+    await db_execute("DELETE FROM pending_referrals WHERE user_id=?", (uid,))
     await log_admin("reset_ref", uid)
-    await call.answer("✅ Реферал сброшен — можно заходить по ссылке заново", show_alert=True)
+    await call.answer("✅ Реферал сброшен", show_alert=True)
     call.data = f"adm:user_card:{uid}"
     await cb_adm_user_card(call)
 
@@ -1855,20 +1749,18 @@ async def cb_adm_reset_ref(call: CallbackQuery):
 async def cb_adm_bans(call: CallbackQuery):
     if call.from_user.id != owner_id:
         return
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute("SELECT * FROM users WHERE is_banned=1 ORDER BY banned_at DESC LIMIT 30")
-        rows = await cur.fetchall()
-        cur = await db.execute("SELECT * FROM users WHERE banned_ref=1 LIMIT 30")
-        ref_rows = await cur.fetchall()
+    rows = await db_fetchall("SELECT * FROM users WHERE is_banned=1 ORDER BY banned_at DESC LIMIT 30")
+    ref_rows = await db_fetchall("SELECT * FROM users WHERE banned_ref=1 LIMIT 30")
 
     lines = []
-    for u in rows:
+    for row in rows:
+        u = row_to_dict(row, USERS_COLS)
         name = u["username"] or u["first_name"] or f"id{u['user_id']}"
         reason = u["banned_reason"] or "—"
         lines.append(f"🚫 <b>{esc(name)}</b> <code>{u['user_id']}</code>\n<i>{esc(reason)[:60]}</i>")
     ref_lines = []
-    for u in ref_rows:
+    for row in ref_rows:
+        u = row_to_dict(row, USERS_COLS)
         name = u["username"] or u["first_name"] or f"id{u['user_id']}"
         ref_lines.append(f"🔒 <b>{esc(name)}</b> <code>{u['user_id']}</code>")
 
@@ -1895,31 +1787,17 @@ async def cb_adm_bans(call: CallbackQuery):
 async def cb_adm_sys(call: CallbackQuery):
     if call.from_user.id != owner_id:
         return
-    try:
-        db_size = os.path.getsize(DB_PATH) / 1024 / 1024
-    except Exception:
-        db_size = 0
-    last_backup = "—"
-    try:
-        files = [f for f in os.listdir(BACKUP_DIR) if f.startswith("bot_") and f.endswith(".db")]
-        if files:
-            files.sort()
-            last = files[-1]
-            ts_str = last[4:19]
-            dt = datetime.strptime(ts_str, "%Y%m%d_%H%M%S").replace(tzinfo=timezone.utc)
-            last_backup = dt.astimezone().strftime("%d.%m.%Y %H:%M")
-    except Exception:
-        pass
-
+    users_total = await db_fetchval("SELECT COUNT(*) FROM users", default=0)
+    msgs = await db_fetchval("SELECT COUNT(*) FROM messages", default=0)
     text = (
         "⚙️ <b>Система</b>\n"
         "─────────────\n"
-        f"💾 Размер БД: <b>{db_size:.2f} МБ</b>\n"
-        f"📦 Последний бэкап: <b>{esc(last_backup)}</b>\n"
-        f"⏱ Интервал бэкапа: <b>{BACKUP_INTERVAL // 60} мин</b>"
+        f"💾 БД: <b>Turso Cloud</b>\n"
+        f"🌐 URL: <code>{esc(TURSO_URL[:40])}...</code>\n"
+        f"👥 Юзеров: <b>{users_total}</b>\n"
+        f"📝 Сообщений: <b>{msgs}</b>"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💾 Бэкап сейчас", callback_data="adm:backup_now")],
         [InlineKeyboardButton(text="🧹 Очистить старые сообщения", callback_data="adm:cleanup")],
         [InlineKeyboardButton(text="🔄 Обновить", callback_data="adm:sys")],
         back_button("adm:menu"),
@@ -1931,27 +1809,13 @@ async def cb_adm_sys(call: CallbackQuery):
     await call.answer()
 
 
-@router.callback_query(F.data == "adm:backup_now")
-async def cb_adm_backup_now(call: CallbackQuery):
-    if call.from_user.id != owner_id:
-        return
-    ok = await do_backup(send_to_owner=True)
-    if ok:
-        await call.answer("✅ Бэкап отправлен в личку", show_alert=True)
-    else:
-        await call.answer("❌ Ошибка бэкапа", show_alert=True)
-
-
 @router.callback_query(F.data == "adm:cleanup")
 async def cb_adm_cleanup(call: CallbackQuery):
     if call.from_user.id != owner_id:
         return
     cutoff = (utcnow() - timedelta(days=30)).isoformat()
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("DELETE FROM messages WHERE date < ?", (cutoff,))
-        deleted = cur.rowcount
-        await db.commit()
-    await call.answer(f"✅ Удалено: {deleted}", show_alert=True)
+    await db_execute("DELETE FROM messages WHERE date < ?", (cutoff,))
+    await call.answer("✅ Старые сообщения удалены", show_alert=True)
     await cb_adm_sys(call)
 
 
@@ -2007,67 +1871,23 @@ async def publish_weekly_top(manual=False):
         return False
 
 
-# ---------------- Backup ----------------
-async def do_backup(send_to_owner=False):
-    try:
-        ts = utcnow().strftime("%Y%m%d_%H%M%S")
-        backup_path = os.path.join(BACKUP_DIR, f"bot_{ts}.db")
-        async with aiosqlite.connect(DB_PATH) as src:
-            async with aiosqlite.connect(backup_path) as dst:
-                await src.backup(dst)
-        try:
-            files = sorted([f for f in os.listdir(BACKUP_DIR) if f.endswith(".db")])
-            for old in files[:-10]:
-                os.remove(os.path.join(BACKUP_DIR, old))
-        except Exception:
-            pass
-        if send_to_owner:
-            try:
-                await bot_ref.send_document(
-                    owner_id,
-                    FSInputFile(backup_path),
-                    caption=f"💾 Бэкап БД · {utcnow().astimezone().strftime('%d.%m.%Y %H:%M')}"
-                )
-            except Exception as e:
-                log.warning("send backup failed: %s", e)
-        return True
-    except Exception as e:
-        log.error("backup failed: %s", e)
-        return False
-
-
-async def backup_loop():
-    while True:
-        try:
-            await asyncio.sleep(BACKUP_INTERVAL)
-            await do_backup(send_to_owner=True)
-        except Exception as e:
-            log.warning("backup loop err: %s", e)
-
-
-# ---------------- Name update (мультиюзер) ----------------
+# ---------------- Background tasks ----------------
 async def update_all_business_names():
-    """Раз в минуту обновляет имена ВСЕХ бизнес-аккаунтов, у кого включена опция."""
     while True:
         try:
-            async with aiosqlite.connect(DB_PATH) as db:
-                db.row_factory = aiosqlite.Row
-                cur = await db.execute(
-                    """SELECT bc.id as conn_id, bc.user_id, s.timezone
-                       FROM business_connections bc
-                       JOIN settings s ON s.user_id = bc.user_id
-                       WHERE bc.enabled=1 AND s.time_in_nick_enabled=1"""
-                )
-                rows = await cur.fetchall()
-
+            rows = await db_fetchall(
+                """SELECT bc.id as conn_id, bc.user_id, s.timezone
+                   FROM business_connections bc
+                   JOIN settings s ON s.user_id = bc.user_id
+                   WHERE bc.enabled=1 AND s.time_in_nick_enabled=1"""
+            )
             for row in rows:
-                connection_id = row["conn_id"]
-                user_id = row["user_id"]
-                tz = row["timezone"] or "UTC"
+                connection_id = row[0]
+                user_id = row[1]
+                tz = row[2] or "UTC"
                 try:
                     base_name = await get_base_name(connection_id)
                     if not base_name:
-                        # Первый раз — берём через API
                         try:
                             info = await bot_ref.get_business_account_name(
                                 business_connection_id=connection_id
@@ -2094,7 +1914,6 @@ async def update_all_business_names():
         await asyncio.sleep(60)
 
 
-# ---------------- Weekly publish ----------------
 async def weekly_publish_loop():
     while True:
         try:
@@ -2111,6 +1930,7 @@ async def weekly_publish_loop():
         except Exception as e:
             log.warning("weekly publish err: %s", e)
             await asyncio.sleep(3600)
+
 
 # ============================================================
 # VIDEO DOWNLOAD HELPERS
@@ -2211,53 +2031,54 @@ async def download_video(url: str, outdir: str) -> tuple[str, str]:
             errors.append(f"tikwm: {str(e)[:100]}")
     raise RuntimeError("Не удалось загрузить. " + " | ".join(errors)[:300])
 
-
 # ============================================================
 # BUSINESS HANDLERS (мультиюзер)
 # ============================================================
 
-# In-memory кэш: business_connection_id → user_id
-connection_cache = {}
-
-
 async def _resolve_owner(message: Message):
     """
     Возвращает user_id владельца бизнес-коннекта.
-    Приоритет: in-memory кэш → БД → fallback на owner_id.
+    Приоритет: кэш → БД → getBusinessConnection → None
     """
     if not message.business_connection_id:
         return None
     bc = message.business_connection_id
-    # 1. In-memory кэш
+
     if bc in connection_cache:
         return connection_cache[bc]
-    # 2. БД
+
     owner_uid = await get_connection_owner(bc)
     if owner_uid:
         connection_cache[bc] = owner_uid
         return owner_uid
-    # 3. Fallback — работаем как владелец из .env
-    log.warning("Connection %s not in DB, fallback to owner_id", bc)
-    connection_cache[bc] = owner_id
-    return owner_id
+
+    try:
+        conn = await bot_ref.get_business_connection(bc)
+        if conn and conn.user:
+            owner_uid = conn.user.id
+            connection_cache[bc] = owner_uid
+            await save_connection(bc, owner_uid, 1)
+            await ensure_user(owner_uid, conn.user.first_name, conn.user.username)
+            log.info("Resolved owner %s for bc %s via API", owner_uid, bc)
+            return owner_uid
+    except Exception as e:
+        log.warning("get_business_connection failed for %s: %s", bc, e)
+
+    log.warning("Cannot resolve owner for bc %s", bc)
+    return None
 
 
 async def _check_owner_command(message: Message):
-    """
-    Проверяет, что команда пришла от владельца бизнес-аккаунта.
-    Мягкая проверка: пропускает, но блокирует чужие dot-команды.
-    """
+    """Проверяет, что команда пришла от владельца бизнес-аккаунта."""
     if not message.from_user or not message.business_connection_id:
         return None
     owner_uid = await _resolve_owner(message)
     if not owner_uid:
         return None
-    # Если команда от самого владельца — точно ОК
     if message.from_user.id == owner_uid:
         if await is_banned(owner_uid):
             return None
         return owner_uid
-    # Если нет — блокируем только dot-команды от чужих
     text = (message.text or "").strip()
     if text.startswith("."):
         return None
@@ -2574,27 +2395,26 @@ async def business_commands(message: Message, bot: Bot):
                 f"🔗 Соединение: <code>{esc(bc)}</code>"
             )
         elif cmd == ".whois":
-            async with aiosqlite.connect(DB_PATH) as db:
-                db.row_factory = aiosqlite.Row
-                cur = await db.execute("SELECT * FROM contacts WHERE chat_id=?", (chat_id,))
-                row = await cur.fetchone()
+            row = await db_fetchone("SELECT * FROM contacts WHERE chat_id=?", (chat_id,))
             if not row:
                 await edit("👤 Информации пока нет.")
             else:
+                c = row_to_dict(row, ["chat_id", "first_seen", "message_count",
+                                       "user_id", "user_name", "username"])
                 first = "—"
                 try:
-                    first = datetime.fromisoformat(row["first_seen"]).astimezone().strftime("%d.%m.%Y %H:%M")
+                    first = datetime.fromisoformat(c["first_seen"]).astimezone().strftime("%d.%m.%Y %H:%M")
                 except Exception:
                     pass
-                uname = f"@{esc(row['username'])}" if row["username"] else "—"
+                uname = f"@{esc(c['username'])}" if c["username"] else "—"
                 await edit(
                     "👤 <b>Информация о собеседнике</b>\n"
                     "─────────────\n"
-                    f"📛 Имя: <b>{esc(row['user_name'])}</b>\n"
-                    f"🆔 ID: <code>{row['user_id']}</code>\n"
+                    f"📛 Имя: <b>{esc(c['user_name'])}</b>\n"
+                    f"🆔 ID: <code>{c['user_id']}</code>\n"
                     f"🔗 Username: {uname}\n"
                     f"📅 Первый контакт: {esc(first)}\n"
-                    f"💬 Сообщений: <b>{row['message_count']}</b>"
+                    f"💬 Сообщений: <b>{c['message_count']}</b>"
                 )
         elif cmd == ".typing":
             try:
@@ -2628,51 +2448,41 @@ async def business_commands(message: Message, bot: Bot):
                 except ValueError:
                     pass
             if target is None:
-                async with aiosqlite.connect(DB_PATH) as db:
-                    cur = await db.execute(
-                        "SELECT user_id FROM messages WHERE chat_id=? AND user_id IS NOT NULL "
-                        "AND user_id!=? ORDER BY id DESC LIMIT 1",
-                        (chat_id, owner_uid)
-                    )
-                    row = await cur.fetchone()
+                row = await db_fetchone(
+                    "SELECT user_id FROM messages WHERE chat_id=? AND user_id IS NOT NULL "
+                    "AND user_id!=? ORDER BY id DESC LIMIT 1",
+                    (chat_id, owner_uid)
+                )
                 if not row:
                     await edit("⚠️ Укажите ID: <code>.mute 60 123456</code>")
                     return
                 target = row[0]
 
-            # ИММУНИТЕТ PREMIUM
             if await is_premium(target):
                 await edit("⛔ Пользователь защищён Premium-иммунитетом")
                 return
 
             until = utcnow() + timedelta(seconds=seconds)
-            async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute(
-                    "INSERT OR REPLACE INTO mutes(chat_id,target_user_id,mute_until) VALUES(?,?,?)",
-                    (chat_id, target, until.isoformat())
-                )
-                await db.commit()
+            await db_execute(
+                "INSERT OR REPLACE INTO mutes(chat_id,target_user_id,mute_until) VALUES(?,?,?)",
+                (chat_id, target, until.isoformat())
+            )
             await edit(f"🔇 Пользователь заглушён на {seconds} сек.")
         elif cmd == ".unmute":
-            async with aiosqlite.connect(DB_PATH) as db:
-                cur = await db.execute(
-                    "SELECT user_id FROM messages WHERE chat_id=? AND user_id IS NOT NULL "
-                    "AND user_id!=? ORDER BY id DESC LIMIT 1",
-                    (chat_id, owner_uid)
-                )
-                row = await cur.fetchone()
-                if row:
-                    await db.execute("DELETE FROM mutes WHERE chat_id=? AND target_user_id=?",
-                                     (chat_id, row[0]))
-                    await db.commit()
+            row = await db_fetchone(
+                "SELECT user_id FROM messages WHERE chat_id=? AND user_id IS NOT NULL "
+                "AND user_id!=? ORDER BY id DESC LIMIT 1",
+                (chat_id, owner_uid)
+            )
+            if row:
+                await db_execute("DELETE FROM mutes WHERE chat_id=? AND target_user_id=?",
+                                 (chat_id, row[0]))
             await edit("🔊 Мут снят")
         elif cmd == ".muted":
-            async with aiosqlite.connect(DB_PATH) as db:
-                cur = await db.execute(
-                    "SELECT target_user_id, mute_until FROM mutes WHERE chat_id=? AND mute_until > ?",
-                    (chat_id, utcnow().isoformat())
-                )
-                rows = await cur.fetchall()
+            rows = await db_fetchall(
+                "SELECT target_user_id, mute_until FROM mutes WHERE chat_id=? AND mute_until > ?",
+                (chat_id, utcnow().isoformat())
+            )
             if not rows:
                 await edit("🔊 Активных мутов нет")
             else:
@@ -2739,13 +2549,10 @@ async def business_message_handler(message: Message, bot: Bot):
     if not sender or sender.id == owner_uid:
         return
 
-    # Mute
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "SELECT mute_until FROM mutes WHERE chat_id=? AND target_user_id=?",
-            (message.chat.id, sender.id)
-        )
-        row = await cur.fetchone()
+    row = await db_fetchone(
+        "SELECT mute_until FROM mutes WHERE chat_id=? AND target_user_id=?",
+        (message.chat.id, sender.id)
+    )
     if row:
         try:
             until = datetime.fromisoformat(row[0])
@@ -2782,9 +2589,7 @@ async def business_message_handler(message: Message, bot: Bot):
     s = await get_settings(owner_uid)
     premium_owner = await is_premium(owner_uid)
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT message_count FROM contacts WHERE chat_id=?", (message.chat.id,))
-        cnt_row = await cur.fetchone()
+    cnt_row = await db_fetchone("SELECT message_count FROM contacts WHERE chat_id=?", (message.chat.id,))
     count = cnt_row[0] if cnt_row else 1
     if count == 1 and s["answer_first_enabled"] and s["answer_first_text"]:
         try:
@@ -2828,7 +2633,15 @@ async def business_deleted_handler(event: BusinessMessagesDeleted, bot: Bot):
     if not owner_uid:
         owner_uid = await get_connection_owner(event.business_connection_id)
     if not owner_uid:
-        owner_uid = owner_id
+        try:
+            conn = await bot_ref.get_business_connection(event.business_connection_id)
+            if conn and conn.user:
+                owner_uid = conn.user.id
+                connection_cache[event.business_connection_id] = owner_uid
+        except Exception:
+            pass
+    if not owner_uid:
+        return
 
     for mid in event.message_ids:
         row = await find_message(event.chat.id, mid)
@@ -2883,7 +2696,19 @@ async def game_callback(call: CallbackQuery, bot: Bot):
     kind = parts[1]
     chat_id = int(parts[2])
     bc = ":".join(parts[3:])
-    owner_uid = connection_cache.get(bc) or await get_connection_owner(bc) or owner_id
+    owner_uid = connection_cache.get(bc) or await get_connection_owner(bc)
+    if not owner_uid:
+        try:
+            conn = await bot_ref.get_business_connection(bc)
+            if conn and conn.user:
+                owner_uid = conn.user.id
+                connection_cache[bc] = owner_uid
+        except Exception:
+            pass
+    if not owner_uid:
+        await call.answer("Не удалось определить владельца", show_alert=True)
+        return
+
     if kind == "roulette":
         roulette_games[(chat_id, call.message.message_id)] = 0
         kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
@@ -2988,22 +2813,17 @@ async def business_connection_handler(connection: BusinessConnection, bot: Bot):
         return
     user_id = connection.user.id
 
-    # Кэшируем в память
     connection_cache[connection.id] = user_id
 
-    # Узнаём предыдущий статус
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "SELECT enabled FROM business_connections WHERE id=?",
-            (connection.id,)
-        )
-        row = await cur.fetchone()
+    row = await db_fetchone(
+        "SELECT enabled FROM business_connections WHERE id=?",
+        (connection.id,)
+    )
     prev_enabled = bool(row[0]) if row else None
 
-    await save_connection(connection.id, user_id, connection.is_enabled)
+    await save_connection(connection.id, user_id, 1)
     await ensure_user(user_id, connection.user.first_name, connection.user.username)
 
-    # Уведомляем только при смене статуса
     if prev_enabled == connection.is_enabled:
         return
 
@@ -3022,12 +2842,6 @@ async def business_connection_handler(connection: BusinessConnection, bot: Bot):
                     "✅ <b>BobMod подключён к вашему бизнес-аккаунту</b>\n\n"
                     "Команды: /start · /settings · /ref"
                 )
-        else:
-            await bot.send_message(
-                user_id,
-                "⚠️ <b>BobMod отключён от бизнес-аккаунта</b>\n\n"
-                "Чтобы вернуть — подключите бота заново."
-            )
     except Exception as e:
         log.info("notify business: %s", e)
 
@@ -3037,11 +2851,18 @@ async def business_connection_handler(connection: BusinessConnection, bot: Bot):
 # ============================================================
 
 async def main():
-    global bot_ref
+    global bot_ref, db_client
+
     if not api_token:
         raise RuntimeError("Не найден API_TOKEN в .env")
     if owner_id <= 0:
         raise RuntimeError("Некорректный OWNER_ID в .env")
+    if not TURSO_URL or not TURSO_TOKEN:
+        raise RuntimeError("Не найдены TURSO_DATABASE_URL или TURSO_AUTH_TOKEN в .env")
+
+    # Подключаемся к Turso
+    db_client = libsql_client.create_client(url=TURSO_URL, auth_token=TURSO_TOKEN)
+    log.info("Connected to Turso: %s", TURSO_URL)
 
     await init_db()
 
@@ -3049,15 +2870,17 @@ async def main():
     dp = Dispatcher()
     dp.include_router(router)
 
-    asyncio.create_task(backup_loop())
     asyncio.create_task(update_all_business_names())
     asyncio.create_task(weekly_publish_loop())
 
     log.info("BobMod started. Owner: %s", owner_id)
-    await dp.start_polling(bot_ref, allowed_updates=dp.resolve_used_update_types() + [
-        "business_connection", "business_message",
-        "edited_business_message", "deleted_business_messages"
-    ])
+    try:
+        await dp.start_polling(bot_ref, allowed_updates=dp.resolve_used_update_types() + [
+            "business_connection", "business_message",
+            "edited_business_message", "deleted_business_messages"
+        ])
+    finally:
+        await db_client.close()
 
 
 if __name__ == "__main__":
