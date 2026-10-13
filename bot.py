@@ -2860,12 +2860,12 @@ async def main():
     if not TURSO_URL or not TURSO_TOKEN:
         raise RuntimeError("Не найдены TURSO_DATABASE_URL или TURSO_AUTH_TOKEN в .env")
 
-# Подключаемся к Turso (HTTP-транспорт, WebSocket на хостинге может блокироваться)
-db_client = libsql_client.create_client(
-    url=TURSO_URL,
-    auth_token=TURSO_TOKEN,
-    scheme="https"
-)
+    # Подключаемся к Turso (HTTP-транспорт, WebSocket на хостинге может блокироваться)
+    db_client = libsql_client.create_client(
+        url=TURSO_URL,
+        auth_token=TURSO_TOKEN,
+        scheme="https"
+    )
     log.info("Connected to Turso: %s", TURSO_URL)
 
     await init_db()
