@@ -95,7 +95,7 @@ router = Router()
 guess_games = {}
 roulette_games = {}
 ttt_games = {}
-pending_inputs = {}      # owner_id -> action
+pending_inputs = {}      # user_id -> action
 pending_admin = {}       # owner_id -> admin action
 sub_cache = {}           # user_id -> (is_subscribed, ts)
 name_update_lock = asyncio.Lock()
@@ -197,8 +197,8 @@ def watermark():
     return f"\n\n<i>via @{BOT_USERNAME}</i>"
 
 
-def with_watermark(text, is_premium):
-    return text if is_premium else text + watermark()
+def with_watermark(text, is_premium_flag):
+    return text if is_premium_flag else text + watermark()
 
 
 URL_RE = re.compile(r"https?://[^\s]+")
@@ -243,7 +243,11 @@ async def init_db():
             forward_to_owner_enabled INTEGER DEFAULT 0
         );
 
-        CREATE TABLE IF NOT EXISTS blacklist (user_id INTEGER PRIMARY KEY);
+        CREATE TABLE IF NOT EXISTS blacklist (
+            owner_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            PRIMARY KEY(owner_id, user_id)
+        );
 
         CREATE TABLE IF NOT EXISTS mutes (
             chat_id INTEGER NOT NULL,
@@ -296,16 +300,24 @@ async def init_db():
         );
         CREATE INDEX IF NOT EXISTS idx_ref_referrer ON referrals(referrer_id);
 
+        CREATE TABLE IF NOT EXISTS pending_referrals (
+            user_id INTEGER PRIMARY KEY,
+            referrer_id INTEGER NOT NULL,
+            ts TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS business_connections (
             id TEXT PRIMARY KEY,
             user_id INTEGER,
             enabled INTEGER DEFAULT 1,
             added_at TEXT
         );
+        CREATE INDEX IF NOT EXISTS idx_bc_user ON business_connections(user_id);
 
-        CREATE TABLE IF NOT EXISTS subscribers_log (
-            user_id INTEGER PRIMARY KEY,
-            first_seen TEXT NOT NULL
+        CREATE TABLE IF NOT EXISTS business_names (
+            connection_id TEXT PRIMARY KEY,
+            base_name TEXT NOT NULL,
+            saved_at TEXT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS admin_log (
@@ -328,8 +340,8 @@ async def init_db():
         await db.commit()
 
 
-async def get_settings(user=None):
-    user = user if user is not None else owner_id
+# ---------------- Settings (per user) ----------------
+async def get_settings(user):
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute("SELECT * FROM settings WHERE user_id=?", (user,))
@@ -342,8 +354,7 @@ async def get_settings(user=None):
         return dict(await cur.fetchone())
 
 
-async def set_setting(key, value, user=None):
-    user = user if user is not None else owner_id
+async def set_setting(user, key, value):
     allowed = {
         "answer_first_enabled", "answer_first_text", "time_in_nick_enabled", "timezone",
         "off_hours_enabled", "off_hours_start", "off_hours_end", "off_hours_text",
@@ -357,24 +368,35 @@ async def set_setting(key, value, user=None):
         await db.commit()
 
 
-async def is_blacklisted(user_id):
+# ---------------- Blacklist (per owner) ----------------
+async def is_blacklisted(owner, user_id):
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT 1 FROM blacklist WHERE user_id=?", (user_id,))
+        cur = await db.execute(
+            "SELECT 1 FROM blacklist WHERE owner_id=? AND user_id=?",
+            (owner, user_id)
+        )
         return await cur.fetchone() is not None
 
 
-async def add_blacklist(user_id):
+async def add_blacklist(owner, user_id):
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT OR IGNORE INTO blacklist(user_id) VALUES(?)", (user_id,))
+        await db.execute(
+            "INSERT OR IGNORE INTO blacklist(owner_id, user_id) VALUES(?,?)",
+            (owner, user_id)
+        )
         await db.commit()
 
 
-async def remove_blacklist(user_id):
+async def remove_blacklist(owner, user_id):
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM blacklist WHERE user_id=?", (user_id,))
+        await db.execute(
+            "DELETE FROM blacklist WHERE owner_id=? AND user_id=?",
+            (owner, user_id)
+        )
         await db.commit()
 
 
+# ---------------- Notes ----------------
 async def get_note(chat_id):
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("SELECT note, updated_at FROM notes WHERE chat_id=?", (chat_id,))
@@ -391,6 +413,7 @@ async def set_note(chat_id, text):
         await db.commit()
 
 
+# ---------------- Admin log ----------------
 async def log_admin(action, target_id=None, details=""):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
@@ -412,10 +435,6 @@ async def ensure_user(user_id, first_name=None, username=None):
             "INSERT INTO users(user_id, first_name, username, joined_at) VALUES(?,?,?,?) "
             "ON CONFLICT(user_id) DO UPDATE SET first_name=excluded.first_name, username=excluded.username",
             (user_id, first_name or "", username or "", utcnow().isoformat())
-        )
-        await db.execute(
-            "INSERT OR IGNORE INTO subscribers_log(user_id, first_seen) VALUES(?,?)",
-            (user_id, utcnow().isoformat())
         )
         await db.commit()
 
@@ -468,13 +487,9 @@ async def get_user_card(user_id):
         db.row_factory = aiosqlite.Row
         cur = await db.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
         u = await cur.fetchone()
-        cur = await db.execute(
-            "SELECT COUNT(*) FROM referrals WHERE referrer_id=?", (user_id,)
-        )
+        cur = await db.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id=?", (user_id,))
         refs = (await cur.fetchone())[0]
-        cur = await db.execute(
-            "SELECT COUNT(*) FROM messages WHERE user_id=?", (user_id,)
-        )
+        cur = await db.execute("SELECT COUNT(*) FROM messages WHERE user_id=?", (user_id,))
         msgs = (await cur.fetchone())[0]
     return dict(u) if u else None, refs, msgs
 
@@ -660,6 +675,55 @@ async def referral_leaderboard(limit=5, week_only=True):
     return result
 
 
+# ---------------- Business connections ----------------
+async def get_connection_owner(connection_id):
+    """Возвращает user_id владельца бизнес-коннекта."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT user_id FROM business_connections WHERE id=?", (connection_id,))
+        row = await cur.fetchone()
+    return row[0] if row else None
+
+
+async def get_user_connection(user_id):
+    """Возвращает активный connection_id для юзера."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT id FROM business_connections WHERE user_id=? AND enabled=1 LIMIT 1",
+            (user_id,)
+        )
+        row = await cur.fetchone()
+    return row[0] if row else None
+
+
+async def save_connection(connection_id, user_id, enabled):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO business_connections(id, user_id, enabled, added_at) VALUES(?,?,?,?)",
+            (connection_id, user_id, int(enabled), utcnow().isoformat())
+        )
+        await db.commit()
+
+
+# ---------------- Base name для бизнес-аккаунта ----------------
+async def get_base_name(connection_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT base_name FROM business_names WHERE connection_id=?",
+            (connection_id,)
+        )
+        row = await cur.fetchone()
+    return row[0] if row else None
+
+
+async def save_base_name(connection_id, name):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO business_names(connection_id, base_name, saved_at) VALUES(?,?,?)",
+            (connection_id, name, utcnow().isoformat())
+        )
+        await db.commit()
+
+
 # ---------------- Message payload / save ----------------
 def message_payload(message: Message):
     text = message.text or message.caption or ""
@@ -687,12 +751,13 @@ def message_payload(message: Message):
     return text, ctype, file_id
 
 
-async def save_business_message(message: Message):
+async def save_business_message(message: Message, owner_uid: int):
+    """Сохраняет сообщение. owner_uid — владелец бизнес-аккаунта."""
     chat_id = message.chat.id
     sender = message.from_user
     uid = sender.id if sender else None
-    outgoing = bool(sender and uid == owner_id)
-    if uid is not None and await is_blacklisted(uid):
+    outgoing = bool(sender and uid == owner_uid)
+    if uid is not None and await is_blacklisted(owner_uid, uid):
         return
     text, ctype, file_id = message_payload(message)
     username = sender.username if sender else None
@@ -800,6 +865,33 @@ async def cb_check_sub(call: CallbackQuery):
         await call.answer("❌ Вы ещё не подписаны!", show_alert=True)
         return
     await ensure_user(user_id, call.from_user.first_name, call.from_user.username)
+
+    # Обработка отложенного реферала
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT referrer_id FROM pending_referrals WHERE user_id=?",
+            (user_id,)
+        )
+        pending = await cur.fetchone()
+    if pending:
+        referrer_id = pending[0]
+        if await register_referral(user_id, referrer_id):
+            until = await grant_premium(referrer_id, hours=REF_BONUS_HOURS)
+            await mark_referral_rewarded(user_id)
+            log.info("Referral (after sub): %s → %s (+%dh)", user_id, referrer_id, REF_BONUS_HOURS)
+            try:
+                await bot_ref.send_message(
+                    referrer_id,
+                    f"🎉 <b>+{REF_BONUS_HOURS} часов Premium</b>\n"
+                    f"По вашей ссылке пришёл новый пользователь.\n"
+                    f"Premium активен до: <b>{until.astimezone().strftime('%d.%m.%Y %H:%M')}</b>"
+                )
+            except Exception:
+                pass
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("DELETE FROM pending_referrals WHERE user_id=?", (user_id,))
+            await db.commit()
+
     await call.answer("✅ Спасибо за подписку!", show_alert=True)
     try:
         await call.message.edit_text(
@@ -835,7 +927,7 @@ def admin_menu():
     ])
 
 # ============================================================
-# PRIVATE HANDLERS
+# PRIVATE HANDLERS (все юзеры)
 # ============================================================
 
 @router.message(Command("start"))
@@ -850,32 +942,55 @@ async def cmd_start(message: Message, command: Command):
 
     await ensure_user(user.id, user.first_name, user.username)
 
+    # Реф-ссылка: сохраняем сразу (вдруг ещё не подписан — обработается после)
     if command.args and command.args.startswith("ref_"):
         try:
             referrer_id = int(command.args[4:])
-            if await register_referral(user.id, referrer_id):
-                until = await grant_premium(referrer_id, hours=REF_BONUS_HOURS)
-                await mark_referral_rewarded(user.id)
-                log.info("Referral: %s → %s (+%dh)", user.id, referrer_id, REF_BONUS_HOURS)
-                try:
-                    await bot_ref.send_message(
-                        referrer_id,
-                        f"🎉 <b>+{REF_BONUS_HOURS} часов Premium</b>\n"
-                        f"По вашей ссылке пришёл новый пользователь.\n"
-                        f"Premium активен до: <b>{until.astimezone().strftime('%d.%m.%Y %H:%M')}</b>"
-                    )
-                except Exception:
-                    pass
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute(
+                    "INSERT OR REPLACE INTO pending_referrals(user_id, referrer_id, ts) VALUES(?,?,?)",
+                    (user.id, referrer_id, utcnow().isoformat())
+                )
+                await db.commit()
         except (ValueError, IndexError):
             pass
 
-    await get_settings()
+    # Обрабатываем отложенный реферал
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT referrer_id FROM pending_referrals WHERE user_id=?",
+            (user.id,)
+        )
+        pending = await cur.fetchone()
+    if pending:
+        referrer_id = pending[0]
+        if await register_referral(user.id, referrer_id):
+            until = await grant_premium(referrer_id, hours=REF_BONUS_HOURS)
+            await mark_referral_rewarded(user.id)
+            log.info("Referral: %s → %s (+%dh)", user.id, referrer_id, REF_BONUS_HOURS)
+            try:
+                await bot_ref.send_message(
+                    referrer_id,
+                    f"🎉 <b>+{REF_BONUS_HOURS} часов Premium</b>\n"
+                    f"По вашей ссылке пришёл новый пользователь.\n"
+                    f"Premium активен до: <b>{until.astimezone().strftime('%d.%m.%Y %H:%M')}</b>"
+                )
+            except Exception:
+                pass
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("DELETE FROM pending_referrals WHERE user_id=?", (user.id,))
+            await db.commit()
+
+    s = await get_settings(user.id)
     premium = await is_premium(user.id)
     status = "💎 Premium" if premium else "🆓 Бесплатный тариф"
+    conn = await get_user_connection(user.id)
+    conn_line = "✅ Бизнес подключён" if conn else "⚠️ Бизнес не подключён"
 
     await message.answer(
         f"👋 <b>Привет! Я {BOT_NAME}.</b>\n"
-        f"Статус: {status}\n\n"
+        f"Статус: {status}\n"
+        f"{conn_line}\n\n"
         "Помогаю в ваших Telegram-чатах:\n"
         "• автоматические ответы\n"
         "• сохранение удалённых сообщений\n"
@@ -903,7 +1018,12 @@ async def cmd_help(message: Message):
         "<code>.mute 60</code> · <code>.unmute</code> · <code>.muted</code>\n"
         "<code>.note</code> · <code>.id</code> · <code>.ping</code> · <code>.game</code>\n\n"
         "<b>В личных сообщениях:</b>\n"
-        "/start · /settings · /ref · /stats",
+        "/start · /settings · /ref · /stats\n\n"
+        "<b>💎 Premium даёт:</b>\n"
+        f"• {PREMIUM_DAILY_LIMIT} запросов ИИ в день (вместо {FREE_DAILY_LIMIT})\n"
+        f"• Задержка {AI_COOLDOWN_PREMIUM} сек (вместо {AI_COOLDOWN_FREE})\n"
+        "• Без водяного знака в ответах\n"
+        "• Иммунитет от <code>.mute</code>",
         reply_markup=main_menu()
     )
 
@@ -912,10 +1032,7 @@ async def cmd_help(message: Message):
 async def cmd_settings(message: Message):
     if not await require_sub(message):
         return
-    if message.from_user and message.from_user.id != owner_id:
-        await message.answer("⛔ Доступ только для владельца.")
-        return
-    await render_settings(message)
+    await render_settings(message, message.from_user.id)
 
 
 @router.message(Command("admin"))
@@ -930,8 +1047,8 @@ async def cmd_admin(message: Message):
     )
 
 
-async def render_settings(msg_or_call, edit=False):
-    s = await get_settings()
+async def render_settings(msg_or_call, user_id, edit=False):
+    s = await get_settings(user_id)
     text = (
         "⚙️ <b>Настройки BobMod</b>\n"
         "─────────────\n"
@@ -975,37 +1092,27 @@ async def cmd_stats(message: Message):
             return (await cur.fetchone())[0]
         messages = await count("SELECT COUNT(*) FROM messages")
         chats = await count("SELECT COUNT(*) FROM contacts")
-        bl = await count("SELECT COUNT(*) FROM blacklist")
-        mutes = await count("SELECT COUNT(*) FROM mutes")
-        subs = await count("SELECT COUNT(*) FROM users")
+        users = await count("SELECT COUNT(*) FROM users")
+        conns = await count("SELECT COUNT(*) FROM business_connections WHERE enabled=1")
         refs_total = await count("SELECT COUNT(*) FROM referrals")
     await message.answer(
         "📊 <b>Статистика BobMod</b>\n"
         "─────────────\n"
         f"💾 Сообщений: <b>{messages}</b>\n"
         f"👥 Чатов: <b>{chats}</b>\n"
-        f"👤 Пользователей бота: <b>{subs}</b>\n"
-        f"🎁 Рефералов: <b>{refs_total}</b>\n"
-        f"🚫 В чёрном списке: <b>{bl}</b>\n"
-        f"🔇 Активных мутов: <b>{mutes}</b>"
+        f"👤 Пользователей: <b>{users}</b>\n"
+        f"🔗 Бизнес-коннектов: <b>{conns}</b>\n"
+        f"🎁 Рефералов: <b>{refs_total}</b>"
     )
 
 
 # ---------------- Рефералка ----------------
-@router.message(Command("ref"))
-async def cmd_ref(message: Message):
-    if not await require_sub(message):
-        return
-    user = message.from_user
-    if not user:
-        return
-    await ensure_user(user.id, user.first_name, user.username)
-
-    ref_link = f"https://t.me/{BOT_USERNAME}?start=ref_{user.id}"
-    total, purchases = await referral_stats(user.id)
+async def render_ref_panel(msg_or_call, user_id, edit=False):
+    ref_link = f"https://t.me/{BOT_USERNAME}?start=ref_{user_id}"
+    total, purchases = await referral_stats(user_id)
     earned_hours = total * REF_BONUS_HOURS
     earned_days = purchases * REF_BONUS_PURCHASE_DAYS
-    premium = await is_premium(user.id)
+    premium = await is_premium(user_id)
 
     text = (
         "🎁 <b>Реферальная программа</b>\n"
@@ -1025,41 +1132,29 @@ async def cmd_ref(message: Message):
         [InlineKeyboardButton(text="🏆 Битва рефералов", callback_data="ref:battle")],
         back_button(),
     ])
-    await message.answer(text, reply_markup=kb)
+    if edit:
+        try:
+            await msg_or_call.edit_text(text, reply_markup=kb)
+        except TelegramBadRequest:
+            await msg_or_call.answer(text, reply_markup=kb)
+    else:
+        await msg_or_call.answer(text, reply_markup=kb)
+
+
+@router.message(Command("ref"))
+async def cmd_ref(message: Message):
+    if not await require_sub(message):
+        return
+    await ensure_user(message.from_user.id, message.from_user.first_name, message.from_user.username)
+    await render_ref_panel(message, message.from_user.id)
 
 
 @router.callback_query(F.data == "menu:ref")
 async def cb_menu_ref(call: CallbackQuery):
     if not await require_sub(call):
         return
-    user = call.from_user
-    await ensure_user(user.id, user.first_name, user.username)
-    ref_link = f"https://t.me/{BOT_USERNAME}?start=ref_{user.id}"
-    total, purchases = await referral_stats(user.id)
-    earned_hours = total * REF_BONUS_HOURS
-    earned_days = purchases * REF_BONUS_PURCHASE_DAYS
-    premium = await is_premium(user.id)
-
-    text = (
-        "🎁 <b>Реферальная программа</b>\n"
-        "─────────────\n"
-        f"🔗 <b>Ваша ссылка:</b>\n"
-        f"<code>{ref_link}</code>\n\n"
-        f"👥 Приглашено: <b>{total}</b>\n"
-        f"💎 Часов за друзей: <b>{earned_hours}</b>\n"
-        f"💰 Дней за покупки: <b>{earned_days}</b>\n"
-        f"Статус: {'💎 Premium' if premium else '🆓 Бесплатный тариф'}"
-    )
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📤 Поделиться",
-                              url=f"https://t.me/share/url?url={ref_link}&text=Попробуй BobMod!")],
-        [InlineKeyboardButton(text="🏆 Битва рефералов", callback_data="ref:battle")],
-        back_button(),
-    ])
-    try:
-        await call.message.edit_text(text, reply_markup=kb)
-    except TelegramBadRequest:
-        await call.message.answer(text, reply_markup=kb)
+    await ensure_user(call.from_user.id, call.from_user.first_name, call.from_user.username)
+    await render_ref_panel(call.message, call.from_user.id, edit=True)
     await call.answer()
 
 
@@ -1154,7 +1249,11 @@ async def cb_help(call: CallbackQuery):
         "<b>В бизнес-чатах:</b>\n"
         "<code>.ai</code> · <code>.save</code> · <code>.anim</code> · <code>.qr</code>\n"
         "<code>.whois</code> · <code>.typing</code> · <code>.mute</code>\n"
-        "<code>.note</code> · <code>.id</code> · <code>.ping</code> · <code>.game</code>"
+        "<code>.note</code> · <code>.id</code> · <code>.ping</code> · <code>.game</code>\n\n"
+        "<b>💎 Premium:</b>\n"
+        f"• {PREMIUM_DAILY_LIMIT} запросов ИИ в день\n"
+        "• Без водяного знака\n"
+        "• Иммунитет от <code>.mute</code>"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[back_button()])
     try:
@@ -1168,33 +1267,28 @@ async def cb_help(call: CallbackQuery):
 async def cb_settings(call: CallbackQuery):
     if not await require_sub(call):
         return
-    if call.from_user.id != owner_id:
-        await call.answer("Доступ только для владельца", show_alert=True)
-        return
-    await render_settings(call.message, edit=True)
+    await render_settings(call.message, call.from_user.id, edit=True)
     await call.answer()
 
 
 # ---------------- Toggles / prompts ----------------
 @router.callback_query(F.data.startswith("toggle:"))
 async def cb_toggle(call: CallbackQuery):
-    if call.from_user.id != owner_id:
-        await call.answer("Доступ только для владельца", show_alert=True)
+    if not await require_sub(call):
         return
     key = call.data.split(":", 1)[1]
-    s = await get_settings()
+    s = await get_settings(call.from_user.id)
     if key not in s:
         await call.answer("Неизвестный параметр", show_alert=True)
         return
-    await set_setting(key, 0 if s[key] else 1)
-    await render_settings(call.message, edit=True)
+    await set_setting(call.from_user.id, key, 0 if s[key] else 1)
+    await render_settings(call.message, call.from_user.id, edit=True)
     await call.answer("Сохранено")
 
 
 @router.callback_query(F.data.startswith("prompt:"))
 async def cb_prompt(call: CallbackQuery):
-    if call.from_user.id != owner_id:
-        await call.answer("Доступ только для владельца", show_alert=True)
+    if not await require_sub(call):
         return
     action = call.data.split(":", 1)[1]
     prompts = {
@@ -1205,51 +1299,54 @@ async def cb_prompt(call: CallbackQuery):
     if action not in prompts:
         await call.answer()
         return
-    pending_inputs[owner_id] = action
+    pending_inputs[call.from_user.id] = action
     await call.message.answer(prompts[action])
     await call.answer()
 
 
-@router.message(F.chat.type == "private", F.from_user.id == owner_id, ~F.text.startswith("/"))
+@router.message(F.chat.type == "private", ~F.text.startswith("/"))
 async def receive_setting_value(message: Message):
-    # Сначала админские вводы
-    if owner_id in pending_admin:
+    user = message.from_user
+    if not user:
+        return
+
+    # Админские вводы (только owner)
+    if user.id == owner_id and owner_id in pending_admin:
         action = pending_admin.pop(owner_id)
         value = (message.text or "").strip()
         await handle_admin_input(message, action, value)
         return
 
-    if owner_id not in pending_inputs:
+    if user.id not in pending_inputs:
         return
-    action = pending_inputs.pop(owner_id)
+    action = pending_inputs.pop(user.id)
     value = (message.text or "").strip()
     try:
         if action == "answer_first_text":
-            await set_setting("answer_first_text", value)
+            await set_setting(user.id, "answer_first_text", value)
         elif action == "off_hours_text":
-            await set_setting("off_hours_text", value)
+            await set_setting(user.id, "off_hours_text", value)
         elif action == "off_hours":
             m = re.fullmatch(r"(\d{2}:\d{2})\s*-\s*(\d{2}:\d{2})", value)
             if not m:
                 raise ValueError("Неверный формат. Ожидается ЧЧ:ММ-ЧЧ:ММ")
             for t in m.groups():
                 datetime.strptime(t, "%H:%M")
-            await set_setting("off_hours_start", m.group(1))
-            await set_setting("off_hours_end", m.group(2))
+            await set_setting(user.id, "off_hours_start", m.group(1))
+            await set_setting(user.id, "off_hours_end", m.group(2))
         elif action == "timezone":
             ZoneInfo(value)
-            await set_setting("timezone", value)
+            await set_setting(user.id, "timezone", value)
         await message.answer("✅ Настройка сохранена")
     except Exception as e:
         await message.answer(f"⚠️ Не удалось сохранить: {esc(e)}")
-    await render_settings(message)
+    await render_settings(message, user.id)
 
 
 # ---------------- Timezones ----------------
 @router.callback_query(F.data == "tz:open")
 async def cb_tz_open(call: CallbackQuery):
-    if call.from_user.id != owner_id:
-        await call.answer("Доступ только для владельца", show_alert=True)
+    if not await require_sub(call):
         return
     rows = []
     for i in range(0, len(TIMEZONES), 2):
@@ -1271,8 +1368,7 @@ async def cb_tz_open(call: CallbackQuery):
 
 @router.callback_query(F.data.startswith("tz:set:"))
 async def cb_tz_set(call: CallbackQuery):
-    if call.from_user.id != owner_id:
-        await call.answer("Доступ только для владельца", show_alert=True)
+    if not await require_sub(call):
         return
     tz = call.data.split(":", 2)[2]
     try:
@@ -1280,17 +1376,16 @@ async def cb_tz_set(call: CallbackQuery):
     except Exception:
         await call.answer("Неизвестный часовой пояс", show_alert=True)
         return
-    await set_setting("timezone", tz)
+    await set_setting(call.from_user.id, "timezone", tz)
     await call.answer(f"Сохранено: {tz}")
-    await render_settings(call.message, edit=True)
+    await render_settings(call.message, call.from_user.id, edit=True)
 
 
 @router.callback_query(F.data == "tz:manual")
 async def cb_tz_manual(call: CallbackQuery):
-    if call.from_user.id != owner_id:
-        await call.answer("Доступ только для владельца", show_alert=True)
+    if not await require_sub(call):
         return
-    pending_inputs[owner_id] = "timezone"
+    pending_inputs[call.from_user.id] = "timezone"
     await call.message.answer("Отправьте IANA-часовой пояс, например <code>Europe/Moscow</code>.")
     await call.answer()
 
@@ -1339,7 +1434,7 @@ async def payment_ok(message: Message):
             f"✅ <b>Premium активирован</b>\n\n"
             f"Теперь вам доступно <b>{PREMIUM_DAILY_LIMIT} запросов в день</b>.\n"
             f"Действует до: <b>{until.astimezone().strftime('%d.%m.%Y %H:%M')}</b>\n\n"
-            f"Спасибо за поддержку!"
+            "Спасибо за поддержку!"
         )
 
         # Уведомление админу
@@ -1382,7 +1477,7 @@ async def payment_ok(message: Message):
 
 
 # ============================================================
-# ADMIN PANEL
+# ADMIN PANEL (только для owner_id)
 # ============================================================
 
 @router.callback_query(F.data == "adm:menu")
@@ -1423,15 +1518,12 @@ async def cb_adm_stats(call: CallbackQuery):
             "SELECT COUNT(*) FROM user_limits WHERE is_premium=1 AND premium_until > ?",
             (now.isoformat(),)
         )
+        conns = await count("SELECT COUNT(*) FROM business_connections WHERE enabled=1")
         chats = await count("SELECT COUNT(*) FROM contacts")
         msgs = await count("SELECT COUNT(*) FROM messages")
         mutes = await count("SELECT COUNT(*) FROM mutes")
-        bl = await count("SELECT COUNT(*) FROM blacklist")
         refs_total = await count("SELECT COUNT(*) FROM referrals")
-        refs_week = await count(
-            "SELECT COUNT(*) FROM referrals WHERE joined_at >= ?",
-            (week_ago,)
-        )
+        refs_week = await count("SELECT COUNT(*) FROM referrals WHERE joined_at >= ?", (week_ago,))
         stars_total = await count("SELECT COALESCE(SUM(stars),0) FROM payments_log")
         purchases = await count("SELECT COUNT(*) FROM payments_log")
 
@@ -1442,11 +1534,11 @@ async def cb_adm_stats(call: CallbackQuery):
         f"  · за 24ч: {users_24h}\n"
         f"  · за 7д: {users_7d}\n"
         f"  · в бане: {users_banned}\n"
+        f"🔗 Бизнес-коннектов: <b>{conns}</b>\n"
         f"💎 Premium активных: <b>{premium_active}</b>\n\n"
         f"💬 Чатов: <b>{chats}</b>\n"
         f"📝 Сообщений: <b>{msgs}</b>\n"
-        f"🔇 Мутов: <b>{mutes}</b>\n"
-        f"🚫 В ЧС: <b>{bl}</b>\n\n"
+        f"🔇 Мутов: <b>{mutes}</b>\n\n"
         f"🎁 Рефералов всего: <b>{refs_total}</b>\n"
         f"  · за 7д: {refs_week}\n\n"
         f"💰 Продаж Premium: <b>{purchases}</b>\n"
@@ -1553,6 +1645,51 @@ async def cb_adm_user_find(call: CallbackQuery):
     await call.answer()
 
 
+async def show_user_card(chat_target, uid):
+    u, refs, msgs = await get_user_card(uid)
+    if not u:
+        await chat_target.answer(f"Юзер <code>{uid}</code> не найден.")
+        return
+    name = u["username"] or u["first_name"] or "—"
+    premium = await is_premium(uid)
+    try:
+        joined = datetime.fromisoformat(u["joined_at"]).astimezone().strftime("%d.%m.%Y %H:%M")
+    except Exception:
+        joined = "—"
+
+    text = (
+        f"👤 <b>Карточка</b>\n"
+        "─────────────\n"
+        f"📛 <b>{esc(name)}</b>\n"
+        f"🆔 <code>{uid}</code>\n"
+        f"📅 Регистрация: {esc(joined)}\n"
+        f"💎 Premium: {'✅' if premium else '❌'}\n"
+        f"🎁 Рефералов: <b>{refs}</b>\n"
+        f"📝 Сообщений: <b>{msgs}</b>\n"
+        f"🚫 Бан: {'✅' if u['is_banned'] else '❌'}\n"
+        f"🔗 Реф-бан: {'✅' if u['banned_ref'] else '❌'}"
+    )
+    rows = [
+        [InlineKeyboardButton(text="➕ Выдать Premium", callback_data=f"adm:grant:{uid}")],
+        [InlineKeyboardButton(text="➖ Снять Premium", callback_data=f"adm:revoke:{uid}")],
+    ]
+    if u["is_banned"]:
+        rows.append([InlineKeyboardButton(text="✅ Разбанить", callback_data=f"adm:unban:{uid}")])
+    else:
+        rows.append([InlineKeyboardButton(text="🚫 Забанить", callback_data=f"adm:ban:{uid}")])
+    if u["banned_ref"]:
+        rows.append([InlineKeyboardButton(text="🔓 Разбанить реф-ссылку", callback_data=f"adm:unban_ref:{uid}")])
+    else:
+        rows.append([InlineKeyboardButton(text="🔒 Забанить реф-ссылку", callback_data=f"adm:ban_ref:{uid}")])
+    rows.append([InlineKeyboardButton(text="🔄 Сбросить реферал", callback_data=f"adm:reset_ref:{uid}")])
+    rows.append(back_button("adm:users"))
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
+    try:
+        await chat_target.answer(text, reply_markup=kb)
+    except Exception:
+        pass
+
+
 @router.callback_query(F.data.startswith("adm:user_card:"))
 async def cb_adm_user_card(call: CallbackQuery):
     if call.from_user.id != owner_id:
@@ -1593,6 +1730,7 @@ async def cb_adm_user_card(call: CallbackQuery):
         rows.append([InlineKeyboardButton(text="🔓 Разбанить реф-ссылку", callback_data=f"adm:unban_ref:{uid}")])
     else:
         rows.append([InlineKeyboardButton(text="🔒 Забанить реф-ссылку", callback_data=f"adm:ban_ref:{uid}")])
+    rows.append([InlineKeyboardButton(text="🔄 Сбросить реферал", callback_data=f"adm:reset_ref:{uid}")])
     rows.append(back_button("adm:users"))
     kb = InlineKeyboardMarkup(inline_keyboard=rows)
     try:
@@ -1612,7 +1750,7 @@ async def cb_adm_grant(call: CallbackQuery):
         [InlineKeyboardButton(text="7 дней", callback_data=f"adm:grant_do:{uid}:7")],
         [InlineKeyboardButton(text="30 дней", callback_data=f"adm:grant_do:{uid}:30")],
         [InlineKeyboardButton(text="365 дней", callback_data=f"adm:grant_do:{uid}:365")],
-        back_button(f"adm:user_card_show:{uid}"),
+        back_button(f"adm:user_card:{uid}"),
     ])
     try:
         await call.message.edit_text(f"💎 Выдать Premium <code>{uid}</code> на:", reply_markup=kb)
@@ -1640,7 +1778,6 @@ async def cb_adm_grant_do(call: CallbackQuery):
         )
     except Exception:
         pass
-    # Вернуть карточку
     call.data = f"adm:user_card:{uid}"
     await cb_adm_user_card(call)
 
@@ -1699,11 +1836,17 @@ async def cb_adm_unban_ref(call: CallbackQuery):
     await cb_adm_user_card(call)
 
 
-@router.callback_query(F.data.startswith("adm:user_card_show:"))
-async def cb_adm_user_card_show(call: CallbackQuery):
+@router.callback_query(F.data.startswith("adm:reset_ref:"))
+async def cb_adm_reset_ref(call: CallbackQuery):
     if call.from_user.id != owner_id:
         return
     uid = int(call.data.split(":")[2])
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM referrals WHERE user_id=?", (uid,))
+        await db.execute("DELETE FROM pending_referrals WHERE user_id=?", (uid,))
+        await db.commit()
+    await log_admin("reset_ref", uid)
+    await call.answer("✅ Реферал сброшен — можно заходить по ссылке заново", show_alert=True)
     call.data = f"adm:user_card:{uid}"
     await cb_adm_user_card(call)
 
@@ -1756,7 +1899,6 @@ async def cb_adm_sys(call: CallbackQuery):
         db_size = os.path.getsize(DB_PATH) / 1024 / 1024
     except Exception:
         db_size = 0
-    # Последний бэкап
     last_backup = "—"
     try:
         files = [f for f in os.listdir(BACKUP_DIR) if f.startswith("bot_") and f.endswith(".db")]
@@ -1814,51 +1956,13 @@ async def cb_adm_cleanup(call: CallbackQuery):
 
 
 async def handle_admin_input(message: Message, action: str, value: str):
-    if action.startswith("find_user:"):
-        pass
     if action == "find_user":
         try:
             uid = int(value)
         except ValueError:
             await message.answer("Нужен числовой ID.")
             return
-        u, refs, msgs = await get_user_card(uid)
-        if not u:
-            await message.answer(f"Юзер <code>{uid}</code> не найден.")
-            return
-        # Показываем карточку через callback-хендлер
-        name = u["username"] or u["first_name"] or "—"
-        premium = await is_premium(uid)
-        try:
-            joined = datetime.fromisoformat(u["joined_at"]).astimezone().strftime("%d.%m.%Y %H:%M")
-        except Exception:
-            joined = "—"
-        text = (
-            f"👤 <b>Карточка</b>\n"
-            "─────────────\n"
-            f"📛 <b>{esc(name)}</b>\n"
-            f"🆔 <code>{uid}</code>\n"
-            f"📅 Регистрация: {esc(joined)}\n"
-            f"💎 Premium: {'✅' if premium else '❌'}\n"
-            f"🎁 Рефералов: <b>{refs}</b>\n"
-            f"📝 Сообщений: <b>{msgs}</b>\n"
-            f"🚫 Бан: {'✅' if u['is_banned'] else '❌'}\n"
-            f"🔗 Реф-бан: {'✅' if u['banned_ref'] else '❌'}"
-        )
-        rows = [
-            [InlineKeyboardButton(text="➕ Выдать Premium", callback_data=f"adm:grant:{uid}")],
-            [InlineKeyboardButton(text="➖ Снять Premium", callback_data=f"adm:revoke:{uid}")],
-        ]
-        if u["is_banned"]:
-            rows.append([InlineKeyboardButton(text="✅ Разбанить", callback_data=f"adm:unban:{uid}")])
-        else:
-            rows.append([InlineKeyboardButton(text="🚫 Забанить", callback_data=f"adm:ban:{uid}")])
-        if u["banned_ref"]:
-            rows.append([InlineKeyboardButton(text="🔓 Разбанить реф-ссылку", callback_data=f"adm:unban_ref:{uid}")])
-        else:
-            rows.append([InlineKeyboardButton(text="🔒 Забанить реф-ссылку", callback_data=f"adm:ban_ref:{uid}")])
-        rows.append(back_button("adm:menu"))
-        await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+        await show_user_card(message, uid)
         return
 
     if action.startswith("ban_reason:"):
@@ -1870,7 +1974,6 @@ async def handle_admin_input(message: Message, action: str, value: str):
 
 
 async def publish_weekly_top(manual=False):
-    """Публикует топ недели в канал."""
     top = await referral_leaderboard(5, week_only=True)
     if not top:
         if manual:
@@ -1912,7 +2015,6 @@ async def do_backup(send_to_owner=False):
         async with aiosqlite.connect(DB_PATH) as src:
             async with aiosqlite.connect(backup_path) as dst:
                 await src.backup(dst)
-        # Чистим старые бэкапы (оставляем 10 последних)
         try:
             files = sorted([f for f in os.listdir(BACKUP_DIR) if f.endswith(".db")])
             for old in files[:-10]:
@@ -1943,35 +2045,50 @@ async def backup_loop():
             log.warning("backup loop err: %s", e)
 
 
-# ---------------- Name update ----------------
-async def update_business_name():
+# ---------------- Name update (мультиюзер) ----------------
+async def update_all_business_names():
+    """Раз в минуту обновляет имена ВСЕХ бизнес-аккаунтов, у кого включена опция."""
     while True:
         try:
-            s = await get_settings()
-            if s["time_in_nick_enabled"]:
-                async with aiosqlite.connect(DB_PATH) as db:
-                    cur = await db.execute(
-                        "SELECT id FROM business_connections WHERE enabled=1 LIMIT 1"
-                    )
-                    row = await cur.fetchone()
-                if row:
-                    connection_id = row[0]
-                    clock = local_now(s["timezone"]).strftime("%H:%M")
-                    try:
-                        me = await bot_ref.get_me()
-                        base = me.first_name or BOT_NAME
-                    except Exception:
-                        base = BOT_NAME
-                    desired = f"{base} [{clock}]"[:64]
+            async with aiosqlite.connect(DB_PATH) as db:
+                db.row_factory = aiosqlite.Row
+                cur = await db.execute(
+                    """SELECT bc.id as conn_id, bc.user_id, s.timezone
+                       FROM business_connections bc
+                       JOIN settings s ON s.user_id = bc.user_id
+                       WHERE bc.enabled=1 AND s.time_in_nick_enabled=1"""
+                )
+                rows = await cur.fetchall()
+
+            for row in rows:
+                connection_id = row["conn_id"]
+                user_id = row["user_id"]
+                tz = row["timezone"] or "UTC"
+                try:
+                    base_name = await get_base_name(connection_id)
+                    if not base_name:
+                        # Первый раз — берём через API
+                        try:
+                            info = await bot_ref.get_business_account_name(
+                                business_connection_id=connection_id
+                            )
+                            base_name = info.first_name or f"User{user_id}"
+                        except Exception:
+                            base_name = f"User{user_id}"
+                        await save_base_name(connection_id, base_name)
+
+                    clock = local_now(tz).strftime("%H:%M")
+                    desired = f"{base_name} [{clock}]"[:64]
                     try:
                         async with name_update_lock:
                             await bot_ref.set_business_account_name(
                                 business_connection_id=connection_id,
                                 first_name=desired
                             )
-                        log.info("Name updated: %s", desired)
                     except Exception as e:
-                        log.warning("set_business_account_name failed: %s", e)
+                        log.warning("set name for %s failed: %s", user_id, e)
+                except Exception as e:
+                    log.warning("name update for %s error: %s", user_id, e)
         except Exception as e:
             log.warning("name loop err: %s", e)
         await asyncio.sleep(60)
@@ -1979,11 +2096,9 @@ async def update_business_name():
 
 # ---------------- Weekly publish ----------------
 async def weekly_publish_loop():
-    """Публикует топ каждый понедельник в 10:00 UTC."""
     while True:
         try:
             now = utcnow()
-            # Ближайший понедельник 10:00
             days_ahead = (7 - now.weekday()) % 7
             if days_ahead == 0 and now.hour >= 10:
                 days_ahead = 7
@@ -2098,24 +2213,44 @@ async def download_video(url: str, outdir: str) -> tuple[str, str]:
 
 
 # ============================================================
-# BUSINESS HANDLERS
+# BUSINESS HANDLERS (мультиюзер)
 # ============================================================
 
-async def _check_owner_business(message: Message) -> bool:
-    """Проверка: владелец + business-контекст."""
-    if not message.from_user or message.from_user.id != owner_id:
-        return False
+async def _resolve_owner(message: Message):
+    """Возвращает user_id владельца бизнес-коннекта для этого сообщения."""
     if not message.business_connection_id:
-        return False
-    return True
+        return None
+    owner_uid = await get_connection_owner(message.business_connection_id)
+    return owner_uid
+
+
+async def _check_owner_command(message: Message):
+    """
+    Проверяет, что команду пишет владелец бизнес-аккаунта (автор сообщения).
+    Возвращает owner_uid или None.
+    """
+    if not message.from_user or not message.business_connection_id:
+        return None
+    owner_uid = await get_connection_owner(message.business_connection_id)
+    if not owner_uid:
+        return None
+    # Команда считается "от владельца", если её написал сам владелец ИЛИ
+    # сообщение исходящее (from_user == owner)
+    if message.from_user.id != owner_uid:
+        return None
+    if await is_banned(owner_uid):
+        return None
+    return owner_uid
 
 
 # ---------- .save ----------
 @router.business_message(F.text.regexp(r"^\.save\s*$"))
 async def business_save(message: Message, bot: Bot):
-    if not await _check_owner_business(message):
+    owner_uid = await _check_owner_command(message)
+    if not owner_uid:
         return
-    await save_business_message(message)
+    await save_business_message(message, owner_uid)
+    premium = await is_premium(owner_uid)
 
     target_text = ""
     if message.reply_to_message and message.reply_to_message.text:
@@ -2146,10 +2281,12 @@ async def business_save(message: Message, bot: Bot):
         size_mb = os.path.getsize(filepath) / 1024 / 1024
         if size_mb > DOWNLOAD_MAX_MB:
             raise RuntimeError(f"Файл слишком большой ({size_mb:.1f} МБ)")
+        caption = f"🎬 <b>{esc(title) or 'Видео'}</b>"
+        caption = with_watermark(caption, premium)
         await bot.send_video(
             chat_id=message.chat.id,
             video=FSInputFile(filepath),
-            caption=f"🎬 <b>{esc(title) or 'Видео'}</b>",
+            caption=caption,
             business_connection_id=message.business_connection_id
         )
         try:
@@ -2173,9 +2310,10 @@ async def business_save(message: Message, bot: Bot):
 # ---------- .anim ----------
 @router.business_message(F.text.regexp(r"^\.anim(\s+.+)?$"))
 async def business_anim(message: Message, bot: Bot):
-    if not await _check_owner_business(message):
+    owner_uid = await _check_owner_command(message)
+    if not owner_uid:
         return
-    await save_business_message(message)
+    await save_business_message(message, owner_uid)
 
     text = (message.text or "")[5:].strip()
     if not text:
@@ -2239,14 +2377,16 @@ async def business_anim(message: Message, bot: Bot):
 # ---------- .ai ----------
 @router.business_message(F.text.regexp(r"^\.ai(\s+.+)?$"))
 async def business_ai(message: Message, bot: Bot):
-    if not await _check_owner_business(message):
+    owner_uid = await _check_owner_command(message)
+    if not owner_uid:
         return
-    await save_business_message(message)
+    await save_business_message(message, owner_uid)
 
     bc = message.business_connection_id
     chat_id = message.chat.id
 
-    ok, seconds = await check_cooldown(owner_id)
+    # Cooldown
+    ok, seconds = await check_cooldown(owner_uid)
     if not ok:
         await bot.edit_message_text(
             chat_id=chat_id, message_id=message.message_id,
@@ -2255,7 +2395,8 @@ async def business_ai(message: Message, bot: Bot):
         )
         return
 
-    can, used, limit, premium = await check_limit(owner_id)
+    # Лимит
+    can, used, limit, premium = await check_limit(owner_uid)
     if not can:
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text=f"⭐ Купить Premium ({PREMIUM_PRICE_STARS}⭐)",
@@ -2303,7 +2444,7 @@ async def business_ai(message: Message, bot: Bot):
             chat_id=chat_id, message_id=thinking.message_id,
             text=text, business_connection_id=bc
         )
-        await increment_usage(owner_id)
+        await increment_usage(owner_uid)
     except Exception as e:
         log.error("AI error: %s", e)
         try:
@@ -2319,9 +2460,11 @@ async def business_ai(message: Message, bot: Bot):
 # ---------- .qr ----------
 @router.business_message(F.text.regexp(r"^\.qr(\s+.+)?$"))
 async def business_qr(message: Message, bot: Bot):
-    if not await _check_owner_business(message):
+    owner_uid = await _check_owner_command(message)
+    if not owner_uid:
         return
-    await save_business_message(message)
+    await save_business_message(message, owner_uid)
+    premium = await is_premium(owner_uid)
 
     bc = message.business_connection_id
     text = (message.text or "")[3:].strip()
@@ -2337,10 +2480,12 @@ async def business_qr(message: Message, bot: Bot):
         buf = BytesIO()
         qrcode.make(text).save(buf, format="PNG")
         buf.seek(0)
+        caption = f"🔳 QR-код: <code>{esc(text[:200])}</code>"
+        caption = with_watermark(caption, premium)
         await bot.send_photo(
             chat_id=message.chat.id,
             photo=BufferedInputFile(buf.read(), filename="qr.png"),
-            caption=f"🔳 QR-код: <code>{esc(text[:200])}</code>",
+            caption=caption,
             business_connection_id=bc
         )
         try:
@@ -2361,25 +2506,13 @@ async def business_qr(message: Message, bot: Bot):
         )
 
 
-# ---------- .mute (с иммунитетом) ----------
-async def _find_target_user(chat_id):
-    """Находит последнего не-владельца в чате."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "SELECT user_id FROM messages WHERE chat_id=? AND user_id IS NOT NULL "
-            "AND user_id!=? ORDER BY id DESC LIMIT 1",
-            (chat_id, owner_id)
-        )
-        row = await cur.fetchone()
-    return row[0] if row else None
-
-
-# ---------- .game ----------
+# ---------- .help / .ping / .id / .whois / .typing / .note / .mute / .unmute / .muted / .game ----------
 @router.business_message(F.text.regexp(r"^\.(help|whois|typing|mute(?:\s+\d+(?:\s+\d+)?)?|unmute|muted|id|ping|note(?:\s+.+)?|game)$"))
 async def business_commands(message: Message, bot: Bot):
-    if not await _check_owner_business(message):
+    owner_uid = await _check_owner_command(message)
+    if not owner_uid:
         return
-    await save_business_message(message)
+    await save_business_message(message, owner_uid)
 
     raw = (message.text or "").strip()
     parts = raw.split(maxsplit=2)
@@ -2462,7 +2595,6 @@ async def business_commands(message: Message, bot: Bot):
                 await set_note(chat_id, full_note)
                 await edit(f"📝 Заметка сохранена: {esc(full_note)}")
         elif cmd.startswith(".mute"):
-            # Парсим аргументы: .mute 60 [user_id]
             tokens = (arg + " " + arg2).split()
             seconds = 60
             target = None
@@ -2477,12 +2609,19 @@ async def business_commands(message: Message, bot: Bot):
                 except ValueError:
                     pass
             if target is None:
-                target = await _find_target_user(chat_id)
-                if not target:
+                async with aiosqlite.connect(DB_PATH) as db:
+                    cur = await db.execute(
+                        "SELECT user_id FROM messages WHERE chat_id=? AND user_id IS NOT NULL "
+                        "AND user_id!=? ORDER BY id DESC LIMIT 1",
+                        (chat_id, owner_uid)
+                    )
+                    row = await cur.fetchone()
+                if not row:
                     await edit("⚠️ Укажите ID: <code>.mute 60 123456</code>")
                     return
+                target = row[0]
 
-            # === ИММУНИТЕТ PREMIUM ===
+            # ===== ИММУНИТЕТ PREMIUM =====
             if await is_premium(target):
                 await edit("⛔ Пользователь защищён Premium-иммунитетом")
                 return
@@ -2496,15 +2635,18 @@ async def business_commands(message: Message, bot: Bot):
                 await db.commit()
             await edit(f"🔇 Пользователь заглушён на {seconds} сек.")
         elif cmd == ".unmute":
-            target = await _find_target_user(chat_id)
-            if target:
-                async with aiosqlite.connect(DB_PATH) as db:
+            async with aiosqlite.connect(DB_PATH) as db:
+                cur = await db.execute(
+                    "SELECT user_id FROM messages WHERE chat_id=? AND user_id IS NOT NULL "
+                    "AND user_id!=? ORDER BY id DESC LIMIT 1",
+                    (chat_id, owner_uid)
+                )
+                row = await cur.fetchone()
+                if row:
                     await db.execute("DELETE FROM mutes WHERE chat_id=? AND target_user_id=?",
-                                     (chat_id, target))
+                                     (chat_id, row[0]))
                     await db.commit()
-                await edit("🔊 Мут снят")
-            else:
-                await edit("🔊 Активных мутов нет")
+            await edit("🔊 Мут снят")
         elif cmd == ".muted":
             async with aiosqlite.connect(DB_PATH) as db:
                 cur = await db.execute(
@@ -2568,11 +2710,14 @@ async def guess_input(message: Message):
 # ---------- Общий обработчик бизнес-сообщений ----------
 @router.business_message()
 async def business_message_handler(message: Message, bot: Bot):
-    await save_business_message(message)
-    if not message.business_connection_id:
+    owner_uid = await _resolve_owner(message)
+    if not owner_uid:
         return
+
+    await save_business_message(message, owner_uid)
+
     sender = message.from_user
-    if not sender or sender.id == owner_id:
+    if not sender or sender.id == owner_uid:
         return
 
     # Mute
@@ -2615,8 +2760,8 @@ async def business_message_handler(message: Message, bot: Bot):
         except Exception:
             pass
 
-    s = await get_settings()
-    premium_owner = await is_premium(owner_id)
+    s = await get_settings(owner_uid)
+    premium_owner = await is_premium(owner_uid)
 
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("SELECT message_count FROM contacts WHERE chat_id=?", (message.chat.id,))
@@ -2650,9 +2795,9 @@ async def business_message_handler(message: Message, bot: Bot):
         try:
             head = f"📥 <b>{esc(sender.full_name)}</b> <code>{sender.id}</code>"
             if message.text or message.caption:
-                await bot.send_message(owner_id, f"{head}\n\n{esc(message.text or message.caption)}")
+                await bot.send_message(owner_uid, f"{head}\n\n{esc(message.text or message.caption)}")
             else:
-                await bot.send_message(owner_id, head)
+                await bot.send_message(owner_uid, head)
         except Exception as e:
             log.info("forward: %s", e)
 
@@ -2660,6 +2805,11 @@ async def business_message_handler(message: Message, bot: Bot):
 # ---------- Удалённые сообщения ----------
 @router.deleted_business_messages()
 async def business_deleted_handler(event: BusinessMessagesDeleted, bot: Bot):
+    owner_uid = await get_connection_owner(event.business_connection_id)
+    if not owner_uid:
+        return
+    premium_owner = await is_premium(owner_uid)
+
     for mid in event.message_ids:
         row = await find_message(event.chat.id, mid)
         if not row:
@@ -2683,22 +2833,22 @@ async def business_deleted_handler(event: BusinessMessagesDeleted, bot: Bot):
             ctype = row["content_type"]
             fid = row["media_file_id"]
             if fid and ctype == "photo":
-                await bot.send_photo(owner_id, fid, caption=caption[:1024])
+                await bot.send_photo(owner_uid, fid, caption=caption[:1024])
             elif fid and ctype == "video":
-                await bot.send_video(owner_id, fid, caption=caption[:1024])
+                await bot.send_video(owner_uid, fid, caption=caption[:1024])
             elif fid and ctype == "animation":
-                await bot.send_animation(owner_id, fid, caption=caption[:1024])
+                await bot.send_animation(owner_uid, fid, caption=caption[:1024])
             elif fid and ctype == "document":
-                await bot.send_document(owner_id, fid, caption=caption[:1024])
+                await bot.send_document(owner_uid, fid, caption=caption[:1024])
             elif fid and ctype == "voice":
-                await bot.send_voice(owner_id, fid, caption=caption[:1024])
+                await bot.send_voice(owner_uid, fid, caption=caption[:1024])
             elif fid and ctype == "audio":
-                await bot.send_audio(owner_id, fid, caption=caption[:1024])
+                await bot.send_audio(owner_uid, fid, caption=caption[:1024])
             elif fid and ctype == "sticker":
-                await bot.send_message(owner_id, caption)
-                await bot.send_sticker(owner_id, fid)
+                await bot.send_message(owner_uid, caption)
+                await bot.send_sticker(owner_uid, fid)
             else:
-                await bot.send_message(owner_id, caption)
+                await bot.send_message(owner_uid, caption)
         except Exception as e:
             log.warning("deleted notify: %s", e)
 
@@ -2713,6 +2863,7 @@ async def game_callback(call: CallbackQuery, bot: Bot):
     kind = parts[1]
     chat_id = int(parts[2])
     bc = ":".join(parts[3:])
+    owner_uid = await get_connection_owner(bc)
     if kind == "roulette":
         roulette_games[(chat_id, call.message.message_id)] = 0
         kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
@@ -2726,7 +2877,7 @@ async def game_callback(call: CallbackQuery, bot: Bot):
         await call.message.edit_text("🎲 <b>Угадай число</b> от 1 до 100. Пишите в чат.")
     elif kind == "ttt":
         ttt_games[(chat_id, call.message.message_id)] = {
-            "board": [""] * 9, "turn": "❌", "owner": owner_id,
+            "board": [""] * 9, "turn": "❌", "owner": owner_uid,
             "opponent": None, "bc": bc, "ended": False
         }
         await render_ttt(call.message, chat_id, call.message.message_id)
@@ -2773,15 +2924,16 @@ async def ttt_move(call: CallbackQuery):
         await call.answer("Игра завершена", show_alert=True)
         return
     uid = call.from_user.id
+    game_owner = game["owner"]
     if game["opponent"] is None:
-        if uid == owner_id:
+        if uid == game_owner:
             await call.answer("Ожидается ход собеседника", show_alert=True)
             return
         game["opponent"] = uid
-    elif uid not in {owner_id, game["opponent"]}:
+    elif uid not in {game_owner, game["opponent"]}:
         await call.answer("Вы не участвуете в игре", show_alert=True)
         return
-    expected = owner_id if game["turn"] == "❌" else game["opponent"]
+    expected = game_owner if game["turn"] == "❌" else game["opponent"]
     if uid != expected:
         await call.answer("Сейчас ход другого игрока", show_alert=True)
         return
@@ -2807,14 +2959,43 @@ async def ttt_move(call: CallbackQuery):
 # ---------- Business connection ----------
 @router.business_connection()
 async def business_connection_handler(connection: BusinessConnection, bot: Bot):
-    log.info("Business connection %s enabled=%s", connection.id, connection.is_enabled)
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT OR REPLACE INTO business_connections(id, user_id, enabled, added_at) VALUES(?,?,?,?)",
-            (connection.id, connection.user.id if connection.user else owner_id,
-             int(connection.is_enabled), utcnow().isoformat())
-        )
-        await db.commit()
+    log.info(
+        "Business connection %s enabled=%s user=%s",
+        connection.id, connection.is_enabled,
+        connection.user.id if connection.user else "?"
+    )
+    if not connection.user:
+        return
+    user_id = connection.user.id
+    await save_connection(connection.id, user_id, connection.is_enabled)
+    await ensure_user(user_id, connection.user.first_name, connection.user.username)
+
+    # Сообщение юзеру
+    try:
+        if connection.is_enabled:
+            # Проверка подписки на канал — только для новых
+            if user_id != owner_id and not await check_subscription(user_id):
+                await bot.send_message(
+                    user_id,
+                    "🔒 <b>Бизнес подключён, но доступ ограничен</b>\n\n"
+                    f"Подпишитесь на канал @{CHANNEL_USERNAME}, чтобы бот начал работать.",
+                    reply_markup=sub_screen_kb()
+                )
+            else:
+                await bot.send_message(
+                    user_id,
+                    "✅ <b>BobMod подключён к вашему бизнес-аккаунту</b>\n\n"
+                    "Теперь бот работает в ваших чатах.\n"
+                    "Команды: /start · /settings · /ref"
+                )
+        else:
+            await bot.send_message(
+                user_id,
+                "⚠️ <b>BobMod отключён от бизнес-аккаунта</b>\n\n"
+                "Чтобы вернуть — подключите бота заново в настройках Telegram Business."
+            )
+    except Exception as e:
+        log.info("notify business: %s", e)
 
 
 # ============================================================
@@ -2834,9 +3015,8 @@ async def main():
     dp = Dispatcher()
     dp.include_router(router)
 
-    # Фоновые задачи
     asyncio.create_task(backup_loop())
-    asyncio.create_task(update_business_name())
+    asyncio.create_task(update_all_business_names())
     asyncio.create_task(weekly_publish_loop())
 
     log.info("BobMod started. Owner: %s", owner_id)
@@ -2850,4 +3030,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        pass 
+        pass
