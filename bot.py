@@ -648,16 +648,17 @@ async def referral_leaderboard(limit=5, week_only=True):
         start = week_start().isoformat()
         q = """SELECT r.referrer_id, COUNT(*) as cnt
                FROM referrals r
-               WHERE r.joined_at >= ?
+               WHERE r.joined_at >= ? AND r.referrer_id != ?
                GROUP BY r.referrer_id
                ORDER BY cnt DESC LIMIT ?"""
-        args = (start, limit)
+        args = (start, owner_id, limit)
     else:
         q = """SELECT referrer_id, COUNT(*) as cnt
                FROM referrals
+               WHERE referrer_id != ?
                GROUP BY referrer_id
                ORDER BY cnt DESC LIMIT ?"""
-        args = (limit,)
+        args = (owner_id, limit)
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute(q, args)
@@ -989,14 +990,13 @@ async def cmd_start(message: Message, command: Command):
 
     await message.answer(
         f"👋 <b>Привет! Я {BOT_NAME}.</b>\n"
-        f"Статус: {status}\n"
         f"{conn_line}\n\n"
         "Помогаю в ваших Telegram-чатах:\n"
         "• автоматические ответы\n"
         "• сохранение удалённых сообщений\n"
         "• ИИ-помощник через <code>.ai</code>\n"
         "• и другие команды\n\n"
-        "<i>Подключение: Настройки → Telegram Business → Чат-автоматизация</i>",
+        "<i>Подключение: Аккаунт → Изменить → Автоматизация чатов</i>",
         reply_markup=main_menu()
     )
 
