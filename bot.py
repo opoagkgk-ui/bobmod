@@ -7,7 +7,6 @@ import shutil
 import tempfile
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
-from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -102,36 +101,25 @@ sub_cache = {}
 connection_cache = {}
 name_update_lock = asyncio.Lock()
 bot_ref: Bot = None
-
-# Глобальный Turso-клиент
 db_client: libsql_client.Client = None
 
 
 # ---------------- Turso DB ----------------
 async def db_execute(sql: str, args: tuple = ()):
-    """Выполнить один запрос. Возвращает ResultSet."""
     return await db_client.execute(sql, args)
 
 
-async def db_executemany(sql: str, args_list):
-    """Выполнить много запросов."""
-    return await db_client.executemany(sql, args_list)
-
-
 async def db_fetchone(sql: str, args: tuple = ()):
-    """Возвращает первую строку как кортеж или None."""
     result = await db_client.execute(sql, args)
     return result.rows[0] if result.rows else None
 
 
 async def db_fetchall(sql: str, args: tuple = ()):
-    """Возвращает все строки как список кортежей."""
     result = await db_client.execute(sql, args)
     return list(result.rows)
 
 
 async def db_fetchval(sql: str, args: tuple = (), default=None):
-    """Возвращает одно значение из первой строки."""
     row = await db_fetchone(sql, args)
     if not row:
         return default
@@ -139,7 +127,6 @@ async def db_fetchval(sql: str, args: tuple = (), default=None):
 
 
 async def init_db():
-    """Создаёт все таблицы в Turso."""
     statements = [
         """CREATE TABLE IF NOT EXISTS messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -290,13 +277,12 @@ def week_start():
 
 
 def row_to_dict(row, columns):
-    """Turso возвращает кортежи. Преобразуем в dict."""
     if not row:
         return None
     return {col: row[i] for i, col in enumerate(columns)}
 
 
-# ---------------- AI providers ----------------
+# ---------------- AI ----------------
 AI_PROVIDERS = [
     {"name": "groq", "url": "https://api.groq.com/openai/v1/chat/completions",
      "key_env": "GROQ_API_KEY", "model": "openai/gpt-oss-120b"},
@@ -530,9 +516,7 @@ async def check_limit(user_id):
         await db_execute(
             "INSERT OR REPLACE INTO user_limits(user_id, date, requests_count, is_premium, premium_until, last_ai_request) "
             "VALUES(?,?,0,?,?,?)",
-            (user_id, today,
-             (row[0] if row else 0),
-             None, None)
+            (user_id, today, 0, None, None)
         )
         used = 0
     else:
@@ -633,16 +617,14 @@ async def referral_leaderboard(limit=5, week_only=True):
 
 # ---------------- Business connections ----------------
 async def get_connection_owner(connection_id):
-    val = await db_fetchval("SELECT user_id FROM business_connections WHERE id=?", (connection_id,))
-    return val
+    return await db_fetchval("SELECT user_id FROM business_connections WHERE id=?", (connection_id,))
 
 
 async def get_user_connection(user_id):
-    val = await db_fetchval(
+    return await db_fetchval(
         "SELECT id FROM business_connections WHERE user_id=? AND enabled=1 LIMIT 1",
         (user_id,)
     )
-    return val
 
 
 async def save_connection(connection_id, user_id, enabled):
@@ -663,7 +645,7 @@ async def save_base_name(connection_id, name):
     )
 
 
-# ---------------- Message payload / save ----------------
+# ---------------- Message payload ----------------
 def message_payload(message: Message):
     text = message.text or message.caption or ""
     ctype, file_id = "text", None
@@ -709,7 +691,6 @@ async def save_business_message(message: Message, owner_uid: int):
          message.date.isoformat() if message.date else utcnow().isoformat(), int(outgoing))
     )
 
-    # Ограничение KEEP_PER_CHAT
     await db_execute(
         """DELETE FROM messages WHERE chat_id=? AND id NOT IN
            (SELECT id FROM messages WHERE chat_id=? ORDER BY id DESC LIMIT ?)""",
@@ -1931,7 +1912,6 @@ async def weekly_publish_loop():
             log.warning("weekly publish err: %s", e)
             await asyncio.sleep(3600)
 
-
 # ============================================================
 # VIDEO DOWNLOAD HELPERS
 # ============================================================
@@ -2031,27 +2011,21 @@ async def download_video(url: str, outdir: str) -> tuple[str, str]:
             errors.append(f"tikwm: {str(e)[:100]}")
     raise RuntimeError("Не удалось загрузить. " + " | ".join(errors)[:300])
 
+
 # ============================================================
-# BUSINESS HANDLERS (мультиюзер)
+# BUSINESS HANDLERS
 # ============================================================
 
 async def _resolve_owner(message: Message):
-    """
-    Возвращает user_id владельца бизнес-коннекта.
-    Приоритет: кэш → БД → getBusinessConnection → None
-    """
     if not message.business_connection_id:
         return None
     bc = message.business_connection_id
-
     if bc in connection_cache:
         return connection_cache[bc]
-
     owner_uid = await get_connection_owner(bc)
     if owner_uid:
         connection_cache[bc] = owner_uid
         return owner_uid
-
     try:
         conn = await bot_ref.get_business_connection(bc)
         if conn and conn.user:
@@ -2063,13 +2037,11 @@ async def _resolve_owner(message: Message):
             return owner_uid
     except Exception as e:
         log.warning("get_business_connection failed for %s: %s", bc, e)
-
     log.warning("Cannot resolve owner for bc %s", bc)
     return None
 
 
 async def _check_owner_command(message: Message):
-    """Проверяет, что команда пришла от владельца бизнес-аккаунта."""
     if not message.from_user or not message.business_connection_id:
         return None
     owner_uid = await _resolve_owner(message)
@@ -2394,42 +2366,40 @@ async def business_commands(message: Message, bot: Bot):
                 f"👤 Ваш ID: <code>{message.from_user.id}</code>\n"
                 f"🔗 Соединение: <code>{esc(bc)}</code>"
             )
-elif cmd == ".whois":
-    row = await db_fetchone(
-        "SELECT user_id, user_name FROM messages "
-        "WHERE chat_id=? AND user_id IS NOT NULL AND user_id!=? AND is_outgoing=0 "
-        "ORDER BY id DESC LIMIT 1",
-        (chat_id, owner_uid)
-    )
-    if not row:
-        await edit("👤 Информации пока нет — собеседник ещё не писал.")
-    else:
-        target_uid = row[0]
-        target_name = row[1] or "—"
-
-        c_row = await db_fetchone("SELECT * FROM contacts WHERE chat_id=?", (chat_id,))
-        first = "—"
-        uname = "—"
-        msg_count = 0
-        if c_row:
-            c = row_to_dict(c_row, ["chat_id", "first_seen", "message_count",
-                                     "user_id", "user_name", "username"])
-            try:
-                first = datetime.fromisoformat(c["first_seen"]).astimezone().strftime("%d.%m.%Y %H:%M")
-            except Exception:
-                pass
-            uname = f"@{esc(c['username'])}" if c["username"] else "—"
-            msg_count = c["message_count"]
-
-        await edit(
-            "👤 <b>Информация о собеседнике</b>\n"
-            "─────────────\n"
-            f"📛 Имя: <b>{esc(target_name)}</b>\n"
-            f"🆔 ID: <code>{target_uid}</code>\n"
-            f"🔗 Username: {uname}\n"
-            f"📅 Первый контакт: {esc(first)}\n"
-            f"💬 Сообщений: <b>{msg_count}</b>"
-        )
+        elif cmd == ".whois":
+            row = await db_fetchone(
+                "SELECT user_id, user_name FROM messages "
+                "WHERE chat_id=? AND user_id IS NOT NULL AND user_id!=? AND is_outgoing=0 "
+                "ORDER BY id DESC LIMIT 1",
+                (chat_id, owner_uid)
+            )
+            if not row:
+                await edit("👤 Информации пока нет — собеседник ещё не писал.")
+            else:
+                target_uid = row[0]
+                target_name = row[1] or "—"
+                c_row = await db_fetchone("SELECT * FROM contacts WHERE chat_id=?", (chat_id,))
+                first = "—"
+                uname = "—"
+                msg_count = 0
+                if c_row:
+                    c = row_to_dict(c_row, ["chat_id", "first_seen", "message_count",
+                                             "user_id", "user_name", "username"])
+                    try:
+                        first = datetime.fromisoformat(c["first_seen"]).astimezone().strftime("%d.%m.%Y %H:%M")
+                    except Exception:
+                        pass
+                    uname = f"@{esc(c['username'])}" if c["username"] else "—"
+                    msg_count = c["message_count"]
+                await edit(
+                    "👤 <b>Информация о собеседнике</b>\n"
+                    "─────────────\n"
+                    f"📛 Имя: <b>{esc(target_name)}</b>\n"
+                    f"🆔 ID: <code>{target_uid}</code>\n"
+                    f"🔗 Username: {uname}\n"
+                    f"📅 Первый контакт: {esc(first)}\n"
+                    f"💬 Сообщений: <b>{msg_count}</b>"
+                )
         elif cmd == ".typing":
             try:
                 await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING, business_connection_id=bc)
@@ -2661,8 +2631,6 @@ async def business_deleted_handler(event: BusinessMessagesDeleted, bot: Bot):
         row = await find_message(event.chat.id, mid)
         if not row:
             continue
-
-        # Не уведомляем о своих (исходящих) сообщениях
         if row["is_outgoing"]:
             continue
 
@@ -2671,14 +2639,13 @@ async def business_deleted_handler(event: BusinessMessagesDeleted, bot: Bot):
             stamp = datetime.fromisoformat(stamp).astimezone().strftime("%d.%m.%Y %H:%M:%S")
         except Exception:
             pass
-        direction = "входящее"
         caption = (
             "🗑 <b>Удалённое сообщение</b>\n"
             "─────────────\n"
             f"💬 Чат: <code>{event.chat.id}</code>\n"
             f"👤 От: <b>{esc(row['user_name'])}</b> <code>{row['user_id']}</code>\n"
             f"🕐 Время: {esc(stamp)}\n"
-            f"📎 Тип: <i>{esc(row['content_type'])}</i> ({direction})\n\n"
+            f"📎 Тип: <i>{esc(row['content_type'])}</i>\n\n"
             f"{esc(row['text'] or '—')}"
         )
         try:
@@ -2703,6 +2670,7 @@ async def business_deleted_handler(event: BusinessMessagesDeleted, bot: Bot):
                 await bot.send_message(owner_uid, caption)
         except Exception as e:
             log.warning("deleted notify: %s", e)
+
 
 # ---------- Игры ----------
 @router.callback_query(F.data.startswith("game:"))
@@ -2878,11 +2846,7 @@ async def main():
     if not TURSO_URL or not TURSO_TOKEN:
         raise RuntimeError("Не найдены TURSO_DATABASE_URL или TURSO_AUTH_TOKEN в .env")
 
-    # Подключаемся к Turso (HTTP-транспорт, WebSocket на хостинге может блокироваться)
-    db_client = libsql_client.create_client(
-        url=TURSO_URL,
-        auth_token=TURSO_TOKEN,
-    )
+    db_client = libsql_client.create_client(url=TURSO_URL, auth_token=TURSO_TOKEN)
     log.info("Connected to Turso: %s", TURSO_URL)
 
     await init_db()
