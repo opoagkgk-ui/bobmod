@@ -2394,8 +2394,7 @@ async def business_commands(message: Message, bot: Bot):
                 f"👤 Ваш ID: <code>{message.from_user.id}</code>\n"
                 f"🔗 Соединение: <code>{esc(bc)}</code>"
             )
-        elif cmd == ".whois":
-    # Берём последнее ВХОДЯЩЕЕ сообщение (не от владельца)
+elif cmd == ".whois":
     row = await db_fetchone(
         "SELECT user_id, user_name FROM messages "
         "WHERE chat_id=? AND user_id IS NOT NULL AND user_id!=? AND is_outgoing=0 "
@@ -2408,7 +2407,6 @@ async def business_commands(message: Message, bot: Bot):
         target_uid = row[0]
         target_name = row[1] or "—"
 
-        # Полная карточка из contacts (там username и первый контакт)
         c_row = await db_fetchone("SELECT * FROM contacts WHERE chat_id=?", (chat_id,))
         first = "—"
         uname = "—"
