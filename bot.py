@@ -2647,12 +2647,17 @@ async def business_deleted_handler(event: BusinessMessagesDeleted, bot: Bot):
         row = await find_message(event.chat.id, mid)
         if not row:
             continue
+
+        # Не уведомляем о своих (исходящих) сообщениях
+        if row["is_outgoing"]:
+            continue
+
         stamp = row["date"]
         try:
             stamp = datetime.fromisoformat(stamp).astimezone().strftime("%d.%m.%Y %H:%M:%S")
         except Exception:
             pass
-        direction = "исходящее" if row["is_outgoing"] else "входящее"
+        direction = "входящее"
         caption = (
             "🗑 <b>Удалённое сообщение</b>\n"
             "─────────────\n"
@@ -2684,7 +2689,6 @@ async def business_deleted_handler(event: BusinessMessagesDeleted, bot: Bot):
                 await bot.send_message(owner_uid, caption)
         except Exception as e:
             log.warning("deleted notify: %s", e)
-
 
 # ---------- Игры ----------
 @router.callback_query(F.data.startswith("game:"))
