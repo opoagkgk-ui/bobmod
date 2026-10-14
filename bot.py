@@ -2395,27 +2395,43 @@ async def business_commands(message: Message, bot: Bot):
                 f"🔗 Соединение: <code>{esc(bc)}</code>"
             )
         elif cmd == ".whois":
-            row = await db_fetchone("SELECT * FROM contacts WHERE chat_id=?", (chat_id,))
-            if not row:
-                await edit("👤 Информации пока нет.")
-            else:
-                c = row_to_dict(row, ["chat_id", "first_seen", "message_count",
-                                       "user_id", "user_name", "username"])
-                first = "—"
-                try:
-                    first = datetime.fromisoformat(c["first_seen"]).astimezone().strftime("%d.%m.%Y %H:%M")
-                except Exception:
-                    pass
-                uname = f"@{esc(c['username'])}" if c["username"] else "—"
-                await edit(
-                    "👤 <b>Информация о собеседнике</b>\n"
-                    "─────────────\n"
-                    f"📛 Имя: <b>{esc(c['user_name'])}</b>\n"
-                    f"🆔 ID: <code>{c['user_id']}</code>\n"
-                    f"🔗 Username: {uname}\n"
-                    f"📅 Первый контакт: {esc(first)}\n"
-                    f"💬 Сообщений: <b>{c['message_count']}</b>"
-                )
+    # Берём последнее ВХОДЯЩЕЕ сообщение (не от владельца)
+    row = await db_fetchone(
+        "SELECT user_id, user_name FROM messages "
+        "WHERE chat_id=? AND user_id IS NOT NULL AND user_id!=? AND is_outgoing=0 "
+        "ORDER BY id DESC LIMIT 1",
+        (chat_id, owner_uid)
+    )
+    if not row:
+        await edit("👤 Информации пока нет — собеседник ещё не писал.")
+    else:
+        target_uid = row[0]
+        target_name = row[1] or "—"
+
+        # Полная карточка из contacts (там username и первый контакт)
+        c_row = await db_fetchone("SELECT * FROM contacts WHERE chat_id=?", (chat_id,))
+        first = "—"
+        uname = "—"
+        msg_count = 0
+        if c_row:
+            c = row_to_dict(c_row, ["chat_id", "first_seen", "message_count",
+                                     "user_id", "user_name", "username"])
+            try:
+                first = datetime.fromisoformat(c["first_seen"]).astimezone().strftime("%d.%m.%Y %H:%M")
+            except Exception:
+                pass
+            uname = f"@{esc(c['username'])}" if c["username"] else "—"
+            msg_count = c["message_count"]
+
+        await edit(
+            "👤 <b>Информация о собеседнике</b>\n"
+            "─────────────\n"
+            f"📛 Имя: <b>{esc(target_name)}</b>\n"
+            f"🆔 ID: <code>{target_uid}</code>\n"
+            f"🔗 Username: {uname}\n"
+            f"📅 Первый контакт: {esc(first)}\n"
+            f"💬 Сообщений: <b>{msg_count}</b>"
+        )
         elif cmd == ".typing":
             try:
                 await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING, business_connection_id=bc)
