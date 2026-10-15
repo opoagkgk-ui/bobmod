@@ -90,9 +90,9 @@ TIMEZONES = [
     ("🇺🇸 Лос-Анджелес (UTC-8)", "America/Los_Angeles"),
 ]
 
-# Категории конструктора
+# Короткие ключи категорий (для callback_data — не должны превышать 64 байта)
 CONSTRUCTOR_CATEGORIES = {
-    "character": {
+    "c1": {
         "title": "🎭 Характер",
         "options": {
             "friendly": "Дружелюбный",
@@ -102,7 +102,7 @@ CONSTRUCTOR_CATEGORIES = {
             "caring": "Заботливый",
         },
     },
-    "length": {
+    "c2": {
         "title": "📏 Длина ответа",
         "options": {
             "short": "Кратко (1-2 предложения)",
@@ -110,7 +110,7 @@ CONSTRUCTOR_CATEGORIES = {
             "long": "Подробно",
         },
     },
-    "style": {
+    "c3": {
         "title": "🗣 Стиль общения",
         "options": {
             "ty": "На «ты»",
@@ -119,7 +119,7 @@ CONSTRUCTOR_CATEGORIES = {
             "informal": "Без официоза",
         },
     },
-    "language": {
+    "c4": {
         "title": "🌐 Язык ответа",
         "options": {
             "ru": "Русский",
@@ -127,7 +127,7 @@ CONSTRUCTOR_CATEGORIES = {
             "auto": "Авто (по языку вопроса)",
         },
     },
-    "emoji": {
+    "c5": {
         "title": "😊 Эмодзи",
         "options": {
             "much": "Много эмодзи",
@@ -135,7 +135,7 @@ CONSTRUCTOR_CATEGORIES = {
             "none": "Без эмодзи",
         },
     },
-    "spec": {
+    "c6": {
         "title": "🎯 Специализация",
         "options": {
             "universal": "Универсальный",
@@ -156,7 +156,7 @@ roulette_games = {}
 ttt_games = {}
 pending_inputs = {}
 pending_admin = {}
-pending_ai_input = {}  # user_id -> {"type": "custom_prompt" | "category:<key>"}
+pending_ai_input = {}
 sub_cache = {}
 connection_cache = {}
 name_update_lock = asyncio.Lock()
@@ -363,8 +363,6 @@ AI_PROVIDERS = [
 
 
 async def get_user_prompt(user_id: int) -> str:
-    """Возвращает системный промпт для юзера (кастомный или дефолтный)."""
-    # Кастомный промпт доступен только Premium
     premium = await is_premium(user_id)
     if not premium:
         return DEFAULT_PROMPT
@@ -390,7 +388,10 @@ async def get_user_prompt(user_id: int) -> str:
             for cat_key, cat in CONSTRUCTOR_CATEGORIES.items():
                 if cat_key in data and data[cat_key]:
                     val = data[cat_key]
-                    parts.append(f"{cat['title'].split(' ', 1)[1]}: {val}")
+                    # Берём название категории без эмодзи
+                    title = cat["title"].split(" ", 1)
+                    cat_name = title[1] if len(title) > 1 else cat["title"]
+                    parts.append(f"{cat_name}: {val}")
             if parts:
                 return DEFAULT_PROMPT + "\n\nДополнительные настройки:\n" + "\n".join(parts)
         except Exception as e:
@@ -400,7 +401,6 @@ async def get_user_prompt(user_id: int) -> str:
 
 
 async def ask_ai(prompt: str, user_id: int = None) -> str:
-    # Получаем промпт (если user_id передан — кастомный)
     system_prompt = DEFAULT_PROMPT
     if user_id:
         try:
@@ -493,10 +493,7 @@ async def get_ai_settings(user_id):
 
 
 async def save_ai_settings(user_id, mode=None, custom_prompt=None, constructor_data=None):
-    await db_execute(
-        "INSERT OR IGNORE INTO ai_settings(user_id) VALUES(?)",
-        (user_id,)
-    )
+    await db_execute("INSERT OR IGNORE INTO ai_settings(user_id) VALUES(?)", (user_id,))
     updates = []
     args = []
     if mode is not None:
@@ -678,7 +675,7 @@ async def revoke_premium(user_id):
     await log_admin("revoke_premium", user_id)
 
 
-# ---------------- Limits (ФИКС) ----------------
+# ---------------- Limits ----------------
 async def check_limit(user_id):
     today = utcnow().strftime("%Y-%m-%d")
     premium = await is_premium(user_id)
@@ -1232,7 +1229,6 @@ async def cb_ai_menu_settings(call: CallbackQuery):
     mode = ai_s["mode"]
     mode_names = {"default": "Стандартный", "custom": "Свой промпт", "constructor": "Конструктор"}
 
-    # Превью текущего промпта
     preview = await get_user_prompt(user_id)
     preview_short = preview[:200] + ("..." if len(preview) > 200 else "")
 
@@ -1278,7 +1274,7 @@ async def cb_ai_custom(call: CallbackQuery):
         f"<i>Максимум {CUSTOM_PROMPT_MAX} символов</i>"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✏️ Изменить промпт", callback_data="ai:custom:edit")],
+        [InlineKeyboardButton(text="✏️ Изменить промпт", callback_data="ai:custom_edit")],
         back_button("ai:menu"),
     ])
     try:
@@ -1288,7 +1284,7 @@ async def cb_ai_custom(call: CallbackQuery):
     await call.answer()
 
 
-@router.callback_query(F.data == "ai:custom:edit")
+@router.callback_query(F.data == "ai:custom_edit")
 async def cb_ai_custom_edit(call: CallbackQuery):
     if not await require_sub(call):
         return
@@ -1328,12 +1324,12 @@ async def cb_ai_constructor(call: CallbackQuery):
     rows = []
     for cat_key, cat in CONSTRUCTOR_CATEGORIES.items():
         current = data.get(cat_key)
-        marker = f" ✅" if current else ""
+        marker = " ✅" if current else ""
         rows.append([InlineKeyboardButton(
             text=f"{cat['title']}{marker}",
             callback_data=f"ai:cat:{cat_key}"
         )])
-    rows.append([InlineKeyboardButton(text="✅ Применить", callback_data="ai:constructor:apply")])
+    rows.append([InlineKeyboardButton(text="✅ Применить", callback_data="ai:apply")])
     rows.append(back_button("ai:menu"))
     kb = InlineKeyboardMarkup(inline_keyboard=rows)
     try:
@@ -1350,9 +1346,14 @@ async def cb_ai_category(call: CallbackQuery):
     if not await is_premium(call.from_user.id):
         await call.answer("💎 Только для Premium", show_alert=True)
         return
-    cat_key = call.data.split(":", 2)[2]
+    parts = call.data.split(":")
+    # ai:cat:c1
+    if len(parts) < 3:
+        await call.answer("Ошибка формата", show_alert=True)
+        return
+    cat_key = parts[2]
     if cat_key not in CONSTRUCTOR_CATEGORIES:
-        await call.answer("Неизвестная категория", show_alert=True)
+        await call.answer(f"Неизвестная категория: {cat_key}", show_alert=True)
         return
 
     cat = CONSTRUCTOR_CATEGORIES[cat_key]
@@ -1374,11 +1375,11 @@ async def cb_ai_category(call: CallbackQuery):
         marker = " ✅" if current == opt_label else ""
         rows.append([InlineKeyboardButton(
             text=f"{opt_label}{marker}",
-            callback_data=f"ai:cat:set:{cat_key}:{opt_key}"
+            callback_data=f"ai:cs:{cat_key}:{opt_key}"
         )])
     rows.append([InlineKeyboardButton(
         text="✏️ Другое (написать своё)",
-        callback_data=f"ai:cat:other:{cat_key}"
+        callback_data=f"ai:co:{cat_key}"
     )])
     rows.append(back_button("ai:constructor"))
     kb = InlineKeyboardMarkup(inline_keyboard=rows)
@@ -1389,22 +1390,26 @@ async def cb_ai_category(call: CallbackQuery):
     await call.answer()
 
 
-@router.callback_query(F.data.startswith("ai:cat:set:"))
+@router.callback_query(F.data.startswith("ai:cs:"))
 async def cb_ai_cat_set(call: CallbackQuery):
     if not await require_sub(call):
         return
     if not await is_premium(call.from_user.id):
         await call.answer("💎 Только для Premium", show_alert=True)
         return
-    parts = call.data.split(":", 4)
-    cat_key = parts[3]
-    opt_key = parts[4]
-    if cat_key not in CONSTRUCTOR_CATEGORIES:
+    parts = call.data.split(":")
+    # ai:cs:c1:friendly
+    if len(parts) < 4:
         await call.answer("Ошибка", show_alert=True)
+        return
+    cat_key = parts[2]
+    opt_key = parts[3]
+    if cat_key not in CONSTRUCTOR_CATEGORIES:
+        await call.answer("Ошибка категории", show_alert=True)
         return
     cat = CONSTRUCTOR_CATEGORIES[cat_key]
     if opt_key not in cat["options"]:
-        await call.answer("Ошибка", show_alert=True)
+        await call.answer("Ошибка опции", show_alert=True)
         return
 
     label = cat["options"][opt_key]
@@ -1426,14 +1431,19 @@ async def cb_ai_cat_set(call: CallbackQuery):
     await cb_ai_category(call)
 
 
-@router.callback_query(F.data.startswith("ai:cat:other:"))
+@router.callback_query(F.data.startswith("ai:co:"))
 async def cb_ai_cat_other(call: CallbackQuery):
     if not await require_sub(call):
         return
     if not await is_premium(call.from_user.id):
         await call.answer("💎 Только для Premium", show_alert=True)
         return
-    cat_key = call.data.split(":", 3)[3]
+    parts = call.data.split(":")
+    # ai:co:c1
+    if len(parts) < 3:
+        await call.answer("Ошибка", show_alert=True)
+        return
+    cat_key = parts[2]
     if cat_key not in CONSTRUCTOR_CATEGORIES:
         await call.answer("Ошибка", show_alert=True)
         return
@@ -1447,8 +1457,8 @@ async def cb_ai_cat_other(call: CallbackQuery):
     await call.answer()
 
 
-@router.callback_query(F.data == "ai:constructor:apply")
-async def cb_ai_constructor_apply(call: CallbackQuery):
+@router.callback_query(F.data == "ai:apply")
+async def cb_ai_apply(call: CallbackQuery):
     if not await require_sub(call):
         return
     if not await is_premium(call.from_user.id):
@@ -1718,11 +1728,11 @@ async def receive_setting_value(message: Message):
         value = (message.text or "").strip()
         if task["type"] == "custom_prompt":
             if len(value) > CUSTOM_PROMPT_MAX:
-                await message.answer(f"⚠️ Слишком длинный промпт (макс. {CUSTOM_PROMPT_MAX} символов). Попробуйте короче.")
+                await message.answer(f"⚠️ Слишком длинный промпт (макс. {CUSTOM_PROMPT_MAX}).")
                 pending_ai_input[user.id] = task
                 return
             if not value:
-                await message.answer("⚠️ Пустой промпт. Попробуйте снова.")
+                await message.answer("⚠️ Пустой промпт.")
                 pending_ai_input[user.id] = task
                 return
             await save_ai_settings(user.id, mode="custom", custom_prompt=value)
@@ -1734,7 +1744,7 @@ async def receive_setting_value(message: Message):
                 pending_ai_input[user.id] = task
                 return
             if not value:
-                await message.answer("⚠️ Пустой текст. Попробуйте снова.")
+                await message.answer("⚠️ Пустой текст.")
                 pending_ai_input[user.id] = task
                 return
             ai_s = await get_ai_settings(user.id)
@@ -2731,7 +2741,7 @@ async def business_anim(message: Message, bot: Bot):
         pass
 
 
-# ---------- .ai (с кастомным промптом) ----------
+# ---------- .ai ----------
 @router.business_message(F.text.regexp(r"^\.ai(\s+.+)?$"))
 async def business_ai(message: Message, bot: Bot):
     owner_uid = await _check_owner_command(message)
@@ -2791,7 +2801,6 @@ async def business_ai(message: Message, bot: Bot):
         pass
 
     try:
-        # Передаём owner_uid, чтобы использовать кастомный промпт
         answer = await ask_ai(prompt, user_id=owner_uid)
         answer = answer[:4000]
         text = f"🤖 {esc(answer)}"
