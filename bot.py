@@ -468,14 +468,17 @@ async def is_premium(user_id):
     if not row or not row[0] or not row[1]:
         return False
     try:
-        if datetime.fromisoformat(row[1]) < utcnow():
+        until = datetime.fromisoformat(row[1])
+        if until < utcnow():
+            log.info("Premium expired for %s at %s", user_id, until)
             await db_execute(
                 "UPDATE user_limits SET is_premium=0, premium_until=NULL WHERE user_id=?",
                 (user_id,)
             )
             return False
         return True
-    except Exception:
+    except Exception as e:
+        log.warning("is_premium error for %s: %s", user_id, e)
         return False
 
 
@@ -507,16 +510,25 @@ async def revoke_premium(user_id):
     await log_admin("revoke_premium", user_id)
 
 
-# ---------------- Limits ----------------
+# ---------------- Limits (ФИКС: не сбрасывает премиум) ----------------
 async def check_limit(user_id):
     today = utcnow().strftime("%Y-%m-%d")
     premium = await is_premium(user_id)
-    row = await db_fetchone("SELECT date, requests_count FROM user_limits WHERE user_id=?", (user_id,))
-    if not row or row[0] != today:
+    row = await db_fetchone(
+        "SELECT date, requests_count FROM user_limits WHERE user_id=?",
+        (user_id,)
+    )
+    if not row:
         await db_execute(
-            "INSERT OR REPLACE INTO user_limits(user_id, date, requests_count, is_premium, premium_until, last_ai_request) "
-            "VALUES(?,?,0,?,?,?)",
-            (user_id, today, 0, None, None)
+            "INSERT INTO user_limits(user_id, date, requests_count) VALUES(?,?,0)",
+            (user_id, today)
+        )
+        used = 0
+    elif row[0] != today:
+        # Новый день — сбрасываем ТОЛЬКО счётчик, premium не трогаем
+        await db_execute(
+            "UPDATE user_limits SET date=?, requests_count=0, last_ai_request=NULL WHERE user_id=?",
+            (today, user_id)
         )
         used = 0
     else:
@@ -838,7 +850,6 @@ def admin_menu():
         [InlineKeyboardButton(text="⚙️ Система", callback_data="adm:sys")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:main")],
     ])
-
 # ============================================================
 # PRIVATE HANDLERS
 # ============================================================
@@ -894,7 +905,7 @@ async def cmd_start(message: Message, command: Command):
         "• сохранение удалённых сообщений\n"
         "• ИИ-помощник через <code>.ai</code>\n"
         "• и другие команды\n\n"
-        "<i>Подключение: Настройки → Telegram Business → Чат-автоматизация</i>",
+        "<i>Как подключить: Профиль → Изменить → Автоматизация чатов</i>",
         reply_markup=main_menu()
     )
 
@@ -921,7 +932,8 @@ async def cmd_help(message: Message):
         f"• {PREMIUM_DAILY_LIMIT} запросов ИИ в день (вместо {FREE_DAILY_LIMIT})\n"
         f"• Задержка {AI_COOLDOWN_PREMIUM} сек (вместо {AI_COOLDOWN_FREE})\n"
         "• Без водяного знака в ответах\n"
-        "• Иммунитет от <code>.mute</code>",
+        "• Иммунитет от <code>.mute</code>\n\n"
+        "<i>Как подключить: Профиль → Изменить → Автоматизация чатов</i>",
         reply_markup=main_menu()
     )
 
@@ -1147,7 +1159,8 @@ async def cb_help(call: CallbackQuery):
         "<b>💎 Premium:</b>\n"
         f"• {PREMIUM_DAILY_LIMIT} запросов ИИ в день\n"
         "• Без водяного знака\n"
-        "• Иммунитет от <code>.mute</code>"
+        "• Иммунитет от <code>.mute</code>\n\n"
+        "<i>Как подключить: Профиль → Изменить → Автоматизация чатов</i>"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[back_button()])
     try:
@@ -1911,7 +1924,6 @@ async def weekly_publish_loop():
         except Exception as e:
             log.warning("weekly publish err: %s", e)
             await asyncio.sleep(3600)
-
 # ============================================================
 # VIDEO DOWNLOAD HELPERS
 # ============================================================
@@ -2873,3 +2885,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         pass
+        
