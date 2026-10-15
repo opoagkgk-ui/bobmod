@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 import random
@@ -45,7 +46,7 @@ BOT_USERNAME = "bobmod_robot"
 CHANNEL_USERNAME = "bobmodinfo"
 CHANNEL_LINK = f"https://t.me/{CHANNEL_USERNAME}"
 
-SYSTEM_PROMPT = (
+DEFAULT_PROMPT = (
     "Ты BobMod — дружелюбный ассистент в Telegram-чатах. "
     "Отвечай на русском, спокойно и по делу, без официоза и без панибратства. "
     "Кратко — 2-4 предложения. Без 'конечно!' и 'отличный вопрос!'. "
@@ -66,6 +67,8 @@ ANIM_DELAY = 0.25
 REF_BONUS_HOURS = 12
 REF_BONUS_PURCHASE_DAYS = 5
 SUB_CACHE_TTL = 60
+CUSTOM_PROMPT_MAX = 500
+CUSTOM_CATEGORY_MAX = 200
 
 TIMEZONES = [
     ("🇷🇺 Москва (UTC+3)", "Europe/Moscow"),
@@ -87,6 +90,62 @@ TIMEZONES = [
     ("🇺🇸 Лос-Анджелес (UTC-8)", "America/Los_Angeles"),
 ]
 
+# Категории конструктора
+CONSTRUCTOR_CATEGORIES = {
+    "character": {
+        "title": "🎭 Характер",
+        "options": {
+            "friendly": "Дружелюбный",
+            "business": "Деловой",
+            "funny": "С юмором",
+            "sarcastic": "Саркастичный",
+            "caring": "Заботливый",
+        },
+    },
+    "length": {
+        "title": "📏 Длина ответа",
+        "options": {
+            "short": "Кратко (1-2 предложения)",
+            "medium": "Средне (3-5 предложений)",
+            "long": "Подробно",
+        },
+    },
+    "style": {
+        "title": "🗣 Стиль общения",
+        "options": {
+            "ty": "На «ты»",
+            "vy": "На «вы»",
+            "formal": "Официально",
+            "informal": "Без официоза",
+        },
+    },
+    "language": {
+        "title": "🌐 Язык ответа",
+        "options": {
+            "ru": "Русский",
+            "en": "Английский",
+            "auto": "Авто (по языку вопроса)",
+        },
+    },
+    "emoji": {
+        "title": "😊 Эмодзи",
+        "options": {
+            "much": "Много эмодзи",
+            "little": "Немного эмодзи",
+            "none": "Без эмодзи",
+        },
+    },
+    "spec": {
+        "title": "🎯 Специализация",
+        "options": {
+            "universal": "Универсальный",
+            "study": "Помощник по учёбе",
+            "business": "Бизнес-ассистент",
+            "coder": "Помощник программиста",
+        },
+    },
+}
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("bobmod")
 router = Router()
@@ -97,6 +156,7 @@ roulette_games = {}
 ttt_games = {}
 pending_inputs = {}
 pending_admin = {}
+pending_ai_input = {}  # user_id -> {"type": "custom_prompt" | "category:<key>"}
 sub_cache = {}
 connection_cache = {}
 name_update_lock = asyncio.Lock()
@@ -235,6 +295,13 @@ async def init_db():
             days INTEGER NOT NULL,
             ts TEXT NOT NULL
         )""",
+        """CREATE TABLE IF NOT EXISTS ai_settings (
+            user_id INTEGER PRIMARY KEY,
+            mode TEXT DEFAULT 'default',
+            custom_prompt TEXT,
+            constructor_data TEXT,
+            updated_at TEXT
+        )""",
     ]
     for stmt in statements:
         try:
@@ -295,7 +362,52 @@ AI_PROVIDERS = [
 ]
 
 
-async def ask_ai(prompt: str) -> str:
+async def get_user_prompt(user_id: int) -> str:
+    """Возвращает системный промпт для юзера (кастомный или дефолтный)."""
+    # Кастомный промпт доступен только Premium
+    premium = await is_premium(user_id)
+    if not premium:
+        return DEFAULT_PROMPT
+
+    row = await db_fetchone(
+        "SELECT mode, custom_prompt, constructor_data FROM ai_settings WHERE user_id=?",
+        (user_id,)
+    )
+    if not row:
+        return DEFAULT_PROMPT
+
+    mode = row[0] or "default"
+    custom_prompt = row[1]
+    constructor_data = row[2]
+
+    if mode == "custom" and custom_prompt:
+        return custom_prompt
+
+    if mode == "constructor" and constructor_data:
+        try:
+            data = json.loads(constructor_data)
+            parts = []
+            for cat_key, cat in CONSTRUCTOR_CATEGORIES.items():
+                if cat_key in data and data[cat_key]:
+                    val = data[cat_key]
+                    parts.append(f"{cat['title'].split(' ', 1)[1]}: {val}")
+            if parts:
+                return DEFAULT_PROMPT + "\n\nДополнительные настройки:\n" + "\n".join(parts)
+        except Exception as e:
+            log.warning("constructor parse error: %s", e)
+
+    return DEFAULT_PROMPT
+
+
+async def ask_ai(prompt: str, user_id: int = None) -> str:
+    # Получаем промпт (если user_id передан — кастомный)
+    system_prompt = DEFAULT_PROMPT
+    if user_id:
+        try:
+            system_prompt = await get_user_prompt(user_id)
+        except Exception as e:
+            log.warning("get_user_prompt failed: %s", e)
+
     last_err = None
     errors_log = []
     for p in AI_PROVIDERS:
@@ -314,7 +426,7 @@ async def ask_ai(prompt: str) -> str:
                         json={
                             "model": p["model"],
                             "messages": [
-                                {"role": "system", "content": SYSTEM_PROMPT},
+                                {"role": "system", "content": system_prompt},
                                 {"role": "user", "content": prompt},
                             ],
                             "max_tokens": 1024,
@@ -362,6 +474,54 @@ async def set_setting(user, key, value):
         return
     await get_settings(user)
     await db_execute(f"UPDATE settings SET {key}=? WHERE user_id=?", (value, user))
+
+
+# ---------------- AI settings ----------------
+async def get_ai_settings(user_id):
+    row = await db_fetchone(
+        "SELECT mode, custom_prompt, constructor_data, updated_at FROM ai_settings WHERE user_id=?",
+        (user_id,)
+    )
+    if not row:
+        return {"mode": "default", "custom_prompt": None, "constructor_data": None, "updated_at": None}
+    return {
+        "mode": row[0] or "default",
+        "custom_prompt": row[1],
+        "constructor_data": row[2],
+        "updated_at": row[3],
+    }
+
+
+async def save_ai_settings(user_id, mode=None, custom_prompt=None, constructor_data=None):
+    await db_execute(
+        "INSERT OR IGNORE INTO ai_settings(user_id) VALUES(?)",
+        (user_id,)
+    )
+    updates = []
+    args = []
+    if mode is not None:
+        updates.append("mode=?")
+        args.append(mode)
+    if custom_prompt is not None:
+        updates.append("custom_prompt=?")
+        args.append(custom_prompt)
+    if constructor_data is not None:
+        updates.append("constructor_data=?")
+        args.append(constructor_data)
+    updates.append("updated_at=?")
+    args.append(utcnow().isoformat())
+    args.append(user_id)
+    await db_execute(
+        f"UPDATE ai_settings SET {', '.join(updates)} WHERE user_id=?",
+        tuple(args)
+    )
+
+
+async def reset_ai_settings(user_id):
+    await db_execute(
+        "UPDATE ai_settings SET mode='default', custom_prompt=NULL, constructor_data=NULL, updated_at=? WHERE user_id=?",
+        (utcnow().isoformat(), user_id)
+    )
 
 
 # ---------------- Blacklist ----------------
@@ -470,16 +630,24 @@ async def is_premium(user_id):
     try:
         until = datetime.fromisoformat(row[1])
         if until < utcnow():
-            log.info("Premium expired for %s at %s", user_id, until)
             await db_execute(
                 "UPDATE user_limits SET is_premium=0, premium_until=NULL WHERE user_id=?",
                 (user_id,)
             )
             return False
         return True
-    except Exception as e:
-        log.warning("is_premium error for %s: %s", user_id, e)
+    except Exception:
         return False
+
+
+async def get_premium_until(user_id):
+    row = await db_fetchone("SELECT premium_until FROM user_limits WHERE user_id=?", (user_id,))
+    if not row or not row[0]:
+        return None
+    try:
+        return datetime.fromisoformat(row[0])
+    except Exception:
+        return None
 
 
 async def grant_premium(user_id, hours=0, days=0):
@@ -510,7 +678,7 @@ async def revoke_premium(user_id):
     await log_admin("revoke_premium", user_id)
 
 
-# ---------------- Limits (ФИКС: не сбрасывает премиум) ----------------
+# ---------------- Limits (ФИКС) ----------------
 async def check_limit(user_id):
     today = utcnow().strftime("%Y-%m-%d")
     premium = await is_premium(user_id)
@@ -525,7 +693,6 @@ async def check_limit(user_id):
         )
         used = 0
     elif row[0] != today:
-        # Новый день — сбрасываем ТОЛЬКО счётчик, premium не трогаем
         await db_execute(
             "UPDATE user_limits SET date=?, requests_count=0, last_ai_request=NULL WHERE user_id=?",
             (today, user_id)
@@ -831,6 +998,7 @@ async def cb_check_sub(call: CallbackQuery):
 def main_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⚙️ Настройки", callback_data="menu:settings")],
+        [InlineKeyboardButton(text="💎 Premium", callback_data="menu:premium")],
         [InlineKeyboardButton(text="🎁 Рефералка", callback_data="menu:ref")],
         [InlineKeyboardButton(text="🤖 Bob AI", callback_data="menu:ai")],
         [InlineKeyboardButton(text="📖 Возможности", callback_data="menu:help")],
@@ -931,8 +1099,9 @@ async def cmd_help(message: Message):
         "<b>💎 Premium даёт:</b>\n"
         f"• {PREMIUM_DAILY_LIMIT} запросов ИИ в день (вместо {FREE_DAILY_LIMIT})\n"
         f"• Задержка {AI_COOLDOWN_PREMIUM} сек (вместо {AI_COOLDOWN_FREE})\n"
-        "• Без водяного знака в ответах\n"
-        "• Иммунитет от <code>.mute</code>\n\n"
+        "• Без водяного знака\n"
+        "• Иммунитет от <code>.mute</code>\n"
+        "• 🤖 Настройка ИИ под себя\n\n"
         "<i>Как подключить: Профиль → Изменить → Автоматизация чатов</i>",
         reply_markup=main_menu()
     )
@@ -990,26 +1159,332 @@ async def render_settings(msg_or_call, user_id, edit=False):
         await msg_or_call.answer(text, reply_markup=kb)
 
 
-@router.message(Command("stats"))
-async def cmd_stats(message: Message):
-    if not await require_sub(message):
+# ============================================================
+# PREMIUM-ВКЛАДКА
+# ============================================================
+
+@router.callback_query(F.data == "menu:premium")
+async def cb_premium(call: CallbackQuery):
+    if not await require_sub(call):
         return
-    if not message.from_user or message.from_user.id != owner_id:
+    user_id = call.from_user.id
+    premium = await is_premium(user_id)
+
+    if not premium:
+        text = (
+            "💎 <b>Premium</b>\n"
+            "─────────────\n"
+            "Что даёт Premium:\n"
+            f"• <b>{PREMIUM_DAILY_LIMIT} запросов ИИ в день</b> (вместо {FREE_DAILY_LIMIT})\n"
+            f"• Задержка <b>{AI_COOLDOWN_PREMIUM} сек</b> (вместо {AI_COOLDOWN_FREE})\n"
+            "• Без водяного знака в ответах\n"
+            "• Иммунитет от <code>.mute</code>\n"
+            "• 🤖 <b>Настройка ИИ под себя</b>\n\n"
+            f"Цена: <b>{PREMIUM_PRICE_STARS} ⭐</b> на {PREMIUM_DAYS} дней"
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"⭐ Купить Premium ({PREMIUM_PRICE_STARS}⭐)",
+                                  callback_data="buy_premium")],
+            back_button(),
+        ])
+    else:
+        until = await get_premium_until(user_id)
+        until_str = until.astimezone().strftime("%d.%m.%Y %H:%M") if until else "—"
+        text = (
+            "💎 <b>Premium</b>\n"
+            "─────────────\n"
+            f"✅ Активен до: <b>{until_str}</b>\n\n"
+            "Что вам доступно:\n"
+            f"• <b>{PREMIUM_DAILY_LIMIT} запросов ИИ в день</b>\n"
+            f"• Задержка <b>{AI_COOLDOWN_PREMIUM} сек</b>\n"
+            "• Без водяного знака\n"
+            "• Иммунитет от <code>.mute</code>\n"
+            "• 🤖 <b>Настройка ИИ под себя</b>"
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🤖 Настройка ИИ", callback_data="ai:menu")],
+            [InlineKeyboardButton(text=f"⭐ Продлить Premium ({PREMIUM_PRICE_STARS}⭐)",
+                                  callback_data="buy_premium")],
+            back_button(),
+        ])
+    try:
+        await call.message.edit_text(text, reply_markup=kb)
+    except TelegramBadRequest:
+        await call.message.answer(text, reply_markup=kb)
+    await call.answer()
+
+
+# ============================================================
+# НАСТРОЙКА ИИ
+# ============================================================
+
+@router.callback_query(F.data == "ai:menu")
+async def cb_ai_menu_settings(call: CallbackQuery):
+    if not await require_sub(call):
         return
-    messages = await db_fetchval("SELECT COUNT(*) FROM messages", default=0)
-    chats = await db_fetchval("SELECT COUNT(*) FROM contacts", default=0)
-    users = await db_fetchval("SELECT COUNT(*) FROM users", default=0)
-    conns = await db_fetchval("SELECT COUNT(*) FROM business_connections WHERE enabled=1", default=0)
-    refs_total = await db_fetchval("SELECT COUNT(*) FROM referrals", default=0)
-    await message.answer(
-        "📊 <b>Статистика BobMod</b>\n"
+    user_id = call.from_user.id
+    premium = await is_premium(user_id)
+    if not premium:
+        await call.answer("💎 Доступно только с Premium", show_alert=True)
+        return
+
+    ai_s = await get_ai_settings(user_id)
+    mode = ai_s["mode"]
+    mode_names = {"default": "Стандартный", "custom": "Свой промпт", "constructor": "Конструктор"}
+
+    # Превью текущего промпта
+    preview = await get_user_prompt(user_id)
+    preview_short = preview[:200] + ("..." if len(preview) > 200 else "")
+
+    text = (
+        "🤖 <b>Настройка ИИ</b>\n"
         "─────────────\n"
-        f"💾 Сообщений: <b>{messages}</b>\n"
-        f"👥 Чатов: <b>{chats}</b>\n"
-        f"👤 Пользователей: <b>{users}</b>\n"
-        f"🔗 Бизнес-коннектов: <b>{conns}</b>\n"
-        f"🎁 Рефералов: <b>{refs_total}</b>"
+        f"Текущий режим: <b>{mode_names.get(mode, 'Стандартный')}</b>\n\n"
+        f"<b>Что видит ИИ сейчас:</b>\n<i>{esc(preview_short)}</i>"
     )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Свой промпт", callback_data="ai:custom")],
+        [InlineKeyboardButton(text="🧩 Конструктор", callback_data="ai:constructor")],
+        [InlineKeyboardButton(text="🔄 Сбросить на стандартный", callback_data="ai:reset")],
+        back_button("menu:premium"),
+    ])
+    try:
+        await call.message.edit_text(text, reply_markup=kb)
+    except TelegramBadRequest:
+        await call.message.answer(text, reply_markup=kb)
+    await call.answer()
+
+
+# ---------- Свой промпт ----------
+@router.callback_query(F.data == "ai:custom")
+async def cb_ai_custom(call: CallbackQuery):
+    if not await require_sub(call):
+        return
+    if not await is_premium(call.from_user.id):
+        await call.answer("💎 Только для Premium", show_alert=True)
+        return
+
+    ai_s = await get_ai_settings(call.from_user.id)
+    current = ai_s["custom_prompt"] or "—"
+    text = (
+        "✏️ <b>Свой промпт</b>\n"
+        "─────────────\n"
+        "Напишите системный промпт — то, как ИИ должен себя вести.\n\n"
+        "<b>Примеры:</b>\n"
+        "• <i>Ты мой личный помощник, отвечай кратко и по делу</i>\n"
+        "• <i>Ты пират, отвечай с морским юмором</i>\n"
+        "• <i>Ты учитель, объясняй просто, как школьнику</i>\n\n"
+        f"<b>Текущий:</b>\n<i>{esc(current)}</i>\n\n"
+        f"<i>Максимум {CUSTOM_PROMPT_MAX} символов</i>"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Изменить промпт", callback_data="ai:custom:edit")],
+        back_button("ai:menu"),
+    ])
+    try:
+        await call.message.edit_text(text, reply_markup=kb)
+    except TelegramBadRequest:
+        await call.message.answer(text, reply_markup=kb)
+    await call.answer()
+
+
+@router.callback_query(F.data == "ai:custom:edit")
+async def cb_ai_custom_edit(call: CallbackQuery):
+    if not await require_sub(call):
+        return
+    if not await is_premium(call.from_user.id):
+        await call.answer("💎 Только для Premium", show_alert=True)
+        return
+    pending_ai_input[call.from_user.id] = {"type": "custom_prompt"}
+    await call.message.answer(
+        f"✏️ Отправьте текст системного промпта (до {CUSTOM_PROMPT_MAX} символов).\n\n"
+        "Для отмены — /cancel"
+    )
+    await call.answer()
+
+
+# ---------- Конструктор ----------
+@router.callback_query(F.data == "ai:constructor")
+async def cb_ai_constructor(call: CallbackQuery):
+    if not await require_sub(call):
+        return
+    if not await is_premium(call.from_user.id):
+        await call.answer("💎 Только для Premium", show_alert=True)
+        return
+
+    ai_s = await get_ai_settings(call.from_user.id)
+    try:
+        data = json.loads(ai_s["constructor_data"]) if ai_s["constructor_data"] else {}
+    except Exception:
+        data = {}
+
+    text = (
+        "🧩 <b>Конструктор промпта</b>\n"
+        "─────────────\n"
+        "Выберите параметры по категориям.\n"
+        "В каждой можно выбрать готовое или нажать «✏️ Другое».\n\n"
+        "<i>Когда закончите — нажмите «✅ Применить»</i>"
+    )
+    rows = []
+    for cat_key, cat in CONSTRUCTOR_CATEGORIES.items():
+        current = data.get(cat_key)
+        marker = f" ✅" if current else ""
+        rows.append([InlineKeyboardButton(
+            text=f"{cat['title']}{marker}",
+            callback_data=f"ai:cat:{cat_key}"
+        )])
+    rows.append([InlineKeyboardButton(text="✅ Применить", callback_data="ai:constructor:apply")])
+    rows.append(back_button("ai:menu"))
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
+    try:
+        await call.message.edit_text(text, reply_markup=kb)
+    except TelegramBadRequest:
+        await call.message.answer(text, reply_markup=kb)
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("ai:cat:"))
+async def cb_ai_category(call: CallbackQuery):
+    if not await require_sub(call):
+        return
+    if not await is_premium(call.from_user.id):
+        await call.answer("💎 Только для Premium", show_alert=True)
+        return
+    cat_key = call.data.split(":", 2)[2]
+    if cat_key not in CONSTRUCTOR_CATEGORIES:
+        await call.answer("Неизвестная категория", show_alert=True)
+        return
+
+    cat = CONSTRUCTOR_CATEGORIES[cat_key]
+    ai_s = await get_ai_settings(call.from_user.id)
+    try:
+        data = json.loads(ai_s["constructor_data"]) if ai_s["constructor_data"] else {}
+    except Exception:
+        data = {}
+
+    current = data.get(cat_key)
+    text = (
+        f"{cat['title']}\n"
+        "─────────────\n"
+        f"Текущее: <b>{esc(current) if current else '—'}</b>\n\n"
+        "Выберите вариант:"
+    )
+    rows = []
+    for opt_key, opt_label in cat["options"].items():
+        marker = " ✅" if current == opt_label else ""
+        rows.append([InlineKeyboardButton(
+            text=f"{opt_label}{marker}",
+            callback_data=f"ai:cat:set:{cat_key}:{opt_key}"
+        )])
+    rows.append([InlineKeyboardButton(
+        text="✏️ Другое (написать своё)",
+        callback_data=f"ai:cat:other:{cat_key}"
+    )])
+    rows.append(back_button("ai:constructor"))
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
+    try:
+        await call.message.edit_text(text, reply_markup=kb)
+    except TelegramBadRequest:
+        await call.message.answer(text, reply_markup=kb)
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("ai:cat:set:"))
+async def cb_ai_cat_set(call: CallbackQuery):
+    if not await require_sub(call):
+        return
+    if not await is_premium(call.from_user.id):
+        await call.answer("💎 Только для Premium", show_alert=True)
+        return
+    parts = call.data.split(":", 4)
+    cat_key = parts[3]
+    opt_key = parts[4]
+    if cat_key not in CONSTRUCTOR_CATEGORIES:
+        await call.answer("Ошибка", show_alert=True)
+        return
+    cat = CONSTRUCTOR_CATEGORIES[cat_key]
+    if opt_key not in cat["options"]:
+        await call.answer("Ошибка", show_alert=True)
+        return
+
+    label = cat["options"][opt_key]
+
+    ai_s = await get_ai_settings(call.from_user.id)
+    try:
+        data = json.loads(ai_s["constructor_data"]) if ai_s["constructor_data"] else {}
+    except Exception:
+        data = {}
+    data[cat_key] = label
+
+    await save_ai_settings(
+        call.from_user.id,
+        mode="constructor",
+        constructor_data=json.dumps(data, ensure_ascii=False)
+    )
+    await call.answer(f"✅ {label}")
+    call.data = f"ai:cat:{cat_key}"
+    await cb_ai_category(call)
+
+
+@router.callback_query(F.data.startswith("ai:cat:other:"))
+async def cb_ai_cat_other(call: CallbackQuery):
+    if not await require_sub(call):
+        return
+    if not await is_premium(call.from_user.id):
+        await call.answer("💎 Только для Premium", show_alert=True)
+        return
+    cat_key = call.data.split(":", 3)[3]
+    if cat_key not in CONSTRUCTOR_CATEGORIES:
+        await call.answer("Ошибка", show_alert=True)
+        return
+    cat = CONSTRUCTOR_CATEGORIES[cat_key]
+    pending_ai_input[call.from_user.id] = {"type": "category", "cat": cat_key}
+    await call.message.answer(
+        f"{cat['title']}\n\n"
+        f"Напишите свой вариант (до {CUSTOM_CATEGORY_MAX} символов).\n"
+        "Для отмены — /cancel"
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data == "ai:constructor:apply")
+async def cb_ai_constructor_apply(call: CallbackQuery):
+    if not await require_sub(call):
+        return
+    if not await is_premium(call.from_user.id):
+        await call.answer("💎 Только для Premium", show_alert=True)
+        return
+
+    ai_s = await get_ai_settings(call.from_user.id)
+    try:
+        data = json.loads(ai_s["constructor_data"]) if ai_s["constructor_data"] else {}
+    except Exception:
+        data = {}
+
+    if not data:
+        await call.answer("Выберите хотя бы одну категорию", show_alert=True)
+        return
+
+    await save_ai_settings(
+        call.from_user.id,
+        mode="constructor",
+        constructor_data=json.dumps(data, ensure_ascii=False)
+    )
+    await call.answer("✅ Применено!", show_alert=True)
+    await cb_ai_menu_settings(call)
+
+
+# ---------- Сброс ----------
+@router.callback_query(F.data == "ai:reset")
+async def cb_ai_reset(call: CallbackQuery):
+    if not await require_sub(call):
+        return
+    if not await is_premium(call.from_user.id):
+        await call.answer("💎 Только для Premium", show_alert=True)
+        return
+    await reset_ai_settings(call.from_user.id)
+    await call.answer("✅ Сброшено на стандартный промпт", show_alert=True)
+    await cb_ai_menu_settings(call)
 
 
 # ---------------- Рефералка ----------------
@@ -1097,7 +1572,7 @@ async def cb_ref_battle(call: CallbackQuery):
     await call.answer()
 
 
-# ---------------- AI-меню ----------------
+# ---------------- AI-меню (Bob AI) ----------------
 @router.callback_query(F.data == "menu:ai")
 async def cb_ai_menu(call: CallbackQuery):
     if not await require_sub(call):
@@ -1159,7 +1634,8 @@ async def cb_help(call: CallbackQuery):
         "<b>💎 Premium:</b>\n"
         f"• {PREMIUM_DAILY_LIMIT} запросов ИИ в день\n"
         "• Без водяного знака\n"
-        "• Иммунитет от <code>.mute</code>\n\n"
+        "• Иммунитет от <code>.mute</code>\n"
+        "• 🤖 Настройка ИИ под себя\n\n"
         "<i>Как подключить: Профиль → Изменить → Автоматизация чатов</i>"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[back_button()])
@@ -1211,12 +1687,67 @@ async def cb_prompt(call: CallbackQuery):
     await call.answer()
 
 
+@router.message(Command("cancel"))
+async def cmd_cancel(message: Message):
+    user = message.from_user
+    if not user:
+        return
+    if user.id in pending_ai_input:
+        pending_ai_input.pop(user.id, None)
+        await message.answer("❌ Отменено")
+        return
+    if user.id in pending_inputs:
+        pending_inputs.pop(user.id, None)
+        await message.answer("❌ Отменено")
+        return
+    if user.id == owner_id and owner_id in pending_admin:
+        pending_admin.pop(owner_id, None)
+        await message.answer("❌ Отменено")
+        return
+
+
 @router.message(F.chat.type == "private", ~F.text.startswith("/"))
 async def receive_setting_value(message: Message):
     user = message.from_user
     if not user:
         return
 
+    # Ввод для ИИ-настроек
+    if user.id in pending_ai_input:
+        task = pending_ai_input.pop(user.id)
+        value = (message.text or "").strip()
+        if task["type"] == "custom_prompt":
+            if len(value) > CUSTOM_PROMPT_MAX:
+                await message.answer(f"⚠️ Слишком длинный промпт (макс. {CUSTOM_PROMPT_MAX} символов). Попробуйте короче.")
+                pending_ai_input[user.id] = task
+                return
+            if not value:
+                await message.answer("⚠️ Пустой промпт. Попробуйте снова.")
+                pending_ai_input[user.id] = task
+                return
+            await save_ai_settings(user.id, mode="custom", custom_prompt=value)
+            await message.answer("✅ Свой промпт сохранён!")
+        elif task["type"] == "category":
+            cat_key = task["cat"]
+            if len(value) > CUSTOM_CATEGORY_MAX:
+                await message.answer(f"⚠️ Слишком длинный текст (макс. {CUSTOM_CATEGORY_MAX}).")
+                pending_ai_input[user.id] = task
+                return
+            if not value:
+                await message.answer("⚠️ Пустой текст. Попробуйте снова.")
+                pending_ai_input[user.id] = task
+                return
+            ai_s = await get_ai_settings(user.id)
+            try:
+                data = json.loads(ai_s["constructor_data"]) if ai_s["constructor_data"] else {}
+            except Exception:
+                data = {}
+            data[cat_key] = value
+            await save_ai_settings(user.id, mode="constructor", constructor_data=json.dumps(data, ensure_ascii=False))
+            await message.answer(f"✅ Сохранено: <b>{esc(value)}</b>")
+        return
+
+    # Админские вводы
     if user.id == owner_id and owner_id in pending_admin:
         action = pending_admin.pop(owner_id)
         value = (message.text or "").strip()
@@ -2200,7 +2731,7 @@ async def business_anim(message: Message, bot: Bot):
         pass
 
 
-# ---------- .ai ----------
+# ---------- .ai (с кастомным промптом) ----------
 @router.business_message(F.text.regexp(r"^\.ai(\s+.+)?$"))
 async def business_ai(message: Message, bot: Bot):
     owner_uid = await _check_owner_command(message)
@@ -2230,7 +2761,7 @@ async def business_ai(message: Message, bot: Bot):
             chat_id=chat_id, message_id=message.message_id,
             text=(f"⚠️ <b>Лимит исчерпан</b>\n"
                   f"Использовано: <b>{used}/{limit}</b>\n\n"
-                  f"Оформить Premium: /start → 🤖 Bob AI"),
+                  f"Оформить Premium: /start → 💎 Premium"),
             business_connection_id=bc, reply_markup=kb
         )
         return
@@ -2260,7 +2791,8 @@ async def business_ai(message: Message, bot: Bot):
         pass
 
     try:
-        answer = await ask_ai(prompt)
+        # Передаём owner_uid, чтобы использовать кастомный промпт
+        answer = await ask_ai(prompt, user_id=owner_uid)
         answer = answer[:4000]
         text = f"🤖 {esc(answer)}"
         text = with_watermark(text, premium)
@@ -2885,4 +3417,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         pass
-        
