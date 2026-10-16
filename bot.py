@@ -90,67 +90,27 @@ TIMEZONES = [
     ("🇺🇸 Лос-Анджелес (UTC-8)", "America/Los_Angeles"),
 ]
 
-# Короткие ключи категорий (для callback_data — не должны превышать 64 байта)
 CONSTRUCTOR_CATEGORIES = {
-    "c1": {
-        "title": "🎭 Характер",
-        "options": {
-            "friendly": "Дружелюбный",
-            "business": "Деловой",
-            "funny": "С юмором",
-            "sarcastic": "Саркастичный",
-            "caring": "Заботливый",
-        },
-    },
-    "c2": {
-        "title": "📏 Длина ответа",
-        "options": {
-            "short": "Кратко (1-2 предложения)",
-            "medium": "Средне (3-5 предложений)",
-            "long": "Подробно",
-        },
-    },
-    "c3": {
-        "title": "🗣 Стиль общения",
-        "options": {
-            "ty": "На «ты»",
-            "vy": "На «вы»",
-            "formal": "Официально",
-            "informal": "Без официоза",
-        },
-    },
-    "c4": {
-        "title": "🌐 Язык ответа",
-        "options": {
-            "ru": "Русский",
-            "en": "Английский",
-            "auto": "Авто (по языку вопроса)",
-        },
-    },
-    "c5": {
-        "title": "😊 Эмодзи",
-        "options": {
-            "much": "Много эмодзи",
-            "little": "Немного эмодзи",
-            "none": "Без эмодзи",
-        },
-    },
-    "c6": {
-        "title": "🎯 Специализация",
-        "options": {
-            "universal": "Универсальный",
-            "study": "Помощник по учёбе",
-            "business": "Бизнес-ассистент",
-            "coder": "Помощник программиста",
-        },
-    },
+    "c1": {"title": "🎭 Характер", "options": {
+        "friendly": "Дружелюбный", "business": "Деловой", "funny": "С юмором",
+        "sarcastic": "Саркастичный", "caring": "Заботливый"}},
+    "c2": {"title": "📏 Длина ответа", "options": {
+        "short": "Кратко (1-2 предложения)", "medium": "Средне (3-5 предложений)", "long": "Подробно"}},
+    "c3": {"title": "🗣 Стиль общения", "options": {
+        "ty": "На «ты»", "vy": "На «вы»", "formal": "Официально", "informal": "Без официоза"}},
+    "c4": {"title": "🌐 Язык ответа", "options": {
+        "ru": "Русский", "en": "Английский", "auto": "Авто (по языку вопроса)"}},
+    "c5": {"title": "😊 Эмодзи", "options": {
+        "much": "Много эмодзи", "little": "Немного эмодзи", "none": "Без эмодзи"}},
+    "c6": {"title": "🎯 Специализация", "options": {
+        "universal": "Универсальный", "study": "Помощник по учёбе",
+        "business": "Бизнес-ассистент", "coder": "Помощник программиста"}},
 }
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("bobmod")
 router = Router()
 
-# ---------------- State ----------------
 guess_games = {}
 roulette_games = {}
 ttt_games = {}
@@ -164,7 +124,6 @@ bot_ref: Bot = None
 db_client: libsql_client.Client = None
 
 
-# ---------------- Turso DB ----------------
 async def db_execute(sql: str, args: tuple = ()):
     return await db_client.execute(sql, args)
 
@@ -214,93 +173,59 @@ async def init_db():
             forward_to_owner_enabled INTEGER DEFAULT 0
         )""",
         """CREATE TABLE IF NOT EXISTS blacklist (
-            owner_id INTEGER NOT NULL,
-            user_id INTEGER NOT NULL,
+            owner_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
             PRIMARY KEY(owner_id, user_id)
         )""",
         """CREATE TABLE IF NOT EXISTS mutes (
-            chat_id INTEGER NOT NULL,
-            target_user_id INTEGER NOT NULL,
-            mute_until TEXT NOT NULL,
-            PRIMARY KEY(chat_id, target_user_id)
+            chat_id INTEGER NOT NULL, target_user_id INTEGER NOT NULL,
+            mute_until TEXT NOT NULL, PRIMARY KEY(chat_id, target_user_id)
         )""",
         """CREATE TABLE IF NOT EXISTS contacts (
-            chat_id INTEGER PRIMARY KEY,
-            first_seen TEXT NOT NULL,
-            message_count INTEGER DEFAULT 0,
-            user_id INTEGER,
-            user_name TEXT,
-            username TEXT
+            chat_id INTEGER PRIMARY KEY, first_seen TEXT NOT NULL,
+            message_count INTEGER DEFAULT 0, user_id INTEGER,
+            user_name TEXT, username TEXT
         )""",
         """CREATE TABLE IF NOT EXISTS notes (
-            chat_id INTEGER PRIMARY KEY,
-            note TEXT,
-            updated_at TEXT
+            chat_id INTEGER PRIMARY KEY, note TEXT, updated_at TEXT
         )""",
         """CREATE TABLE IF NOT EXISTS user_limits (
-            user_id INTEGER PRIMARY KEY,
-            date TEXT NOT NULL,
-            requests_count INTEGER DEFAULT 0,
-            is_premium INTEGER DEFAULT 0,
-            premium_until TEXT,
-            last_ai_request TEXT
+            user_id INTEGER PRIMARY KEY, date TEXT NOT NULL,
+            requests_count INTEGER DEFAULT 0, is_premium INTEGER DEFAULT 0,
+            premium_until TEXT, last_ai_request TEXT
         )""",
         """CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            first_name TEXT,
-            username TEXT,
-            joined_at TEXT NOT NULL,
-            is_banned INTEGER DEFAULT 0,
-            banned_at TEXT,
-            banned_reason TEXT,
-            banned_ref INTEGER DEFAULT 0
+            user_id INTEGER PRIMARY KEY, first_name TEXT, username TEXT,
+            joined_at TEXT NOT NULL, is_banned INTEGER DEFAULT 0,
+            banned_at TEXT, banned_reason TEXT, banned_ref INTEGER DEFAULT 0
         )""",
         """CREATE TABLE IF NOT EXISTS referrals (
-            user_id INTEGER PRIMARY KEY,
-            referrer_id INTEGER NOT NULL,
-            joined_at TEXT NOT NULL,
-            rewarded_join INTEGER DEFAULT 0,
+            user_id INTEGER PRIMARY KEY, referrer_id INTEGER NOT NULL,
+            joined_at TEXT NOT NULL, rewarded_join INTEGER DEFAULT 0,
             rewarded_purchase INTEGER DEFAULT 0
         )""",
         "CREATE INDEX IF NOT EXISTS idx_ref_referrer ON referrals(referrer_id)",
         """CREATE TABLE IF NOT EXISTS pending_referrals (
-            user_id INTEGER PRIMARY KEY,
-            referrer_id INTEGER NOT NULL,
-            ts TEXT NOT NULL
+            user_id INTEGER PRIMARY KEY, referrer_id INTEGER NOT NULL, ts TEXT NOT NULL
         )""",
         """CREATE TABLE IF NOT EXISTS business_connections (
-            id TEXT PRIMARY KEY,
-            user_id INTEGER,
-            enabled INTEGER DEFAULT 1,
-            added_at TEXT
+            id TEXT PRIMARY KEY, user_id INTEGER,
+            enabled INTEGER DEFAULT 1, added_at TEXT
         )""",
         "CREATE INDEX IF NOT EXISTS idx_bc_user ON business_connections(user_id)",
         """CREATE TABLE IF NOT EXISTS business_names (
-            connection_id TEXT PRIMARY KEY,
-            base_name TEXT NOT NULL,
-            saved_at TEXT NOT NULL
+            connection_id TEXT PRIMARY KEY, base_name TEXT NOT NULL, saved_at TEXT NOT NULL
         )""",
         """CREATE TABLE IF NOT EXISTS admin_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            admin_id INTEGER NOT NULL,
-            action TEXT NOT NULL,
-            target_id INTEGER,
-            details TEXT,
-            ts TEXT NOT NULL
+            id INTEGER PRIMARY KEY AUTOINCREMENT, admin_id INTEGER NOT NULL,
+            action TEXT NOT NULL, target_id INTEGER, details TEXT, ts TEXT NOT NULL
         )""",
         """CREATE TABLE IF NOT EXISTS payments_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            stars INTEGER NOT NULL,
-            days INTEGER NOT NULL,
-            ts TEXT NOT NULL
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
+            stars INTEGER NOT NULL, days INTEGER NOT NULL, ts TEXT NOT NULL
         )""",
         """CREATE TABLE IF NOT EXISTS ai_settings (
-            user_id INTEGER PRIMARY KEY,
-            mode TEXT DEFAULT 'default',
-            custom_prompt TEXT,
-            constructor_data TEXT,
-            updated_at TEXT
+            user_id INTEGER PRIMARY KEY, mode TEXT DEFAULT 'default',
+            custom_prompt TEXT, constructor_data TEXT, updated_at TEXT
         )""",
     ]
     for stmt in statements:
@@ -311,7 +236,6 @@ async def init_db():
     log.info("Turso DB initialized")
 
 
-# ---------------- Utilities ----------------
 def utcnow():
     return datetime.now(timezone.utc)
 
@@ -349,7 +273,6 @@ def row_to_dict(row, columns):
     return {col: row[i] for i, col in enumerate(columns)}
 
 
-# ---------------- AI ----------------
 AI_PROVIDERS = [
     {"name": "groq", "url": "https://api.groq.com/openai/v1/chat/completions",
      "key_env": "GROQ_API_KEY", "model": "openai/gpt-oss-120b"},
@@ -366,21 +289,17 @@ async def get_user_prompt(user_id: int) -> str:
     premium = await is_premium(user_id)
     if not premium:
         return DEFAULT_PROMPT
-
     row = await db_fetchone(
         "SELECT mode, custom_prompt, constructor_data FROM ai_settings WHERE user_id=?",
         (user_id,)
     )
     if not row:
         return DEFAULT_PROMPT
-
     mode = row[0] or "default"
     custom_prompt = row[1]
     constructor_data = row[2]
-
     if mode == "custom" and custom_prompt:
         return custom_prompt
-
     if mode == "constructor" and constructor_data:
         try:
             data = json.loads(constructor_data)
@@ -388,7 +307,6 @@ async def get_user_prompt(user_id: int) -> str:
             for cat_key, cat in CONSTRUCTOR_CATEGORIES.items():
                 if cat_key in data and data[cat_key]:
                     val = data[cat_key]
-                    # Берём название категории без эмодзи
                     title = cat["title"].split(" ", 1)
                     cat_name = title[1] if len(title) > 1 else cat["title"]
                     parts.append(f"{cat_name}: {val}")
@@ -396,7 +314,6 @@ async def get_user_prompt(user_id: int) -> str:
                 return DEFAULT_PROMPT + "\n\nДополнительные настройки:\n" + "\n".join(parts)
         except Exception as e:
             log.warning("constructor parse error: %s", e)
-
     return DEFAULT_PROMPT
 
 
@@ -407,7 +324,6 @@ async def ask_ai(prompt: str, user_id: int = None) -> str:
             system_prompt = await get_user_prompt(user_id)
         except Exception as e:
             log.warning("get_user_prompt failed: %s", e)
-
     last_err = None
     errors_log = []
     for p in AI_PROVIDERS:
@@ -448,7 +364,6 @@ async def ask_ai(prompt: str, user_id: int = None) -> str:
     raise RuntimeError("ИИ недоступен. " + " | ".join(errors_log)[:300])
 
 
-# ---------------- Settings ----------------
 SETTINGS_COLS = ["user_id", "answer_first_enabled", "answer_first_text",
                  "time_in_nick_enabled", "timezone", "off_hours_enabled",
                  "off_hours_start", "off_hours_end", "off_hours_text",
@@ -476,7 +391,6 @@ async def set_setting(user, key, value):
     await db_execute(f"UPDATE settings SET {key}=? WHERE user_id=?", (value, user))
 
 
-# ---------------- AI settings ----------------
 async def get_ai_settings(user_id):
     row = await db_fetchone(
         "SELECT mode, custom_prompt, constructor_data, updated_at FROM ai_settings WHERE user_id=?",
@@ -484,12 +398,8 @@ async def get_ai_settings(user_id):
     )
     if not row:
         return {"mode": "default", "custom_prompt": None, "constructor_data": None, "updated_at": None}
-    return {
-        "mode": row[0] or "default",
-        "custom_prompt": row[1],
-        "constructor_data": row[2],
-        "updated_at": row[3],
-    }
+    return {"mode": row[0] or "default", "custom_prompt": row[1],
+            "constructor_data": row[2], "updated_at": row[3]}
 
 
 async def save_ai_settings(user_id, mode=None, custom_prompt=None, constructor_data=None):
@@ -508,10 +418,7 @@ async def save_ai_settings(user_id, mode=None, custom_prompt=None, constructor_d
     updates.append("updated_at=?")
     args.append(utcnow().isoformat())
     args.append(user_id)
-    await db_execute(
-        f"UPDATE ai_settings SET {', '.join(updates)} WHERE user_id=?",
-        tuple(args)
-    )
+    await db_execute(f"UPDATE ai_settings SET {', '.join(updates)} WHERE user_id=?", tuple(args))
 
 
 async def reset_ai_settings(user_id):
@@ -521,7 +428,6 @@ async def reset_ai_settings(user_id):
     )
 
 
-# ---------------- Blacklist ----------------
 async def is_blacklisted(owner, user_id):
     row = await db_fetchone("SELECT 1 FROM blacklist WHERE owner_id=? AND user_id=?", (owner, user_id))
     return row is not None
@@ -535,7 +441,6 @@ async def remove_blacklist(owner, user_id):
     await db_execute("DELETE FROM blacklist WHERE owner_id=? AND user_id=?", (owner, user_id))
 
 
-# ---------------- Notes ----------------
 async def get_note(chat_id):
     return await db_fetchone("SELECT note, updated_at FROM notes WHERE chat_id=?", (chat_id,))
 
@@ -548,7 +453,6 @@ async def set_note(chat_id, text):
     )
 
 
-# ---------------- Admin log ----------------
 async def log_admin(action, target_id=None, details=""):
     await db_execute(
         "INSERT INTO admin_log(admin_id, action, target_id, details, ts) VALUES(?,?,?,?,?)",
@@ -556,7 +460,6 @@ async def log_admin(action, target_id=None, details=""):
     )
 
 
-# ---------------- Users ----------------
 async def ensure_user(user_id, first_name=None, username=None):
     today = utcnow().strftime("%Y-%m-%d")
     await db_execute(
@@ -571,13 +474,11 @@ async def ensure_user(user_id, first_name=None, username=None):
 
 
 async def is_banned(user_id):
-    val = await db_fetchval("SELECT is_banned FROM users WHERE user_id=?", (user_id,), 0)
-    return bool(val)
+    return bool(await db_fetchval("SELECT is_banned FROM users WHERE user_id=?", (user_id,), 0))
 
 
 async def is_ref_banned(user_id):
-    val = await db_fetchval("SELECT banned_ref FROM users WHERE user_id=?", (user_id,), 0)
-    return bool(val)
+    return bool(await db_fetchval("SELECT banned_ref FROM users WHERE user_id=?", (user_id,), 0))
 
 
 async def ban_user(user_id, reason=""):
@@ -616,11 +517,9 @@ async def get_user_card(user_id):
     return row_to_dict(row, USERS_COLS), refs, msgs
 
 
-# ---------------- Premium ----------------
 async def is_premium(user_id):
     row = await db_fetchone(
-        "SELECT is_premium, premium_until FROM user_limits WHERE user_id=?",
-        (user_id,)
+        "SELECT is_premium, premium_until FROM user_limits WHERE user_id=?", (user_id,)
     )
     if not row or not row[0] or not row[1]:
         return False
@@ -669,19 +568,16 @@ async def grant_premium(user_id, hours=0, days=0):
 
 async def revoke_premium(user_id):
     await db_execute(
-        "UPDATE user_limits SET is_premium=0, premium_until=NULL WHERE user_id=?",
-        (user_id,)
+        "UPDATE user_limits SET is_premium=0, premium_until=NULL WHERE user_id=?", (user_id,)
     )
     await log_admin("revoke_premium", user_id)
 
 
-# ---------------- Limits ----------------
 async def check_limit(user_id):
     today = utcnow().strftime("%Y-%m-%d")
     premium = await is_premium(user_id)
     row = await db_fetchone(
-        "SELECT date, requests_count FROM user_limits WHERE user_id=?",
-        (user_id,)
+        "SELECT date, requests_count FROM user_limits WHERE user_id=?", (user_id,)
     )
     if not row:
         await db_execute(
@@ -726,7 +622,6 @@ async def increment_usage(user_id):
     )
 
 
-# ---------------- Referrals ----------------
 async def register_referral(new_user_id, referrer_id):
     if new_user_id == referrer_id or referrer_id == 0:
         return False
@@ -750,8 +645,7 @@ async def mark_referral_rewarded(new_user_id):
 
 async def referral_stats(user_id):
     row = await db_fetchone(
-        "SELECT COUNT(*), SUM(rewarded_purchase) FROM referrals WHERE referrer_id=?",
-        (user_id,)
+        "SELECT COUNT(*), SUM(rewarded_purchase) FROM referrals WHERE referrer_id=?", (user_id,)
     )
     if not row:
         return 0, 0
@@ -762,20 +656,15 @@ async def referral_leaderboard(limit=5, week_only=True):
     if week_only:
         start = week_start().isoformat()
         rows = await db_fetchall(
-            """SELECT r.referrer_id, COUNT(*) as cnt
-               FROM referrals r
+            """SELECT r.referrer_id, COUNT(*) as cnt FROM referrals r
                WHERE r.joined_at >= ? AND r.referrer_id != ?
-               GROUP BY r.referrer_id
-               ORDER BY cnt DESC LIMIT ?""",
+               GROUP BY r.referrer_id ORDER BY cnt DESC LIMIT ?""",
             (start, owner_id, limit)
         )
     else:
         rows = await db_fetchall(
-            """SELECT referrer_id, COUNT(*) as cnt
-               FROM referrals
-               WHERE referrer_id != ?
-               GROUP BY referrer_id
-               ORDER BY cnt DESC LIMIT ?""",
+            """SELECT referrer_id, COUNT(*) as cnt FROM referrals
+               WHERE referrer_id != ? GROUP BY referrer_id ORDER BY cnt DESC LIMIT ?""",
             (owner_id, limit)
         )
     result = []
@@ -783,23 +672,18 @@ async def referral_leaderboard(limit=5, week_only=True):
         referrer_id = row[0]
         cnt = row[1]
         urow = await db_fetchone("SELECT first_name, username FROM users WHERE user_id=?", (referrer_id,))
-        if urow:
-            name = urow[1] or urow[0] or f"id{referrer_id}"
-        else:
-            name = f"id{referrer_id}"
+        name = (urow[1] or urow[0] or f"id{referrer_id}") if urow else f"id{referrer_id}"
         result.append((referrer_id, name, cnt))
     return result
 
 
-# ---------------- Business connections ----------------
 async def get_connection_owner(connection_id):
     return await db_fetchval("SELECT user_id FROM business_connections WHERE id=?", (connection_id,))
 
 
 async def get_user_connection(user_id):
     return await db_fetchval(
-        "SELECT id FROM business_connections WHERE user_id=? AND enabled=1 LIMIT 1",
-        (user_id,)
+        "SELECT id FROM business_connections WHERE user_id=? AND enabled=1 LIMIT 1", (user_id,)
     )
 
 
@@ -821,7 +705,6 @@ async def save_base_name(connection_id, name):
     )
 
 
-# ---------------- Message payload ----------------
 def message_payload(message: Message):
     text = message.text or message.caption or ""
     ctype, file_id = "text", None
@@ -858,7 +741,6 @@ async def save_business_message(message: Message, owner_uid: int):
     text, ctype, file_id = message_payload(message)
     username = sender.username if sender else None
     display = (sender.full_name if sender else message.chat.full_name if message.chat else "Unknown")
-
     await db_execute(
         """INSERT INTO messages(chat_id,message_id,user_id,user_name,text,content_type,
                                  media_file_id,date,is_outgoing)
@@ -866,13 +748,11 @@ async def save_business_message(message: Message, owner_uid: int):
         (chat_id, message.message_id, uid, display, text, ctype, file_id,
          message.date.isoformat() if message.date else utcnow().isoformat(), int(outgoing))
     )
-
     await db_execute(
         """DELETE FROM messages WHERE chat_id=? AND id NOT IN
            (SELECT id FROM messages WHERE chat_id=? ORDER BY id DESC LIMIT ?)""",
         (chat_id, chat_id, KEEP_PER_CHAT)
     )
-
     await db_execute(
         """INSERT INTO contacts(chat_id,first_seen,message_count,user_id,user_name,username)
            VALUES(?,?,1,?,?,?)
@@ -894,7 +774,6 @@ async def find_message(chat_id, message_id):
     return row_to_dict(row, MESSAGES_COLS)
 
 
-# ---------------- Subscription ----------------
 async def check_subscription(user_id):
     now_ts = utcnow().timestamp()
     if user_id in sub_cache:
@@ -920,11 +799,9 @@ def sub_screen_kb():
 
 async def show_sub_screen(message: Message):
     await message.answer(
-        "🔒 <b>Доступ закрыт</b>\n"
-        "─────────────\n"
+        "🔒 <b>Доступ закрыт</b>\n─────────────\n"
         "Чтобы пользоваться <b>BobMod</b>, подпишитесь на канал:\n\n"
-        f"📢 <b>@{CHANNEL_USERNAME}</b>\n"
-        "<i>Обновления и новости бота</i>",
+        f"📢 <b>@{CHANNEL_USERNAME}</b>\n<i>Обновления и новости бота</i>",
         reply_markup=sub_screen_kb()
     )
 
@@ -963,7 +840,6 @@ async def cb_check_sub(call: CallbackQuery):
         await call.answer("❌ Вы ещё не подписаны!", show_alert=True)
         return
     await ensure_user(user_id, call.from_user.first_name, call.from_user.username)
-
     pending = await db_fetchone("SELECT referrer_id FROM pending_referrals WHERE user_id=?", (user_id,))
     if pending:
         referrer_id = pending[0]
@@ -980,18 +856,15 @@ async def cb_check_sub(call: CallbackQuery):
             except Exception:
                 pass
         await db_execute("DELETE FROM pending_referrals WHERE user_id=?", (user_id,))
-
     await call.answer("✅ Спасибо за подписку!", show_alert=True)
     try:
         await call.message.edit_text(
-            f"🎉 <b>Добро пожаловать в {BOT_NAME}!</b>\n\n"
-            "Нажмите /start, чтобы начать.",
+            f"🎉 <b>Добро пожаловать в {BOT_NAME}!</b>\n\nНажмите /start, чтобы начать."
         )
     except Exception:
         pass
 
 
-# ---------------- Menus ----------------
 def main_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⚙️ Настройки", callback_data="menu:settings")],
@@ -1116,20 +989,14 @@ async def cmd_admin(message: Message):
     if not message.from_user or message.from_user.id != owner_id:
         return
     await message.answer(
-        "🔐 <b>Админ-панель BobMod</b>\n"
-        "─────────────\n"
-        "Выберите раздел:",
+        "🔐 <b>Админ-панель BobMod</b>\n─────────────\nВыберите раздел:",
         reply_markup=admin_menu()
     )
 
 
 async def render_settings(msg_or_call, user_id, edit=False):
     s = await get_settings(user_id)
-    text = (
-        "⚙️ <b>Настройки BobMod</b>\n"
-        "─────────────\n"
-        "Выберите раздел для настройки:"
-    )
+    text = "⚙️ <b>Настройки BobMod</b>\n─────────────\nВыберите раздел для настройки:"
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"💬 Первый ответ: {'✅' if s['answer_first_enabled'] else '❌'}",
                               callback_data="toggle:answer_first_enabled")],
@@ -1141,8 +1008,7 @@ async def render_settings(msg_or_call, user_id, edit=False):
         [InlineKeyboardButton(text="✏️ Текст автоответа", callback_data="prompt:off_hours_text")],
         [InlineKeyboardButton(text=f"📥 Пересылка вам: {'✅' if s['forward_to_owner_enabled'] else '❌'}",
                               callback_data="toggle:forward_to_owner_enabled")],
-        [InlineKeyboardButton(text=f"🌍 Часовой пояс: {s['timezone']}",
-                              callback_data="tz:open")],
+        [InlineKeyboardButton(text=f"🌍 Часовой пояс: {s['timezone']}", callback_data="tz:open")],
         [InlineKeyboardButton(text=f"🕐 Время в имени: {'✅' if s['time_in_nick_enabled'] else '❌'}",
                               callback_data="toggle:time_in_nick_enabled")],
         back_button(),
@@ -1157,7 +1023,7 @@ async def render_settings(msg_or_call, user_id, edit=False):
 
 
 # ============================================================
-# PREMIUM-ВКЛАДКА
+# PREMIUM
 # ============================================================
 
 @router.callback_query(F.data == "menu:premium")
@@ -1169,8 +1035,7 @@ async def cb_premium(call: CallbackQuery):
 
     if not premium:
         text = (
-            "💎 <b>Premium</b>\n"
-            "─────────────\n"
+            "💎 <b>Premium</b>\n─────────────\n"
             "Что даёт Premium:\n"
             f"• <b>{PREMIUM_DAILY_LIMIT} запросов ИИ в день</b> (вместо {FREE_DAILY_LIMIT})\n"
             f"• Задержка <b>{AI_COOLDOWN_PREMIUM} сек</b> (вместо {AI_COOLDOWN_FREE})\n"
@@ -1188,8 +1053,7 @@ async def cb_premium(call: CallbackQuery):
         until = await get_premium_until(user_id)
         until_str = until.astimezone().strftime("%d.%m.%Y %H:%M") if until else "—"
         text = (
-            "💎 <b>Premium</b>\n"
-            "─────────────\n"
+            "💎 <b>Premium</b>\n─────────────\n"
             f"✅ Активен до: <b>{until_str}</b>\n\n"
             "Что вам доступно:\n"
             f"• <b>{PREMIUM_DAILY_LIMIT} запросов ИИ в день</b>\n"
@@ -1220,21 +1084,18 @@ async def cb_ai_menu_settings(call: CallbackQuery):
     if not await require_sub(call):
         return
     user_id = call.from_user.id
-    premium = await is_premium(user_id)
-    if not premium:
+    if not await is_premium(user_id):
         await call.answer("💎 Доступно только с Premium", show_alert=True)
         return
 
     ai_s = await get_ai_settings(user_id)
     mode = ai_s["mode"]
     mode_names = {"default": "Стандартный", "custom": "Свой промпт", "constructor": "Конструктор"}
-
     preview = await get_user_prompt(user_id)
     preview_short = preview[:200] + ("..." if len(preview) > 200 else "")
 
     text = (
-        "🤖 <b>Настройка ИИ</b>\n"
-        "─────────────\n"
+        "🤖 <b>Настройка ИИ</b>\n─────────────\n"
         f"Текущий режим: <b>{mode_names.get(mode, 'Стандартный')}</b>\n\n"
         f"<b>Что видит ИИ сейчас:</b>\n<i>{esc(preview_short)}</i>"
     )
@@ -1251,7 +1112,6 @@ async def cb_ai_menu_settings(call: CallbackQuery):
     await call.answer()
 
 
-# ---------- Свой промпт ----------
 @router.callback_query(F.data == "ai:custom")
 async def cb_ai_custom(call: CallbackQuery):
     if not await require_sub(call):
@@ -1263,8 +1123,7 @@ async def cb_ai_custom(call: CallbackQuery):
     ai_s = await get_ai_settings(call.from_user.id)
     current = ai_s["custom_prompt"] or "—"
     text = (
-        "✏️ <b>Свой промпт</b>\n"
-        "─────────────\n"
+        "✏️ <b>Свой промпт</b>\n─────────────\n"
         "Напишите системный промпт — то, как ИИ должен себя вести.\n\n"
         "<b>Примеры:</b>\n"
         "• <i>Ты мой личный помощник, отвечай кратко и по делу</i>\n"
@@ -1299,7 +1158,6 @@ async def cb_ai_custom_edit(call: CallbackQuery):
     await call.answer()
 
 
-# ---------- Конструктор ----------
 @router.callback_query(F.data == "ai:constructor")
 async def cb_ai_constructor(call: CallbackQuery):
     if not await require_sub(call):
@@ -1307,16 +1165,13 @@ async def cb_ai_constructor(call: CallbackQuery):
     if not await is_premium(call.from_user.id):
         await call.answer("💎 Только для Premium", show_alert=True)
         return
-
     ai_s = await get_ai_settings(call.from_user.id)
     try:
         data = json.loads(ai_s["constructor_data"]) if ai_s["constructor_data"] else {}
     except Exception:
         data = {}
-
     text = (
-        "🧩 <b>Конструктор промпта</b>\n"
-        "─────────────\n"
+        "🧩 <b>Конструктор промпта</b>\n─────────────\n"
         "Выберите параметры по категориям.\n"
         "В каждой можно выбрать готовое или нажать «✏️ Другое».\n\n"
         "<i>Когда закончите — нажмите «✅ Применить»</i>"
@@ -1326,8 +1181,7 @@ async def cb_ai_constructor(call: CallbackQuery):
         current = data.get(cat_key)
         marker = " ✅" if current else ""
         rows.append([InlineKeyboardButton(
-            text=f"{cat['title']}{marker}",
-            callback_data=f"ai:cat:{cat_key}"
+            text=f"{cat['title']}{marker}", callback_data=f"ai:cat:{cat_key}"
         )])
     rows.append([InlineKeyboardButton(text="✅ Применить", callback_data="ai:apply")])
     rows.append(back_button("ai:menu"))
@@ -1347,7 +1201,6 @@ async def cb_ai_category(call: CallbackQuery):
         await call.answer("💎 Только для Premium", show_alert=True)
         return
     parts = call.data.split(":")
-    # ai:cat:c1
     if len(parts) < 3:
         await call.answer("Ошибка формата", show_alert=True)
         return
@@ -1355,18 +1208,15 @@ async def cb_ai_category(call: CallbackQuery):
     if cat_key not in CONSTRUCTOR_CATEGORIES:
         await call.answer(f"Неизвестная категория: {cat_key}", show_alert=True)
         return
-
     cat = CONSTRUCTOR_CATEGORIES[cat_key]
     ai_s = await get_ai_settings(call.from_user.id)
     try:
         data = json.loads(ai_s["constructor_data"]) if ai_s["constructor_data"] else {}
     except Exception:
         data = {}
-
     current = data.get(cat_key)
     text = (
-        f"{cat['title']}\n"
-        "─────────────\n"
+        f"{cat['title']}\n─────────────\n"
         f"Текущее: <b>{esc(current) if current else '—'}</b>\n\n"
         "Выберите вариант:"
     )
@@ -1374,13 +1224,10 @@ async def cb_ai_category(call: CallbackQuery):
     for opt_key, opt_label in cat["options"].items():
         marker = " ✅" if current == opt_label else ""
         rows.append([InlineKeyboardButton(
-            text=f"{opt_label}{marker}",
-            callback_data=f"ai:cs:{cat_key}:{opt_key}"
+            text=f"{opt_label}{marker}", callback_data=f"ai:cs:{cat_key}:{opt_key}"
         )])
-    rows.append([InlineKeyboardButton(
-        text="✏️ Другое (написать своё)",
-        callback_data=f"ai:co:{cat_key}"
-    )])
+    rows.append([InlineKeyboardButton(text="✏️ Другое (написать своё)",
+                                       callback_data=f"ai:co:{cat_key}")])
     rows.append(back_button("ai:constructor"))
     kb = InlineKeyboardMarkup(inline_keyboard=rows)
     try:
@@ -1398,7 +1245,6 @@ async def cb_ai_cat_set(call: CallbackQuery):
         await call.answer("💎 Только для Premium", show_alert=True)
         return
     parts = call.data.split(":")
-    # ai:cs:c1:friendly
     if len(parts) < 4:
         await call.answer("Ошибка", show_alert=True)
         return
@@ -1411,19 +1257,15 @@ async def cb_ai_cat_set(call: CallbackQuery):
     if opt_key not in cat["options"]:
         await call.answer("Ошибка опции", show_alert=True)
         return
-
     label = cat["options"][opt_key]
-
     ai_s = await get_ai_settings(call.from_user.id)
     try:
         data = json.loads(ai_s["constructor_data"]) if ai_s["constructor_data"] else {}
     except Exception:
         data = {}
     data[cat_key] = label
-
     await save_ai_settings(
-        call.from_user.id,
-        mode="constructor",
+        call.from_user.id, mode="constructor",
         constructor_data=json.dumps(data, ensure_ascii=False)
     )
     await call.answer(f"✅ {label}")
@@ -1439,7 +1281,6 @@ async def cb_ai_cat_other(call: CallbackQuery):
         await call.answer("💎 Только для Premium", show_alert=True)
         return
     parts = call.data.split(":")
-    # ai:co:c1
     if len(parts) < 3:
         await call.answer("Ошибка", show_alert=True)
         return
@@ -1464,27 +1305,22 @@ async def cb_ai_apply(call: CallbackQuery):
     if not await is_premium(call.from_user.id):
         await call.answer("💎 Только для Premium", show_alert=True)
         return
-
     ai_s = await get_ai_settings(call.from_user.id)
     try:
         data = json.loads(ai_s["constructor_data"]) if ai_s["constructor_data"] else {}
     except Exception:
         data = {}
-
     if not data:
         await call.answer("Выберите хотя бы одну категорию", show_alert=True)
         return
-
     await save_ai_settings(
-        call.from_user.id,
-        mode="constructor",
+        call.from_user.id, mode="constructor",
         constructor_data=json.dumps(data, ensure_ascii=False)
     )
     await call.answer("✅ Применено!", show_alert=True)
     await cb_ai_menu_settings(call)
 
 
-# ---------- Сброс ----------
 @router.callback_query(F.data == "ai:reset")
 async def cb_ai_reset(call: CallbackQuery):
     if not await require_sub(call):
@@ -1497,19 +1333,19 @@ async def cb_ai_reset(call: CallbackQuery):
     await cb_ai_menu_settings(call)
 
 
-# ---------------- Рефералка ----------------
+# ============================================================
+# РЕФЕРАЛКА
+# ============================================================
+
 async def render_ref_panel(msg_or_call, user_id, edit=False):
     ref_link = f"https://t.me/{BOT_USERNAME}?start=ref_{user_id}"
     total, purchases = await referral_stats(user_id)
     earned_hours = total * REF_BONUS_HOURS
     earned_days = purchases * REF_BONUS_PURCHASE_DAYS
     premium = await is_premium(user_id)
-
     text = (
-        "🎁 <b>Реферальная программа</b>\n"
-        "─────────────\n"
-        f"🔗 <b>Ваша ссылка:</b>\n"
-        f"<code>{ref_link}</code>\n\n"
+        "🎁 <b>Реферальная программа</b>\n─────────────\n"
+        f"🔗 <b>Ваша ссылка:</b>\n<code>{ref_link}</code>\n\n"
         f"👥 Приглашено: <b>{total}</b>\n"
         f"💎 Часов за друзей: <b>{earned_hours}</b>\n"
         f"💰 Дней за покупки: <b>{earned_days}</b>\n"
@@ -1555,25 +1391,17 @@ async def cb_ref_battle(call: CallbackQuery):
         return
     top = await referral_leaderboard(5, week_only=True)
     if not top:
-        text = (
-            "🏆 <b>Битва рефералов</b>\n"
-            "─────────────\n"
-            "На этой неделе пока нет участников.\n"
-            "Станьте первым!"
-        )
+        text = ("🏆 <b>Битва рефералов</b>\n─────────────\n"
+                "На этой неделе пока нет участников.\nСтаньте первым!")
     else:
         medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
         lines = []
         for i, (uid, name, cnt) in enumerate(top):
             lines.append(f"{medals[i]} <b>{esc(name)}</b> — {cnt}")
-        text = (
-            "🏆 <b>Битва рефералов</b>\n"
-            "─────────────\n"
-            "Топ за эту неделю:\n\n"
-            + "\n".join(lines)
-            + "\n\n🎁 Победитель получает <b>месяц Premium</b>.\n"
-            "<i>Итоги в понедельник в @bobmodinfo</i>"
-        )
+        text = ("🏆 <b>Битва рефералов</b>\n─────────────\nТоп за эту неделю:\n\n"
+                + "\n".join(lines)
+                + "\n\n🎁 Победитель получает <b>месяц Premium</b>.\n"
+                  "<i>Итоги в понедельник в @bobmodinfo</i>")
     kb = InlineKeyboardMarkup(inline_keyboard=[back_button("menu:ref")])
     try:
         await call.message.edit_text(text, reply_markup=kb)
@@ -1582,7 +1410,10 @@ async def cb_ref_battle(call: CallbackQuery):
     await call.answer()
 
 
-# ---------------- AI-меню (Bob AI) ----------------
+# ============================================================
+# BOB AI
+# ============================================================
+
 @router.callback_query(F.data == "menu:ai")
 async def cb_ai_menu(call: CallbackQuery):
     if not await require_sub(call):
@@ -1591,14 +1422,11 @@ async def cb_ai_menu(call: CallbackQuery):
     premium = await is_premium(user_id)
     _, used, limit, _ = await check_limit(user_id)
     cooldown = AI_COOLDOWN_PREMIUM if premium else AI_COOLDOWN_FREE
-
     filled = int((used / limit) * 10) if limit else 0
     bar = "█" * filled + "░" * (10 - filled)
-
     status = "💎 <b>Premium</b>" if premium else "🆓 <b>Бесплатный тариф</b>"
     text = (
-        "🤖 <b>Bob AI</b>\n"
-        "─────────────\n"
+        "🤖 <b>Bob AI</b>\n─────────────\n"
         f"Статус: {status}\n"
         f"Использовано сегодня: <b>{used}/{limit}</b>\n"
         f"<code>{bar}</code>\n"
@@ -1635,8 +1463,7 @@ async def cb_help(call: CallbackQuery):
     if not await require_sub(call):
         return
     text = (
-        "<b>📖 Возможности бота</b>\n"
-        "─────────────\n"
+        "<b>📖 Возможности бота</b>\n─────────────\n"
         "<b>В бизнес-чатах:</b>\n"
         "<code>.ai</code> · <code>.save</code> · <code>.anim</code> · <code>.qr</code>\n"
         "<code>.whois</code> · <code>.typing</code> · <code>.mute</code>\n"
@@ -1664,7 +1491,10 @@ async def cb_settings(call: CallbackQuery):
     await call.answer()
 
 
-# ---------------- Toggles / prompts ----------------
+# ============================================================
+# TOGGLES / PROMPTS
+# ============================================================
+
 @router.callback_query(F.data.startswith("toggle:"))
 async def cb_toggle(call: CallbackQuery):
     if not await require_sub(call):
@@ -1722,7 +1552,6 @@ async def receive_setting_value(message: Message):
     if not user:
         return
 
-    # Ввод для ИИ-настроек
     if user.id in pending_ai_input:
         task = pending_ai_input.pop(user.id)
         value = (message.text or "").strip()
@@ -1753,11 +1582,11 @@ async def receive_setting_value(message: Message):
             except Exception:
                 data = {}
             data[cat_key] = value
-            await save_ai_settings(user.id, mode="constructor", constructor_data=json.dumps(data, ensure_ascii=False))
+            await save_ai_settings(user.id, mode="constructor",
+                                    constructor_data=json.dumps(data, ensure_ascii=False))
             await message.answer(f"✅ Сохранено: <b>{esc(value)}</b>")
         return
 
-    # Админские вводы
     if user.id == owner_id and owner_id in pending_admin:
         action = pending_admin.pop(owner_id)
         value = (message.text or "").strip()
@@ -1790,7 +1619,10 @@ async def receive_setting_value(message: Message):
     await render_settings(message, user.id)
 
 
-# ---------------- Timezones ----------------
+# ============================================================
+# TIMEZONES
+# ============================================================
+
 @router.callback_query(F.data == "tz:open")
 async def cb_tz_open(call: CallbackQuery):
     if not await require_sub(call):
@@ -1837,7 +1669,10 @@ async def cb_tz_manual(call: CallbackQuery):
     await call.answer()
 
 
-# ---------------- Payments ----------------
+# ============================================================
+# PAYMENTS
+# ============================================================
+
 @router.callback_query(F.data == "buy_premium")
 async def cb_buy_premium(call: CallbackQuery, bot: Bot):
     if not await require_sub(call):
@@ -1869,19 +1704,16 @@ async def payment_ok(message: Message):
     p = message.successful_payment
     if p.invoice_payload == "premium_30d":
         until = await grant_premium(user_id, days=PREMIUM_DAYS)
-
         await db_execute(
             "INSERT INTO payments_log(user_id, stars, days, ts) VALUES(?,?,?,?)",
             (user_id, PREMIUM_PRICE_STARS, PREMIUM_DAYS, utcnow().isoformat())
         )
-
         await message.answer(
             f"✅ <b>Premium активирован</b>\n\n"
             f"Теперь вам доступно <b>{PREMIUM_DAILY_LIMIT} запросов в день</b>.\n"
             f"Действует до: <b>{until.astimezone().strftime('%d.%m.%Y %H:%M')}</b>\n\n"
             "Спасибо за поддержку!"
         )
-
         try:
             name = message.from_user.full_name or f"id{user_id}"
             await bot_ref.send_message(
@@ -1892,10 +1724,8 @@ async def payment_ok(message: Message):
             )
         except Exception:
             pass
-
         row = await db_fetchone(
-            "SELECT referrer_id, rewarded_purchase FROM referrals WHERE user_id=?",
-            (user_id,)
+            "SELECT referrer_id, rewarded_purchase FROM referrals WHERE user_id=?", (user_id,)
         )
         if row and not row[1]:
             referrer_id = row[0]
@@ -1940,7 +1770,6 @@ async def cb_adm_stats(call: CallbackQuery):
     now = utcnow()
     day_ago = (now - timedelta(days=1)).isoformat()
     week_ago = (now - timedelta(days=7)).isoformat()
-
     users_total = await db_fetchval("SELECT COUNT(*) FROM users", default=0)
     users_24h = await db_fetchval("SELECT COUNT(*) FROM users WHERE joined_at >= ?", (day_ago,), 0)
     users_7d = await db_fetchval("SELECT COUNT(*) FROM users WHERE joined_at >= ?", (week_ago,), 0)
@@ -1957,10 +1786,8 @@ async def cb_adm_stats(call: CallbackQuery):
     refs_week = await db_fetchval("SELECT COUNT(*) FROM referrals WHERE joined_at >= ?", (week_ago,), 0)
     stars_total = await db_fetchval("SELECT COALESCE(SUM(stars),0) FROM payments_log", default=0)
     purchases = await db_fetchval("SELECT COUNT(*) FROM payments_log", default=0)
-
     text = (
-        "📊 <b>Статистика</b>\n"
-        "─────────────\n"
+        "📊 <b>Статистика</b>\n─────────────\n"
         f"👤 Юзеров: <b>{users_total}</b>\n"
         f"  · за 24ч: {users_24h}\n"
         f"  · за 7д: {users_7d}\n"
@@ -1992,18 +1819,10 @@ async def cb_adm_refs(call: CallbackQuery):
         return
     top_all = await referral_leaderboard(20, week_only=False)
     top_week = await referral_leaderboard(10, week_only=True)
-
-    lines_all = []
-    for i, (uid, name, cnt) in enumerate(top_all, 1):
-        lines_all.append(f"{i}. <b>{esc(name)}</b> — {cnt}")
-    lines_week = []
-    for i, (uid, name, cnt) in enumerate(top_week, 1):
-        lines_week.append(f"{i}. <b>{esc(name)}</b> — {cnt}")
-
+    lines_all = [f"{i}. <b>{esc(name)}</b> — {cnt}" for i, (uid, name, cnt) in enumerate(top_all, 1)]
+    lines_week = [f"{i}. <b>{esc(name)}</b> — {cnt}" for i, (uid, name, cnt) in enumerate(top_week, 1)]
     text = (
-        "🎁 <b>Рефералы</b>\n"
-        "─────────────\n"
-        "<b>За всё время:</b>\n"
+        "🎁 <b>Рефералы</b>\n─────────────\n<b>За всё время:</b>\n"
         + ("\n".join(lines_all) if lines_all else "<i>пусто</i>")
         + "\n\n<b>За эту неделю:</b>\n"
         + ("\n".join(lines_week) if lines_week else "<i>пусто</i>")
@@ -2025,10 +1844,7 @@ async def cb_adm_refs_publish(call: CallbackQuery):
     if call.from_user.id != owner_id:
         return
     ok = await publish_weekly_top(manual=True)
-    if ok:
-        await call.answer("✅ Отправлено в канал", show_alert=True)
-    else:
-        await call.answer("❌ Не удалось отправить", show_alert=True)
+    await call.answer("✅ Отправлено в канал" if ok else "❌ Не удалось отправить", show_alert=True)
 
 
 @router.callback_query(F.data == "adm:users")
@@ -2036,7 +1852,6 @@ async def cb_adm_users(call: CallbackQuery):
     if call.from_user.id != owner_id:
         return
     rows = await db_fetchall("SELECT * FROM users ORDER BY joined_at DESC LIMIT 20")
-
     lines = []
     for row in rows:
         u = row_to_dict(row, USERS_COLS)
@@ -2047,12 +1862,7 @@ async def cb_adm_users(call: CallbackQuery):
             d = "?"
         flag = "🚫" if u["is_banned"] else ""
         lines.append(f"• <b>{esc(name)}</b> <code>{u['user_id']}</code> {d} {flag}")
-
-    text = (
-        "👥 <b>Последние 20 юзеров</b>\n"
-        "─────────────\n"
-        + ("\n".join(lines) if lines else "<i>пусто</i>")
-    )
+    text = "👥 <b>Последние 20 юзеров</b>\n─────────────\n" + ("\n".join(lines) if lines else "<i>пусто</i>")
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔍 Поиск по ID", callback_data="adm:user_find")],
         [InlineKeyboardButton(text="🔄 Обновить", callback_data="adm:users")],
@@ -2085,10 +1895,8 @@ async def show_user_card(chat_target, uid):
         joined = datetime.fromisoformat(u["joined_at"]).astimezone().strftime("%d.%m.%Y %H:%M")
     except Exception:
         joined = "—"
-
     text = (
-        f"👤 <b>Карточка</b>\n"
-        "─────────────\n"
+        f"👤 <b>Карточка</b>\n─────────────\n"
         f"📛 <b>{esc(name)}</b>\n"
         f"🆔 <code>{uid}</code>\n"
         f"📅 Регистрация: {esc(joined)}\n"
@@ -2134,10 +1942,8 @@ async def cb_adm_user_card(call: CallbackQuery):
         joined = datetime.fromisoformat(u["joined_at"]).astimezone().strftime("%d.%m.%Y %H:%M")
     except Exception:
         joined = "—"
-
     text = (
-        f"👤 <b>Карточка</b>\n"
-        "─────────────\n"
+        f"👤 <b>Карточка</b>\n─────────────\n"
         f"📛 <b>{esc(name)}</b>\n"
         f"🆔 <code>{uid}</code>\n"
         f"📅 Регистрация: {esc(joined)}\n"
@@ -2286,7 +2092,6 @@ async def cb_adm_bans(call: CallbackQuery):
         return
     rows = await db_fetchall("SELECT * FROM users WHERE is_banned=1 ORDER BY banned_at DESC LIMIT 30")
     ref_rows = await db_fetchall("SELECT * FROM users WHERE banned_ref=1 LIMIT 30")
-
     lines = []
     for row in rows:
         u = row_to_dict(row, USERS_COLS)
@@ -2298,11 +2103,8 @@ async def cb_adm_bans(call: CallbackQuery):
         u = row_to_dict(row, USERS_COLS)
         name = u["username"] or u["first_name"] or f"id{u['user_id']}"
         ref_lines.append(f"🔒 <b>{esc(name)}</b> <code>{u['user_id']}</code>")
-
     text = (
-        "🚫 <b>Баны</b>\n"
-        "─────────────\n"
-        "<b>Юзеры:</b>\n"
+        "🚫 <b>Баны</b>\n─────────────\n<b>Юзеры:</b>\n"
         + ("\n".join(lines) if lines else "<i>пусто</i>")
         + "\n\n<b>Реф-ссылки:</b>\n"
         + ("\n".join(ref_lines) if ref_lines else "<i>пусто</i>")
@@ -2325,8 +2127,7 @@ async def cb_adm_sys(call: CallbackQuery):
     users_total = await db_fetchval("SELECT COUNT(*) FROM users", default=0)
     msgs = await db_fetchval("SELECT COUNT(*) FROM messages", default=0)
     text = (
-        "⚙️ <b>Система</b>\n"
-        "─────────────\n"
+        "⚙️ <b>Система</b>\n─────────────\n"
         f"💾 БД: <b>Turso Cloud</b>\n"
         f"🌐 URL: <code>{esc(TURSO_URL[:40])}...</code>\n"
         f"👥 Юзеров: <b>{users_total}</b>\n"
@@ -2363,7 +2164,6 @@ async def handle_admin_input(message: Message, action: str, value: str):
             return
         await show_user_card(message, uid)
         return
-
     if action.startswith("ban_reason:"):
         uid = int(action.split(":")[1])
         reason = value if value != "-" else ""
@@ -2385,16 +2185,11 @@ async def publish_weekly_top(manual=False):
             except Exception:
                 return False
         return False
-
     medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
-    lines = []
-    for i, (uid, name, cnt) in enumerate(top):
-        lines.append(f"{medals[i]} <b>{esc(name)}</b> — {cnt}")
-
+    lines = [f"{medals[i]} <b>{esc(name)}</b> — {cnt}" for i, (uid, name, cnt) in enumerate(top)]
     winner_name = top[0][1]
     text = (
-        "🏆 <b>Битва рефералов — итоги недели</b>\n"
-        "─────────────\n\n"
+        "🏆 <b>Битва рефералов — итоги недели</b>\n─────────────\n\n"
         + "\n".join(lines)
         + f"\n\n🎁 Победитель: <b>{esc(winner_name)}</b> — месяц Premium!"
     )
@@ -2406,7 +2201,6 @@ async def publish_weekly_top(manual=False):
         return False
 
 
-# ---------------- Background tasks ----------------
 async def update_all_business_names():
     while True:
         try:
@@ -2431,7 +2225,6 @@ async def update_all_business_names():
                         except Exception:
                             base_name = f"User{user_id}"
                         await save_base_name(connection_id, base_name)
-
                     clock = local_now(tz).strftime("%H:%M")
                     desired = f"{base_name} [{clock}]"[:64]
                     try:
@@ -2920,56 +2713,44 @@ async def business_commands(message: Message, bot: Bot):
                 f"🔗 Соединение: <code>{esc(bc)}</code>"
             )
         elif cmd == ".whois":
-            # Последнее входящее сообщение (не от владельца)
             row = await db_fetchone(
-            "SELECT user_id, user_name, date FROM messages "
-            "WHERE chat_id=? AND user_id IS NOT NULL AND user_id!=? AND is_outgoing=0 "
-            "ORDER BY id DESC LIMIT 1",
-            (chat_id, owner_uid)
-        )
-        if not row:
-            await edit("👤 Информации пока нет — собеседник ещё не писал.")
-        else:
-            target_uid = row[0]
-            target_name = row[1] or "—"
-
-            # Считаем сообщения этого собеседника в этом чате
-            msg_count = await db_fetchval(
-                "SELECT COUNT(*) FROM messages WHERE chat_id=? AND user_id=?",
-                (chat_id, target_uid), 0
+                "SELECT user_id, user_name FROM messages "
+                "WHERE chat_id=? AND user_id IS NOT NULL AND user_id!=? AND is_outgoing=0 "
+                "ORDER BY id DESC LIMIT 1",
+                (chat_id, owner_uid)
             )
-            # Первое сообщение собеседника в этом чате
-            first_row = await db_fetchone(
-                "SELECT date FROM messages WHERE chat_id=? AND user_id=? "
-                "ORDER BY id ASC LIMIT 1",
-                (chat_id, target_uid)
-            )
-            first_str = "—"
-            if first_row and first_row[0]:
-            try:
-                first_str = datetime.fromisoformat(first_row[0]).astimezone().strftime("%d.%m.%Y %H:%M")
-            except Exception:
-                pass
-
-            # Username из общей таблицы users (по user_id собеседника)
-            uname_row = await db_fetchone(
-                "SELECT username FROM users WHERE user_id=?",
-                (target_uid,)
-            )
-            if uname_row and uname_row[0]:
-                uname = f"@{esc(uname_row[0])}"
+            if not row:
+                await edit("👤 Информации пока нет — собеседник ещё не писал.")
             else:
-                uname = "—"
-
-            await edit(
-                "👤 <b>Информация о собеседнике</b>\n"
-                "─────────────\n"
-               f"📛 Имя: <b>{esc(target_name)}</b>\n"
-               f"🆔 ID: <code>{target_uid}</code>\n"
-               f"🔗 Username: {uname}\n"
-               f"📅 Первый контакт: {esc(first_str)}\n"
-               f"💬 Сообщений: <b>{msg_count}</b>"
-            )
+                target_uid = row[0]
+                target_name = row[1] or "—"
+                msg_count = await db_fetchval(
+                    "SELECT COUNT(*) FROM messages WHERE chat_id=? AND user_id=?",
+                    (chat_id, target_uid), 0
+                )
+                first_row = await db_fetchone(
+                    "SELECT date FROM messages WHERE chat_id=? AND user_id=? ORDER BY id ASC LIMIT 1",
+                    (chat_id, target_uid)
+                )
+                first_str = "—"
+                if first_row and first_row[0]:
+                    try:
+                        first_str = datetime.fromisoformat(first_row[0]).astimezone().strftime("%d.%m.%Y %H:%M")
+                    except Exception:
+                        first_str = "—"
+                uname_row = await db_fetchone(
+                    "SELECT username FROM users WHERE user_id=?", (target_uid,)
+                )
+                uname = f"@{esc(uname_row[0])}" if uname_row and uname_row[0] else "—"
+                await edit(
+                    "👤 <b>Информация о собеседнике</b>\n"
+                    "─────────────\n"
+                    f"📛 Имя: <b>{esc(target_name)}</b>\n"
+                    f"🆔 ID: <code>{target_uid}</code>\n"
+                    f"🔗 Username: {uname}\n"
+                    f"📅 Первый контакт: {esc(first_str)}\n"
+                    f"💬 Сообщений: <b>{msg_count}</b>"
+                )
         elif cmd == ".typing":
             try:
                 await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING, business_connection_id=bc)
@@ -3203,7 +2984,6 @@ async def business_deleted_handler(event: BusinessMessagesDeleted, bot: Bot):
             continue
         if row["is_outgoing"]:
             continue
-
         stamp = row["date"]
         try:
             stamp = datetime.fromisoformat(stamp).astimezone().strftime("%d.%m.%Y %H:%M:%S")
@@ -3372,8 +3152,7 @@ async def business_connection_handler(connection: BusinessConnection, bot: Bot):
     connection_cache[connection.id] = user_id
 
     row = await db_fetchone(
-        "SELECT enabled FROM business_connections WHERE id=?",
-        (connection.id,)
+        "SELECT enabled FROM business_connections WHERE id=?", (connection.id,)
     )
     prev_enabled = bool(row[0]) if row else None
 
