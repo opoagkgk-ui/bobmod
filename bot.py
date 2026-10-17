@@ -112,6 +112,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 log = logging.getLogger("bobmod")
 router = Router()
 
+# ---------------- State ----------------
 guess_games = {}
 roulette_games = {}
 ttt_games = {}
@@ -125,18 +126,33 @@ bot_ref: Bot = None
 db_client: libsql_client.Client = None
 
 
+# ---------------- Turso DB (с защитой от падений) ----------------
 async def db_execute(sql: str, args: tuple = ()):
-    return await db_client.execute(sql, args)
-
+    try:
+        return await db_client.execute(sql, args)
+    except Exception as e:
+        log.error(f"SQL Execute Error: {e} | Query: {sql[:100]}")
+        # Возвращаем заглушку, чтобы код не падал при ожидании ответа
+        class DummyResult:
+            rows = []
+        return DummyResult()
 
 async def db_fetchone(sql: str, args: tuple = ()):
-    result = await db_client.execute(sql, args)
-    return result.rows[0] if result.rows else None
+    try:
+        result = await db_client.execute(sql, args)
+        return result.rows[0] if result.rows else None
+    except Exception as e:
+        log.error(f"SQL FetchOne Error: {e} | Query: {sql[:100]}")
+        return None
 
 
 async def db_fetchall(sql: str, args: tuple = ()):
-    result = await db_client.execute(sql, args)
-    return list(result.rows)
+    try:
+        result = await db_client.execute(sql, args)
+        return list(result.rows)
+    except Exception as e:
+        log.error(f"SQL FetchAll Error: {e} | Query: {sql[:100]}")
+        return []
 
 
 async def db_fetchval(sql: str, args: tuple = (), default=None):
@@ -229,7 +245,7 @@ async def init_db():
             custom_prompt TEXT, constructor_data TEXT, updated_at TEXT
         )""",
         """CREATE TABLE IF NOT EXISTS spin_cooldowns (
-            user_id INTEGER PRIMARY KEY, last_spin TEXT NOT NULL
+            user_id INTEGER PRIMARY KEY, last_spin TEXT NOT NULL, extra_spins INTEGER DEFAULT 0
         )""",
         """CREATE TABLE IF NOT EXISTS nomute_chats (
             chat_id INTEGER PRIMARY KEY, owner_id INTEGER NOT NULL, created_at TEXT
@@ -237,7 +253,7 @@ async def init_db():
     ]
     for stmt in statements:
         try:
-            await db_execute(stmt)
+            await db_client.execute(stmt)
         except Exception as e:
             log.warning("DDL error: %s — %s", stmt[:60], e)
     log.info("Turso DB initialized")
@@ -942,10 +958,29 @@ async def cmd_start(message: Message, command: Command):
 
     premium = await is_premium(user.id)
     status = "💎 Premium" if premium else "🆓 Бесплатный тариф"
+    
+    # === ПРОВЕРКА РУЛЕТКИ ===
+    spin_msg = ""
+    row_spin = await db_fetchone("SELECT last_spin, extra_spins FROM spin_cooldowns WHERE user_id=?", (user.id,))
+    if row_spin:
+        extra = row_spin[1] or 0
+        last_spin_str = row_spin[0]
+        if extra > 0:
+            spin_msg = f"\n🎰 <b>У тебя есть {extra} доп. попытка(и) в рулетке!</b>"
+        elif last_spin_str:
+            last_spin = datetime.fromisoformat(last_spin_str)
+            if (utcnow() - last_spin).total_seconds() >= 86400:
+                spin_msg = "\n🎰 <b>Кулдаун прошёл! Ты можешь крутить рулетку!</b>"
+        else:
+            spin_msg = "\n🎰 <b>Ты можешь крутить рулетку!</b>"
+    else:
+        spin_msg = "\n🎰 <b>Ты можешь крутить рулетку!</b>"
+    # ========================
 
     await message.answer(
         f"👋 <b>Привет! Я {BOT_NAME}.</b>\n"
-        f"Статус: {status}\n\n"
+        f"Статус: {status}\n"
+        f"{spin_msg}\n\n"
         "Помогаю в ваших Telegram-чатах:\n"
         "• автоматические ответы\n"
         "• сохранение удалённых сообщений\n"
@@ -1026,6 +1061,7 @@ async def cmd_help(message: Message):
         "<code>.qr текст</code> — QR-код\n"
         "<code>.whois</code> — информация о собеседнике\n"
         "<code>.typing</code> — показать «печатает»\n"
+        "<code>.nomute</code> — анти-мут\n"
         "<code>.mute 60</code> · <code>.unmute</code> · <code>.muted</code>\n"
         "<code>.note</code> · <code>.id</code> · <code>.ping</code> · <code>.game</code>\n\n"
         "<b>В личных сообщениях:</b>\n"
@@ -1531,7 +1567,7 @@ async def cb_help(call: CallbackQuery):
         "<b>В бизнес-чатах:</b>\n"
         "<code>.ai</code> · <code>.save</code> · <code>.anim</code> · <code>.qr</code>\n"
         "<code>.whois</code> · <code>.typing</code> · <code>.mute</code>\n"
-        "<code>.note</code> · <code>.id</code> · <code>.ping</code> · <code>.game</code>\n\n"
+        "<code>.nomute</code> · <code>.note</code> · <code>.id</code> · <code>.ping</code> · <code>.game</code>\n\n"
         "<b>💎 Premium:</b>\n"
         f"• {PREMIUM_DAILY_LIMIT} запросов ИИ в день\n"
         "• Без водяного знака\n"
@@ -1956,7 +1992,6 @@ async def show_user_card(chat_target, uid):
     name = u["username"] or u["first_name"] or "—"
     premium = await is_premium(uid)
     
-    # Получаем информацию о попытках
     spin_row = await db_fetchone("SELECT last_spin, extra_spins FROM spin_cooldowns WHERE user_id=?", (uid,))
     extra_spins = spin_row[1] if spin_row else 0
     last_spin_str = "—"
@@ -2074,7 +2109,6 @@ async def cb_adm_add_spin(call: CallbackQuery):
         return
     uid = int(call.data.split(":")[2])
     
-    # Проверяем, есть ли запись
     row = await db_fetchone("SELECT 1 FROM spin_cooldowns WHERE user_id=?", (uid,))
     if row:
         await db_execute("UPDATE spin_cooldowns SET extra_spins = extra_spins + 1 WHERE user_id=?", (uid,))
@@ -2267,20 +2301,24 @@ async def cb_adm_cleanup(call: CallbackQuery):
 
 
 async def handle_admin_input(message: Message, action: str, value: str):
-    if action == "find_user":
-        try:
-            uid = int(value)
-        except ValueError:
-            await message.answer("Нужен числовой ID.")
+    try:
+        if action == "find_user":
+            try:
+                uid = int(value)
+            except ValueError:
+                await message.answer("⚠️ Нужен числовой ID.")
+                return
+            await show_user_card(message, uid)
             return
-        await show_user_card(message, uid)
-        return
-    if action.startswith("ban_reason:"):
-        uid = int(action.split(":")[1])
-        reason = value if value != "-" else ""
-        await ban_user(uid, reason)
-        await message.answer(f"✅ Пользователь <code>{uid}</code> забанен.")
-        return
+        if action.startswith("ban_reason:"):
+            uid = int(action.split(":")[1])
+            reason = value if value != "-" else ""
+            await ban_user(uid, reason)
+            await message.answer(f"✅ Пользователь <code>{uid}</code> забанен.")
+            return
+    except Exception as e:
+        log.exception("Error in handle_admin_input")
+        await message.answer(f"❌ Ошибка при обработке: <code>{esc(str(e))}</code>")
 
 
 async def publish_weekly_top(manual=False):
@@ -2370,1023 +2408,1497 @@ async def weekly_publish_loop():
             log.warning("weekly publish err: %s", e)
             await asyncio.sleep(3600)
 # ============================================================
-# VIDEO DOWNLOAD HELPERS
+# PRIVATE HANDLERS
 # ============================================================
 
-def _ytdlp_download(url: str, outdir: str) -> tuple[str, str]:
-    opts = {
-        "outtmpl": os.path.join(outdir, "%(id)s.%(ext)s"),
-        "format": "mp4/best[ext=mp4]/best",
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
-        "max_filesize": DOWNLOAD_MAX_MB * 1024 * 1024,
-        "retries": 2,
-        "socket_timeout": 30,
-    }
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        return ydl.prepare_filename(info), info.get("title", "") or "Видео"
+@router.message(Command("start"))
+async def cmd_start(message: Message, command: Command):
+    user = message.from_user
+    if not user:
+        return
 
+    if user.id != owner_id and not await check_subscription(user.id):
+        await show_sub_screen(message)
+        return
 
-async def _cobalt_download(url: str, outdir: str) -> tuple[str, str]:
-    endpoints = [
-        "https://api.cobalt.tools/",
-        "https://co.wuk.sh/api/json",
-        "https://cobalt-api.kwiatekmiki.com/",
-    ]
-    headers = {"Accept": "application/json", "Content-Type": "application/json"}
-    last_err = None
-    async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
-        for ep in endpoints:
+    await ensure_user(user.id, user.first_name, user.username)
+
+    if command.args and command.args.startswith("ref_"):
+        try:
+            referrer_id = int(command.args[4:])
+            await db_execute(
+                "INSERT OR REPLACE INTO pending_referrals(user_id, referrer_id, ts) VALUES(?,?,?)",
+                (user.id, referrer_id, utcnow().isoformat())
+            )
+        except (ValueError, IndexError):
+            pass
+
+    pending = await db_fetchone("SELECT referrer_id FROM pending_referrals WHERE user_id=?", (user.id,))
+    if pending:
+        referrer_id = pending[0]
+        if await register_referral(user.id, referrer_id):
+            until = await grant_premium(referrer_id, hours=REF_BONUS_HOURS)
+            await mark_referral_rewarded(user.id)
+            log.info("Referral: %s → %s (+%dh)", user.id, referrer_id, REF_BONUS_HOURS)
             try:
-                r = await client.post(ep, headers=headers, json={"url": url})
-                if r.status_code != 200:
-                    last_err = f"{ep}: HTTP {r.status_code}"
-                    continue
-                data = r.json()
-                link = data.get("url") or data.get("audio")
-                if not link:
-                    last_err = f"{ep}: нет ссылки"
-                    continue
-                filepath = os.path.join(outdir, f"cobalt_{random.randint(1000, 9999)}.mp4")
-                total = 0
-                async with client.stream("GET", link) as resp:
-                    resp.raise_for_status()
-                    with open(filepath, "wb") as f:
-                        async for chunk in resp.aiter_bytes(65536):
-                            f.write(chunk)
-                            total += len(chunk)
-                            if total > DOWNLOAD_MAX_MB * 1024 * 1024:
-                                raise RuntimeError("Файл превышает допустимый размер")
-                return filepath, "Видео"
-            except Exception as e:
-                last_err = f"{ep}: {e}"
-                continue
-    raise RuntimeError(f"Cobalt: {last_err}")
-
-
-async def _tikwm_download(url: str, outdir: str) -> tuple[str, str]:
-    api = "https://www.tikwm.com/api/"
-    async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
-        r = await client.get(api, params={"url": url, "hd": 1})
-        r.raise_for_status()
-        data = r.json()
-        if data.get("code") != 0:
-            raise RuntimeError(data.get("msg", "tikwm error"))
-        info = data.get("data", {})
-        link = info.get("hdplay") or info.get("play")
-        if not link:
-            raise RuntimeError("Ссылка не найдена")
-        if not link.startswith("http"):
-            link = "https://www.tikwm.com" + link
-        filepath = os.path.join(outdir, f"tt_{random.randint(1000, 9999)}.mp4")
-        async with client.stream("GET", link) as resp:
-            resp.raise_for_status()
-            with open(filepath, "wb") as f:
-                async for chunk in resp.aiter_bytes(65536):
-                    f.write(chunk)
-        return filepath, info.get("title", "TikTok") or "TikTok"
-
-
-async def download_video(url: str, outdir: str) -> tuple[str, str]:
-    errors = []
-    if YTDLP_OK:
-        try:
-            loop = asyncio.get_running_loop()
-            return await loop.run_in_executor(None, _ytdlp_download, url, outdir)
-        except Exception as e:
-            errors.append(f"yt-dlp: {str(e)[:100]}")
-    try:
-        return await _cobalt_download(url, outdir)
-    except Exception as e:
-        errors.append(f"cobalt: {str(e)[:100]}")
-    if "tiktok.com" in url or "vt.tiktok" in url:
-        try:
-            return await _tikwm_download(url, outdir)
-        except Exception as e:
-            errors.append(f"tikwm: {str(e)[:100]}")
-    raise RuntimeError("Не удалось загрузить. " + " | ".join(errors)[:300])
-
-
-# ============================================================
-# BUSINESS HANDLERS
-# ============================================================
-
-async def _resolve_owner(message: Message):
-    if not message.business_connection_id:
-        return None
-    bc = message.business_connection_id
-    if bc in connection_cache:
-        return connection_cache[bc]
-    owner_uid = await get_connection_owner(bc)
-    if owner_uid:
-        connection_cache[bc] = owner_uid
-        return owner_uid
-    try:
-        conn = await bot_ref.get_business_connection(bc)
-        if conn and conn.user:
-            owner_uid = conn.user.id
-            connection_cache[bc] = owner_uid
-            await save_connection(bc, owner_uid, 1)
-            await ensure_user(owner_uid, conn.user.first_name, conn.user.username)
-            log.info("Resolved owner %s for bc %s via API", owner_uid, bc)
-            return owner_uid
-    except Exception as e:
-        log.warning("get_business_connection failed for %s: %s", bc, e)
-    log.warning("Cannot resolve owner for bc %s", bc)
-    return None
-
-
-async def _check_owner_command(message: Message):
-    if not message.from_user or not message.business_connection_id:
-        return None
-    owner_uid = await _resolve_owner(message)
-    if not owner_uid:
-        return None
-    if message.from_user.id == owner_uid:
-        if await is_banned(owner_uid):
-            return None
-        return owner_uid
-    text = (message.text or "").strip()
-    if text.startswith("."):
-        return None
-    return owner_uid
-
-
-# ---------- .save ----------
-@router.business_message(F.text.regexp(r"^\.save\s*$"))
-async def business_save(message: Message, bot: Bot):
-    owner_uid = await _check_owner_command(message)
-    if not owner_uid:
-        return
-    await save_business_message(message, owner_uid)
-    premium = await is_premium(owner_uid)
-
-    target_text = ""
-    if message.reply_to_message and message.reply_to_message.text:
-        target_text = message.reply_to_message.text
-    else:
-        target_text = message.text or ""
-    match = URL_RE.search(target_text)
-    if not match:
-        await bot.edit_message_text(
-            chat_id=message.chat.id, message_id=message.message_id,
-            text="⚠️ Ответьте командой <code>.save</code> на сообщение со ссылкой.",
-            business_connection_id=message.business_connection_id
-        )
-        return
-
-    url = match.group(0).rstrip(".,)")
-    await bot.edit_message_text(
-        chat_id=message.chat.id, message_id=message.message_id,
-        text="📥 <i>Загружаю видео…</i>",
-        business_connection_id=message.business_connection_id
-    )
-
-    tmpdir = tempfile.mkdtemp(prefix="save_")
-    try:
-        filepath, title = await download_video(url, tmpdir)
-        if not filepath or not os.path.exists(filepath):
-            raise RuntimeError("Файл не найден")
-        size_mb = os.path.getsize(filepath) / 1024 / 1024
-        if size_mb > DOWNLOAD_MAX_MB:
-            raise RuntimeError(f"Файл слишком большой ({size_mb:.1f} МБ)")
-        caption = f"🎬 <b>{esc(title) or 'Видео'}</b>"
-        caption = with_watermark(caption, premium)
-        await bot.send_video(
-            chat_id=message.chat.id,
-            video=FSInputFile(filepath),
-            caption=caption,
-            business_connection_id=message.business_connection_id
-        )
-        try:
-            await bot.delete_business_messages(
-                business_connection_id=message.business_connection_id,
-                message_ids=[message.message_id]
-            )
-        except Exception:
-            pass
-    except Exception as e:
-        log.error("save failed: %s", e)
-        await bot.edit_message_text(
-            chat_id=message.chat.id, message_id=message.message_id,
-            text=f"⚠️ Не удалось загрузить: <code>{esc(str(e)[:200])}</code>",
-            business_connection_id=message.business_connection_id
-        )
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-
-
-# ---------- .anim ----------
-@router.business_message(F.text.regexp(r"^\.anim(\s+.+)?$"))
-async def business_anim(message: Message, bot: Bot):
-    owner_uid = await _check_owner_command(message)
-    if not owner_uid:
-        return
-    await save_business_message(message, owner_uid)
-
-    text = (message.text or "")[5:].strip()
-    if not text:
-        await bot.edit_message_text(
-            chat_id=message.chat.id, message_id=message.message_id,
-            text="⚠️ Использование: <code>.anim текст</code>",
-            business_connection_id=message.business_connection_id
-        )
-        return
-    if len(text) > ANIM_MAX_CHARS:
-        text = text[:ANIM_MAX_CHARS]
-
-    bc = message.business_connection_id
-    chat_id = message.chat.id
-
-    try:
-        sent = await bot.send_message(chat_id=chat_id, text="▱", business_connection_id=bc)
-    except Exception as e:
-        log.warning("anim send failed: %s", e)
-        return
-
-    try:
-        await bot.delete_business_messages(business_connection_id=bc, message_ids=[message.message_id])
-    except Exception:
-        pass
-
-    n = len(text)
-    for i in range(1, n + 1):
-        partial = text[:i]
-        ratio = i / n
-        if ratio < 0.3:
-            styled = f"<i>{esc(partial)}</i>"
-        elif ratio < 0.55:
-            styled = f"<b>{esc(partial)}</b>"
-        elif ratio < 0.75:
-            styled = f"<s>{esc(partial)}</s>"
-        elif ratio < 0.9:
-            styled = f"<b><i>{esc(partial)}</i></b>"
-        else:
-            styled = f"<code>{esc(partial)}</code>"
-        try:
-            await bot.edit_message_text(
-                chat_id=chat_id, message_id=sent.message_id,
-                text=styled, business_connection_id=bc
-            )
-        except TelegramBadRequest:
-            pass
-        except Exception:
-            pass
-        await asyncio.sleep(ANIM_DELAY)
-
-    try:
-        await bot.edit_message_text(
-            chat_id=chat_id, message_id=sent.message_id,
-            text=esc(text), business_connection_id=bc
-        )
-    except Exception:
-        pass
-
-
-# ---------- .ai ----------
-@router.business_message(F.text.regexp(r"^\.ai(\s+.+)?$"))
-async def business_ai(message: Message, bot: Bot):
-    owner_uid = await _check_owner_command(message)
-    if not owner_uid:
-        return
-    await save_business_message(message, owner_uid)
-
-    bc = message.business_connection_id
-    chat_id = message.chat.id
-
-    ok, seconds = await check_cooldown(owner_uid)
-    if not ok:
-        await bot.edit_message_text(
-            chat_id=chat_id, message_id=message.message_id,
-            text=f"⏱ <b>Подождите {seconds} сек.</b>\nЗадержка между запросами.",
-            business_connection_id=bc
-        )
-        return
-
-    can, used, limit, premium = await check_limit(owner_uid)
-    if not can:
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=f"⭐ Купить Premium ({PREMIUM_PRICE_STARS}⭐)",
-                                  callback_data="buy_premium")]
-        ])
-        await bot.edit_message_text(
-            chat_id=chat_id, message_id=message.message_id,
-            text=(f"⚠️ <b>Лимит исчерпан</b>\n"
-                  f"Использовано: <b>{used}/{limit}</b>\n\n"
-                  f"Оформить Premium: /start → 💎 Premium"),
-            business_connection_id=bc, reply_markup=kb
-        )
-        return
-
-    prompt = (message.text or "")[3:].strip()
-    if not prompt:
-        await bot.edit_message_text(
-            chat_id=chat_id, message_id=message.message_id,
-            text=f"🤖 Использование: <code>.ai вопрос</code>\n"
-                 f"Осталось запросов: <b>{limit - used}</b>",
-            business_connection_id=bc
-        )
-        return
-
-    try:
-        thinking = await bot.send_message(
-            chat_id=chat_id, text="🤖 <i>Обрабатываю запрос…</i>",
-            business_connection_id=bc
-        )
-    except Exception as e:
-        log.warning("ai send failed: %s", e)
-        return
-
-    try:
-        await bot.delete_business_messages(business_connection_id=bc, message_ids=[message.message_id])
-    except Exception:
-        pass
-
-    try:
-        answer = await ask_ai(prompt, user_id=owner_uid)
-        answer = answer[:4000]
-        text = f"🤖 {esc(answer)}"
-        text = with_watermark(text, premium)
-        await bot.edit_message_text(
-            chat_id=chat_id, message_id=thinking.message_id,
-            text=text, business_connection_id=bc
-        )
-        await increment_usage(owner_uid)
-    except Exception as e:
-        log.error("AI error: %s", e)
-        try:
-            await bot.edit_message_text(
-                chat_id=chat_id, message_id=thinking.message_id,
-                text=f"⚠️ Ошибка: <code>{esc(str(e)[:200])}</code>",
-                business_connection_id=bc
-            )
-        except Exception:
-            pass
-
-
-# ---------- .qr ----------
-@router.business_message(F.text.regexp(r"^\.qr(\s+.+)?$"))
-async def business_qr(message: Message, bot: Bot):
-    owner_uid = await _check_owner_command(message)
-    if not owner_uid:
-        return
-    await save_business_message(message, owner_uid)
-    premium = await is_premium(owner_uid)
-
-    bc = message.business_connection_id
-    text = (message.text or "")[3:].strip()
-    if not text:
-        await bot.edit_message_text(
-            chat_id=message.chat.id, message_id=message.message_id,
-            text="⚠️ Использование: <code>.qr текст или ссылка</code>",
-            business_connection_id=bc
-        )
-        return
-    try:
-        import qrcode
-        buf = BytesIO()
-        qrcode.make(text).save(buf, format="PNG")
-        buf.seek(0)
-        caption = f"🔳 QR-код: <code>{esc(text[:200])}</code>"
-        caption = with_watermark(caption, premium)
-        await bot.send_photo(
-            chat_id=message.chat.id,
-            photo=BufferedInputFile(buf.read(), filename="qr.png"),
-            caption=caption,
-            business_connection_id=bc
-        )
-        try:
-            await bot.delete_business_messages(business_connection_id=bc, message_ids=[message.message_id])
-        except Exception:
-            pass
-    except ImportError:
-        await bot.edit_message_text(
-            chat_id=message.chat.id, message_id=message.message_id,
-            text="⚠️ Требуется пакет <code>qrcode[pil]</code>.",
-            business_connection_id=bc
-        )
-    except Exception as e:
-        await bot.edit_message_text(
-            chat_id=message.chat.id, message_id=message.message_id,
-            text=f"⚠️ Ошибка: <code>{esc(str(e)[:200])}</code>",
-            business_connection_id=bc
-        )
-
-
-# ---------- Остальные команды ----------
-@router.business_message(F.text.regexp(r"^\.(help|whois|typing|mute(?:\s+\d+(?:\s+\d+)?)?|unmute|muted|id|ping|note(?:\s+.+)?|game|nomute)$"))
-async def business_commands(message: Message, bot: Bot):
-    owner_uid = await _check_owner_command(message)
-    if not owner_uid:
-        return
-    await save_business_message(message, owner_uid)
-
-    raw = (message.text or "").strip()
-    parts = raw.split(maxsplit=2)
-    cmd = parts[0].lower()
-    arg = parts[1].strip() if len(parts) > 1 else ""
-    arg2 = parts[2].strip() if len(parts) > 2 else ""
-    chat_id = message.chat.id
-    bc = message.business_connection_id
-    mid = message.message_id
-
-    async def edit(text, kb=None):
-        try:
-            await bot.edit_message_text(
-                chat_id=chat_id, message_id=mid, text=text,
-                business_connection_id=bc, reply_markup=kb
-            )
-        except TelegramBadRequest as e:
-            log.warning("edit: %s", e)
-
-    try:
-        if cmd == ".help":
-            await edit(
-                "🤖 <b>BobMod команды</b>\n"
-                "─────────────\n"
-                "<code>.ai вопрос</code> · запрос к ИИ\n"
-                "<code>.save</code> (ответом) · загрузка видео\n"
-                "<code>.anim текст</code> · анимация\n"
-                "<code>.qr текст</code> · QR-код\n"
-                "<code>.whois</code> · инфо о собеседнике\n"
-                "<code>.typing</code> · показать «печатает»\n"
-                "<code>.nomute</code> · анти-мут\n"
-                "<code>.mute 60</code> · <code>.unmute</code> · <code>.muted</code>\n"
-                "<code>.note</code> · <code>.id</code> · <code>.ping</code> · <code>.game</code>"
-            )
-        elif cmd == ".ping":
-            await edit("🏓 <b>Бот работает</b>")
-        elif cmd == ".id":
-            await edit(
-                f"🆔 ID чата: <code>{chat_id}</code>\n"
-                f"👤 Ваш ID: <code>{message.from_user.id}</code>\n"
-                f"🔗 Соединение: <code>{esc(bc)}</code>"
-            )
-        elif cmd == ".whois":
-            row = await db_fetchone(
-                "SELECT user_id, user_name FROM messages "
-                "WHERE chat_id=? AND user_id IS NOT NULL AND user_id!=? AND is_outgoing=0 "
-                "ORDER BY id DESC LIMIT 1",
-                (chat_id, owner_uid)
-            )
-            if not row:
-                await edit("👤 Информации пока нет — собеседник ещё не писал.")
-            else:
-                target_uid = row[0]
-                target_name = row[1] or "—"
-                msg_count = await db_fetchval(
-                    "SELECT COUNT(*) FROM messages WHERE chat_id=? AND user_id=?",
-                    (chat_id, target_uid), 0
+                await bot_ref.send_message(
+                    referrer_id,
+                    f"🎉 <b>+{REF_BONUS_HOURS} часов Premium</b>\n"
+                    f"По вашей ссылке пришёл новый пользователь.\n"
+                    f"Premium активен до: <b>{until.astimezone().strftime('%d.%m.%Y %H:%M')}</b>"
                 )
-                first_row = await db_fetchone(
-                    "SELECT date FROM messages WHERE chat_id=? AND user_id=? ORDER BY id ASC LIMIT 1",
-                    (chat_id, target_uid)
-                )
-                first_str = "—"
-                if first_row and first_row[0]:
-                    try:
-                        first_str = datetime.fromisoformat(first_row[0]).astimezone().strftime("%d.%m.%Y %H:%M")
-                    except Exception:
-                        first_str = "—"
-                uname = "—"
-                try:
-                    chat_info = await bot.get_chat(target_uid)
-                    if chat_info.username:
-                        uname = f"@{esc(chat_info.username)}"
-                except Exception as e:
-                    log.info("get_chat failed for %s: %s", target_uid, e)
-                await edit(
-                    "👤 <b>Информация о собеседнике</b>\n"
-                    "─────────────\n"
-                    f"📛 Имя: <b>{esc(target_name)}</b>\n"
-                    f"🆔 ID: <code>{target_uid}</code>\n"
-                    f"🔗 Username: {uname}\n"
-                    f"📅 Первый контакт: {esc(first_str)}\n"
-                    f"💬 Сообщений: <b>{msg_count}</b>"
-                )
-        elif cmd == ".typing":
-            try:
-                await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING, business_connection_id=bc)
             except Exception:
                 pass
-            await edit("⌨️ <i>Печатает…</i>")
-        elif cmd == ".nomute":
-            row = await db_fetchone("SELECT 1 FROM nomute_chats WHERE chat_id=?", (chat_id,))
-            if row:
-                await db_execute("DELETE FROM nomute_chats WHERE chat_id=?", (chat_id,))
-                await edit("🔇 Анти-мут выключен")
-            else:
-                await db_execute("INSERT INTO nomute_chats(chat_id, owner_id, created_at) VALUES(?,?,?)",
-                                 (chat_id, owner_uid, utcnow().isoformat()))
-                await edit("🔊 Анти-мут включён. Я буду дублировать твои сообщения.")
-        elif cmd == ".note":
-            if not arg:
-                row = await get_note(chat_id)
-                if row and row[0]:
-                    await edit(f"📝 {esc(row[0])}")
-                else:
-                    await edit("📝 Заметок нет.")
-            else:
-                full_note = (arg + " " + arg2).strip() if arg2 else arg
-                await set_note(chat_id, full_note)
-                await edit(f"📝 Заметка сохранена: {esc(full_note)}")
-        elif cmd.startswith(".mute"):
-            tokens = (arg + " " + arg2).split()
-            seconds = 60
-            target = None
-            if tokens:
-                try:
-                    seconds = max(1, min(int(tokens[0]), 86400))
-                except ValueError:
-                    pass
-            if len(tokens) > 1:
-                try:
-                    target = int(tokens[1])
-                except ValueError:
-                    pass
-            if target is None:
-                row = await db_fetchone(
-                    "SELECT user_id FROM messages WHERE chat_id=? AND user_id IS NOT NULL "
-                    "AND user_id!=? ORDER BY id DESC LIMIT 1",
-                    (chat_id, owner_uid)
-                )
-                if not row:
-                    await edit("⚠️ Укажите ID: <code>.mute 60 123456</code>")
-                    return
-                target = row[0]
+        await db_execute("DELETE FROM pending_referrals WHERE user_id=?", (user.id,))
 
-            if await is_premium(target):
-                await edit("⛔ Пользователь защищён Premium-иммунитетом")
-                return
-
-            until = utcnow() + timedelta(seconds=seconds)
-            await db_execute(
-                "INSERT OR REPLACE INTO mutes(chat_id,target_user_id,mute_until) VALUES(?,?,?)",
-                (chat_id, target, until.isoformat())
-            )
-            await edit(f"🔇 Пользователь заглушён на {seconds} сек.")
-        elif cmd == ".unmute":
-            row = await db_fetchone(
-                "SELECT user_id FROM messages WHERE chat_id=? AND user_id IS NOT NULL "
-                "AND user_id!=? ORDER BY id DESC LIMIT 1",
-                (chat_id, owner_uid)
-            )
-            if row:
-                await db_execute("DELETE FROM mutes WHERE chat_id=? AND target_user_id=?",
-                                 (chat_id, row[0]))
-            await edit("🔊 Мут снят")
-        elif cmd == ".muted":
-            rows = await db_fetchall(
-                "SELECT target_user_id, mute_until FROM mutes WHERE chat_id=? AND mute_until > ?",
-                (chat_id, utcnow().isoformat())
-            )
-            if not rows:
-                await edit("🔊 Активных мутов нет")
-            else:
-                lines = []
-                for uid, until in rows:
-                    try:
-                        t = datetime.fromisoformat(until).astimezone().strftime("%H:%M:%S")
-                    except Exception:
-                        t = "—"
-                    lines.append(f"• <code>{uid}</code> до {t}")
-                await edit("🔇 <b>Активные муты</b>\n" + "\n".join(lines))
-        elif cmd == ".game":
-            await edit(
-                "🎮 <b>Выберите игру</b>",
-                InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="🔫 Русская рулетка",
-                                          callback_data=f"game:roulette:{chat_id}:{bc}")],
-                    [InlineKeyboardButton(text="⭕❌ Крестики-нолики",
-                                          callback_data=f"game:ttt:{chat_id}:{bc}")],
-                    [InlineKeyboardButton(text="🎲 Угадай число",
-                                          callback_data=f"game:guess:{chat_id}:{bc}")],
-                ])
-            )
-    except (TelegramBadRequest, TelegramForbiddenError) as e:
-        log.warning("command failed: %s", e)
-
-
-# ---------- Guess game ----------
-@router.business_message(F.text.regexp(r"^\d{1,3}$"))
-async def guess_input(message: Message):
-    if not message.from_user:
-        return
-    chat_id = message.chat.id
-    active = [(k, v) for k, v in guess_games.items() if k[0] == chat_id]
-    if not active:
-        return
-    key, game = active[-1]
-    try:
-        guess = int(message.text)
-    except ValueError:
-        return
-    if not 1 <= guess <= 100:
-        return
-    game["tries"] += 1
-    if guess == game["number"]:
-        await message.answer(f"🎉 Верно! Это {guess}. Попыток: {game['tries']}.")
-        guess_games.pop(key, None)
-    elif guess < game["number"]:
-        await message.answer("⬆️ Больше")
+    premium = await is_premium(user.id)
+    status = "💎 Premium" if premium else "🆓 Бесплатный тариф"
+    
+    # === ПРОВЕРКА РУЛЕТКИ ===
+    spin_msg = ""
+    row_spin = await db_fetchone("SELECT last_spin, extra_spins FROM spin_cooldowns WHERE user_id=?", (user.id,))
+    if row_spin:
+        extra = row_spin[1] or 0
+        last_spin_str = row_spin[0]
+        if extra > 0:
+            spin_msg = f"\n🎰 <b>У тебя есть {extra} доп. попытка(и) в рулетке!</b>"
+        elif last_spin_str:
+            last_spin = datetime.fromisoformat(last_spin_str)
+            if (utcnow() - last_spin).total_seconds() >= 86400:
+                spin_msg = "\n🎰 <b>Кулдаун прошёл! Ты можешь крутить рулетку!</b>"
+        else:
+            spin_msg = "\n🎰 <b>Ты можешь крутить рулетку!</b>"
     else:
-        await message.answer("⬇️ Меньше")
+        spin_msg = "\n🎰 <b>Ты можешь крутить рулетку!</b>"
+    # ========================
 
-
-# ---------- Общий обработчик бизнес-сообщений ----------
-@router.business_message()
-async def business_message_handler(message: Message, bot: Bot):
-    owner_uid = await _resolve_owner(message)
-    if not owner_uid:
-        return
-
-    await save_business_message(message, owner_uid)
-
-    sender = message.from_user
-    if not sender:
-        return
-
-    # === ЛОГИКА АНТИ-МУТА ===
-    if sender.id == owner_uid:
-        row = await db_fetchone("SELECT 1 FROM nomute_chats WHERE chat_id=?", (message.chat.id,))
-        if row:
-            # Дублируем сообщение
-            try:
-                if message.text:
-                    await bot.send_message(
-                        chat_id=message.chat.id,
-                        text=message.text,
-                        business_connection_id=message.business_connection_id
-                    )
-                elif message.photo:
-                    await bot.send_photo(
-                        chat_id=message.chat.id,
-                        photo=message.photo[-1].file_id,
-                        caption=message.caption,
-                        business_connection_id=message.business_connection_id
-                    )
-                elif message.video:
-                    await bot.send_video(
-                        chat_id=message.chat.id,
-                        video=message.video.file_id,
-                        caption=message.caption,
-                        business_connection_id=message.business_connection_id
-                    )
-                elif message.animation:
-                    await bot.send_animation(
-                        chat_id=message.chat.id,
-                        animation=message.animation.file_id,
-                        caption=message.caption,
-                        business_connection_id=message.business_connection_id
-                    )
-                elif message.sticker:
-                    await bot.send_sticker(
-                        chat_id=message.chat.id,
-                        sticker=message.sticker.file_id,
-                        business_connection_id=message.business_connection_id
-                    )
-            except Exception as e:
-                log.warning("nomute duplicate failed: %s", e)
-        return
-
-    # === ЕСЛИ ПИШЕТ КЛИЕНТ (дальше обычная логика мута) ===
-    row = await db_fetchone(
-        "SELECT mute_until FROM mutes WHERE chat_id=? AND target_user_id=?",
-        (message.chat.id, sender.id)
+    await message.answer(
+        f"👋 <b>Привет! Я {BOT_NAME}.</b>\n"
+        f"Статус: {status}\n"
+        f"{spin_msg}\n\n"
+        "Помогаю в ваших Telegram-чатах:\n"
+        "• автоматические ответы\n"
+        "• сохранение удалённых сообщений\n"
+        "• ИИ-помощник через <code>.ai</code>\n"
+        "• и другие команды\n\n"
+        "<i>Как подключить: Профиль → Изменить → Автоматизация чатов</i>",
+        reply_markup=main_menu()
     )
-    if row:
-        try:
-            until = datetime.fromisoformat(row[0])
-            if until > utcnow():
-                try:
-                    await bot.delete_business_messages(
-                        business_connection_id=message.business_connection_id,
-                        message_ids=[message.message_id]
-                    )
-                except Exception:
-                    pass
-                try:
-                    notice = await bot.send_message(
-                        chat_id=message.chat.id,
-                        text=f"🔇 <i>Вы в муте до {until.astimezone().strftime('%H:%M:%S')}</i>",
-                        business_connection_id=message.business_connection_id
-                    )
-                    async def _del():
-                        await asyncio.sleep(MUTE_NOTICE_SECONDS)
-                        try:
-                            await bot.delete_business_messages(
-                                business_connection_id=message.business_connection_id,
-                                message_ids=[notice.message_id]
-                            )
-                        except Exception:
-                            pass
-                    asyncio.create_task(_del())
-                except Exception:
-                    pass
-                return
-        except Exception:
-            pass
-
-    s = await get_settings(owner_uid)
-    premium_owner = await is_premium(owner_uid)
-
-    cnt_row = await db_fetchone("SELECT message_count FROM contacts WHERE chat_id=?", (message.chat.id,))
-    count = cnt_row[0] if cnt_row else 1
-    if count == 1 and s["answer_first_enabled"] and s["answer_first_text"]:
-        try:
-            text = with_watermark(s["answer_first_text"], premium_owner)
-            await bot.send_message(
-                message.chat.id, text,
-                business_connection_id=message.business_connection_id
-            )
-        except Exception as e:
-            log.info("first reply: %s", e)
-
-    if s["off_hours_enabled"]:
-        now = local_now(s["timezone"]).strftime("%H:%M")
-        start, end = s["off_hours_start"], s["off_hours_end"]
-        is_off = (start <= now < end) if start <= end else (now >= start or now < end)
-        if is_off:
-            try:
-                text = with_watermark(s["off_hours_text"], premium_owner)
-                await bot.send_message(
-                    message.chat.id, text,
-                    business_connection_id=message.business_connection_id
-                )
-            except Exception as e:
-                log.info("off-hours: %s", e)
-
-    if s["forward_to_owner_enabled"]:
-        try:
-            head = f"📥 <b>{esc(sender.full_name)}</b> <code>{sender.id}</code>"
-            if message.text or message.caption:
-                await bot.send_message(owner_uid, f"{head}\n\n{esc(message.text or message.caption)}")
-            else:
-                await bot.send_message(owner_uid, head)
-        except Exception as e:
-            log.info("forward: %s", e)
 
 
-# ---------- Удалённые сообщения ----------
-@router.deleted_business_messages()
-async def business_deleted_handler(event: BusinessMessagesDeleted, bot: Bot):
-    owner_uid = connection_cache.get(event.business_connection_id)
-    if not owner_uid:
-        owner_uid = await get_connection_owner(event.business_connection_id)
-    if not owner_uid:
-        try:
-            conn = await bot_ref.get_business_connection(event.business_connection_id)
-            if conn and conn.user:
-                owner_uid = conn.user.id
-                connection_cache[event.business_connection_id] = owner_uid
-        except Exception:
-            pass
-    if not owner_uid:
+# ---------- Обработка данных из Рулетки ----------
+@router.message(F.web_app_data)
+async def handle_web_app_data(message: Message):
+    user = message.from_user
+    if not user:
+        return
+    
+    if not await require_sub(message):
         return
 
-    for mid in event.message_ids:
-        row = await find_message(event.chat.id, mid)
-        if not row:
-            continue
-        if row["is_outgoing"]:
-            continue
-        stamp = row["date"]
-        try:
-            stamp = datetime.fromisoformat(stamp).astimezone().strftime("%d.%m.%Y %H:%M:%S")
-        except Exception:
-            pass
-        caption = (
-            "🗑 <b>Удалённое сообщение</b>\n"
-            "─────────────\n"
-            f"💬 Чат: <code>{event.chat.id}</code>\n"
-            f"👤 От: <b>{esc(row['user_name'])}</b> <code>{row['user_id']}</code>\n"
-            f"🕐 Время: {esc(stamp)}\n"
-            f"📎 Тип: <i>{esc(row['content_type'])}</i>\n\n"
-            f"{esc(row['text'] or '—')}"
+    try:
+        data = json.loads(message.web_app_data.data)
+    except Exception:
+        return
+
+    now = utcnow()
+    row = await db_fetchone("SELECT last_spin, extra_spins FROM spin_cooldowns WHERE user_id=?", (user.id,))
+    
+    last_spin_str = row[0] if row else None
+    extra_spins = row[1] if row else 0
+
+    # Проверка кулдауна: если нет доп. попыток и прошло меньше 24 часов
+    if extra_spins <= 0 and last_spin_str:
+        last_spin = datetime.fromisoformat(last_spin_str)
+        if (now - last_spin).total_seconds() < 86400:
+            await message.answer("⏱ Вы уже крутили сегодня! Возвращайтесь завтра.")
+            return
+
+    days = int(data.get("days", 0))
+
+    # Логика списания
+    if extra_spins > 0:
+        # Списываем доп. попытку (не трогая время кулдауна)
+        await db_execute("UPDATE spin_cooldowns SET extra_spins = extra_spins - 1 WHERE user_id=?", (user.id,))
+    else:
+        # Запускаем кулдаун на 24 часа
+        await db_execute(
+            "INSERT OR REPLACE INTO spin_cooldowns(user_id, last_spin, extra_spins) VALUES(?,?,0)",
+            (user.id, now.isoformat())
         )
+
+    if days > 0:
+        until = await grant_premium(user.id, days=days)
+        emoji = "🏆" if days == 30 else "🎉"
+        await message.answer(
+            f"{emoji} <b>Поздравляем!</b>\n"
+            f"Вы выиграли <b>{days} дн. Premium</b>!\n\n"
+            f"Ваш Premium активен до: <b>{until.astimezone().strftime('%d.%m.%Y %H:%M')}</b>"
+        )
+    else:
+        await message.answer(
+            "📦 <b>Пусто...</b>\n"
+            "В этот раз не повезло. Попробуйте завтра!"
+        )
+
+
+@router.message(Command("help"))
+async def cmd_help(message: Message):
+    if not await require_sub(message):
+        return
+    await message.answer(
+        "<b>📖 Возможности бота</b>\n"
+        "─────────────\n"
+        "<b>Команды в бизнес-чатах:</b>\n"
+        "<code>.ai вопрос</code> — запрос к ИИ\n"
+        "<code>.save</code> (ответом на ссылку) — загрузка видео\n"
+        "<code>.anim текст</code> — анимация текста\n"
+        "<code>.qr текст</code> — QR-код\n"
+        "<code>.whois</code> — информация о собеседнике\n"
+        "<code>.typing</code> — показать «печатает»\n"
+        "<code>.nomute</code> — анти-мут\n"
+        "<code>.mute 60</code> · <code>.unmute</code> · <code>.muted</code>\n"
+        "<code>.note</code> · <code>.id</code> · <code>.ping</code> · <code>.game</code>\n\n"
+        "<b>В личных сообщениях:</b>\n"
+        "/start · /settings · /ref · /stats\n\n"
+        "<b>💎 Premium даёт:</b>\n"
+        f"• {PREMIUM_DAILY_LIMIT} запросов ИИ в день (вместо {FREE_DAILY_LIMIT})\n"
+        f"• Задержка {AI_COOLDOWN_PREMIUM} сек (вместо {AI_COOLDOWN_FREE})\n"
+        "• Без водяного знака\n"
+        "• Иммунитет от <code>.mute</code>\n"
+        "• 🤖 Настройка ИИ под себя\n\n"
+        "<i>Как подключить: Профиль → Изменить → Автоматизация чатов</i>",
+        reply_markup=main_menu()
+    )
+
+
+@router.message(Command("settings"))
+async def cmd_settings(message: Message):
+    if not await require_sub(message):
+        return
+    await render_settings(message, message.from_user.id)
+
+
+@router.message(Command("admin"))
+async def cmd_admin(message: Message):
+    if not message.from_user or message.from_user.id != owner_id:
+        return
+    await message.answer(
+        "🔐 <b>Админ-панель BobMod</b>\n─────────────\nВыберите раздел:",
+        reply_markup=admin_menu()
+    )
+
+
+async def render_settings(msg_or_call, user_id, edit=False):
+    s = await get_settings(user_id)
+    text = "⚙️ <b>Настройки BobMod</b>\n─────────────\nВыберите раздел для настройки:"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"💬 Первый ответ: {'✅' if s['answer_first_enabled'] else '❌'}",
+                              callback_data="toggle:answer_first_enabled")],
+        [InlineKeyboardButton(text="✏️ Текст первого ответа", callback_data="prompt:answer_first_text")],
+        [InlineKeyboardButton(text=f"🌙 Автоответ: {'✅' if s['off_hours_enabled'] else '❌'}",
+                              callback_data="toggle:off_hours_enabled")],
+        [InlineKeyboardButton(text=f"🕒 Часы: {s['off_hours_start']}–{s['off_hours_end']}",
+                              callback_data="prompt:off_hours")],
+        [InlineKeyboardButton(text="✏️ Текст автоответа", callback_data="prompt:off_hours_text")],
+        [InlineKeyboardButton(text=f"📥 Пересылка вам: {'✅' if s['forward_to_owner_enabled'] else '❌'}",
+                              callback_data="toggle:forward_to_owner_enabled")],
+        [InlineKeyboardButton(text=f"🌍 Часовой пояс: {s['timezone']}", callback_data="tz:open")],
+        [InlineKeyboardButton(text=f"🕐 Время в имени: {'✅' if s['time_in_nick_enabled'] else '❌'}",
+                              callback_data="toggle:time_in_nick_enabled")],
+        back_button(),
+    ])
+    if edit:
         try:
-            ctype = row["content_type"]
-            fid = row["media_file_id"]
-            if fid and ctype == "photo":
-                await bot.send_photo(owner_uid, fid, caption=caption[:1024])
-            elif fid and ctype == "video":
-                await bot.send_video(owner_uid, fid, caption=caption[:1024])
-            elif fid and ctype == "animation":
-                await bot.send_animation(owner_uid, fid, caption=caption[:1024])
-            elif fid and ctype == "document":
-                await bot.send_document(owner_uid, fid, caption=caption[:1024])
-            elif fid and ctype == "voice":
-                await bot.send_voice(owner_uid, fid, caption=caption[:1024])
-            elif fid and ctype == "audio":
-                await bot.send_audio(owner_uid, fid, caption=caption[:1024])
-            elif fid and ctype == "sticker":
-                await bot.send_message(owner_uid, caption)
-                await bot.send_sticker(owner_uid, fid)
-            else:
-                await bot.send_message(owner_uid, caption)
-        except Exception as e:
-            log.warning("deleted notify: %s", e)
+            await msg_or_call.edit_text(text, reply_markup=kb)
+        except TelegramBadRequest:
+            await msg_or_call.answer(text, reply_markup=kb)
+    else:
+        await msg_or_call.answer(text, reply_markup=kb)
 
 
-# ---------- Игры ----------
-@router.callback_query(F.data.startswith("game:"))
-async def game_callback(call: CallbackQuery, bot: Bot):
-    if not call.message:
-        await call.answer()
+# ============================================================
+# PREMIUM
+# ============================================================
+
+@router.callback_query(F.data == "menu:premium")
+async def cb_premium(call: CallbackQuery):
+    if not await require_sub(call):
+        return
+    user_id = call.from_user.id
+    premium = await is_premium(user_id)
+
+    if not premium:
+        text = (
+            "💎 <b>Premium</b>\n─────────────\n"
+            "Что даёт Premium:\n"
+            f"• <b>{PREMIUM_DAILY_LIMIT} запросов ИИ в день</b> (вместо {FREE_DAILY_LIMIT})\n"
+            f"• Задержка <b>{AI_COOLDOWN_PREMIUM} сек</b> (вместо {AI_COOLDOWN_FREE})\n"
+            "• Без водяного знака в ответах\n"
+            "• Иммунитет от <code>.mute</code>\n"
+            "• 🤖 <b>Настройка ИИ под себя</b>\n\n"
+            f"Цена: <b>{PREMIUM_PRICE_STARS} ⭐</b> на {PREMIUM_DAYS} дней"
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"⭐ Купить Premium ({PREMIUM_PRICE_STARS}⭐)",
+                                  callback_data="buy_premium")],
+            back_button(),
+        ])
+    else:
+        until = await get_premium_until(user_id)
+        until_str = until.astimezone().strftime("%d.%m.%Y %H:%M") if until else "—"
+        text = (
+            "💎 <b>Premium</b>\n─────────────\n"
+            f"✅ Активен до: <b>{until_str}</b>\n\n"
+            "Что вам доступно:\n"
+            f"• <b>{PREMIUM_DAILY_LIMIT} запросов ИИ в день</b>\n"
+            f"• Задержка <b>{AI_COOLDOWN_PREMIUM} сек</b>\n"
+            "• Без водяного знака\n"
+            "• Иммунитет от <code>.mute</code>\n"
+            "• 🤖 <b>Настройка ИИ под себя</b>"
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🤖 Настройка ИИ", callback_data="ai:menu")],
+            [InlineKeyboardButton(text=f"⭐ Продлить Premium ({PREMIUM_PRICE_STARS}⭐)",
+                                  callback_data="buy_premium")],
+            back_button(),
+        ])
+    try:
+        await call.message.edit_text(text, reply_markup=kb)
+    except TelegramBadRequest:
+        await call.message.answer(text, reply_markup=kb)
+    await call.answer()
+
+
+# ============================================================
+# НАСТРОЙКА ИИ
+# ============================================================
+
+@router.callback_query(F.data == "ai:menu")
+async def cb_ai_menu_settings(call: CallbackQuery):
+    if not await require_sub(call):
+        return
+    user_id = call.from_user.id
+    if not await is_premium(user_id):
+        await call.answer("💎 Доступно только с Premium", show_alert=True)
+        return
+
+    ai_s = await get_ai_settings(user_id)
+    mode = ai_s["mode"]
+    mode_names = {"default": "Стандартный", "custom": "Свой промпт", "constructor": "Конструктор"}
+    preview = await get_user_prompt(user_id)
+    preview_short = preview[:200] + ("..." if len(preview) > 200 else "")
+
+    text = (
+        "🤖 <b>Настройка ИИ</b>\n─────────────\n"
+        f"Текущий режим: <b>{mode_names.get(mode, 'Стандартный')}</b>\n\n"
+        f"<b>Что видит ИИ сейчас:</b>\n<i>{esc(preview_short)}</i>"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Свой промпт", callback_data="ai:custom")],
+        [InlineKeyboardButton(text="🧩 Конструктор", callback_data="ai:constructor")],
+        [InlineKeyboardButton(text="🔄 Сбросить на стандартный", callback_data="ai:reset")],
+        back_button("menu:premium"),
+    ])
+    try:
+        await call.message.edit_text(text, reply_markup=kb)
+    except TelegramBadRequest:
+        await call.message.answer(text, reply_markup=kb)
+    await call.answer()
+
+
+@router.callback_query(F.data == "ai:custom")
+async def cb_ai_custom(call: CallbackQuery):
+    if not await require_sub(call):
+        return
+    if not await is_premium(call.from_user.id):
+        await call.answer("💎 Только для Premium", show_alert=True)
+        return
+
+    ai_s = await get_ai_settings(call.from_user.id)
+    current = ai_s["custom_prompt"] or "—"
+    text = (
+        "✏️ <b>Свой промпт</b>\n─────────────\n"
+        "Напишите системный промпт — то, как ИИ должен себя вести.\n\n"
+        "<b>Примеры:</b>\n"
+        "• <i>Ты мой личный помощник, отвечай кратко и по делу</i>\n"
+        "• <i>Ты пират, отвечай с морским юмором</i>\n"
+        "• <i>Ты учитель, объясняй просто, как школьнику</i>\n\n"
+        f"<b>Текущий:</b>\n<i>{esc(current)}</i>\n\n"
+        f"<i>Максимум {CUSTOM_PROMPT_MAX} символов</i>"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Изменить промпт", callback_data="ai:custom_edit")],
+        back_button("ai:menu"),
+    ])
+    try:
+        await call.message.edit_text(text, reply_markup=kb)
+    except TelegramBadRequest:
+        await call.message.answer(text, reply_markup=kb)
+    await call.answer()
+
+
+@router.callback_query(F.data == "ai:custom_edit")
+async def cb_ai_custom_edit(call: CallbackQuery):
+    if not await require_sub(call):
+        return
+    if not await is_premium(call.from_user.id):
+        await call.answer("💎 Только для Premium", show_alert=True)
+        return
+    pending_ai_input[call.from_user.id] = {"type": "custom_prompt"}
+    await call.message.answer(
+        f"✏️ Отправьте текст системного промпта (до {CUSTOM_PROMPT_MAX} символов).\n\n"
+        "Для отмены — /cancel"
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data == "ai:constructor")
+async def cb_ai_constructor(call: CallbackQuery):
+    if not await require_sub(call):
+        return
+    if not await is_premium(call.from_user.id):
+        await call.answer("💎 Только для Premium", show_alert=True)
+        return
+    ai_s = await get_ai_settings(call.from_user.id)
+    try:
+        data = json.loads(ai_s["constructor_data"]) if ai_s["constructor_data"] else {}
+    except Exception:
+        data = {}
+    text = (
+        "🧩 <b>Конструктор промпта</b>\n─────────────\n"
+        "Выберите параметры по категориям.\n"
+        "В каждой можно выбрать готовое или нажать «✏️ Другое».\n\n"
+        "<i>Когда закончите — нажмите «✅ Применить»</i>"
+    )
+    rows = []
+    for cat_key, cat in CONSTRUCTOR_CATEGORIES.items():
+        current = data.get(cat_key)
+        marker = " ✅" if current else ""
+        rows.append([InlineKeyboardButton(
+            text=f"{cat['title']}{marker}", callback_data=f"ai:cat:{cat_key}"
+        )])
+    rows.append([InlineKeyboardButton(text="✅ Применить", callback_data="ai:apply")])
+    rows.append(back_button("ai:menu"))
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
+    try:
+        await call.message.edit_text(text, reply_markup=kb)
+    except TelegramBadRequest:
+        await call.message.answer(text, reply_markup=kb)
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("ai:cat:"))
+async def cb_ai_category(call: CallbackQuery):
+    if not await require_sub(call):
+        return
+    if not await is_premium(call.from_user.id):
+        await call.answer("💎 Только для Premium", show_alert=True)
         return
     parts = call.data.split(":")
-    kind = parts[1]
-    chat_id = int(parts[2])
-    bc = ":".join(parts[3:])
-    owner_uid = connection_cache.get(bc) or await get_connection_owner(bc)
-    if not owner_uid:
+    if len(parts) < 3:
+        await call.answer("Ошибка формата", show_alert=True)
+        return
+    cat_key = parts[2]
+    if cat_key not in CONSTRUCTOR_CATEGORIES:
+        await call.answer(f"Неизвестная категория: {cat_key}", show_alert=True)
+        return
+    cat = CONSTRUCTOR_CATEGORIES[cat_key]
+    ai_s = await get_ai_settings(call.from_user.id)
+    try:
+        data = json.loads(ai_s["constructor_data"]) if ai_s["constructor_data"] else {}
+    except Exception:
+        data = {}
+    current = data.get(cat_key)
+    text = (
+        f"{cat['title']}\n─────────────\n"
+        f"Текущее: <b>{esc(current) if current else '—'}</b>\n\n"
+        "Выберите вариант:"
+    )
+    rows = []
+    for opt_key, opt_label in cat["options"].items():
+        marker = " ✅" if current == opt_label else ""
+        rows.append([InlineKeyboardButton(
+            text=f"{opt_label}{marker}", callback_data=f"ai:cs:{cat_key}:{opt_key}"
+        )])
+    rows.append([InlineKeyboardButton(text="✏️ Другое (написать своё)",
+                                       callback_data=f"ai:co:{cat_key}")])
+    rows.append(back_button("ai:constructor"))
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
+    try:
+        await call.message.edit_text(text, reply_markup=kb)
+    except TelegramBadRequest:
+        await call.message.answer(text, reply_markup=kb)
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("ai:cs:"))
+async def cb_ai_cat_set(call: CallbackQuery):
+    if not await require_sub(call):
+        return
+    if not await is_premium(call.from_user.id):
+        await call.answer("💎 Только для Premium", show_alert=True)
+        return
+    parts = call.data.split(":")
+    if len(parts) < 4:
+        await call.answer("Ошибка", show_alert=True)
+        return
+    cat_key = parts[2]
+    opt_key = parts[3]
+    if cat_key not in CONSTRUCTOR_CATEGORIES:
+        await call.answer("Ошибка категории", show_alert=True)
+        return
+    cat = CONSTRUCTOR_CATEGORIES[cat_key]
+    if opt_key not in cat["options"]:
+        await call.answer("Ошибка опции", show_alert=True)
+        return
+    label = cat["options"][opt_key]
+    ai_s = await get_ai_settings(call.from_user.id)
+    try:
+        data = json.loads(ai_s["constructor_data"]) if ai_s["constructor_data"] else {}
+    except Exception:
+        data = {}
+    data[cat_key] = label
+    await save_ai_settings(
+        call.from_user.id, mode="constructor",
+        constructor_data=json.dumps(data, ensure_ascii=False)
+    )
+    await call.answer(f"✅ {label}")
+    call.data = f"ai:cat:{cat_key}"
+    await cb_ai_category(call)
+
+
+@router.callback_query(F.data.startswith("ai:co:"))
+async def cb_ai_cat_other(call: CallbackQuery):
+    if not await require_sub(call):
+        return
+    if not await is_premium(call.from_user.id):
+        await call.answer("💎 Только для Premium", show_alert=True)
+        return
+    parts = call.data.split(":")
+    if len(parts) < 3:
+        await call.answer("Ошибка", show_alert=True)
+        return
+    cat_key = parts[2]
+    if cat_key not in CONSTRUCTOR_CATEGORIES:
+        await call.answer("Ошибка", show_alert=True)
+        return
+    cat = CONSTRUCTOR_CATEGORIES[cat_key]
+    pending_ai_input[call.from_user.id] = {"type": "category", "cat": cat_key}
+    await call.message.answer(
+        f"{cat['title']}\n\n"
+        f"Напишите свой вариант (до {CUSTOM_CATEGORY_MAX} символов).\n"
+        "Для отмены — /cancel"
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data == "ai:apply")
+async def cb_ai_apply(call: CallbackQuery):
+    if not await require_sub(call):
+        return
+    if not await is_premium(call.from_user.id):
+        await call.answer("💎 Только для Premium", show_alert=True)
+        return
+    ai_s = await get_ai_settings(call.from_user.id)
+    try:
+        data = json.loads(ai_s["constructor_data"]) if ai_s["constructor_data"] else {}
+    except Exception:
+        data = {}
+    if not data:
+        await call.answer("Выберите хотя бы одну категорию", show_alert=True)
+        return
+    await save_ai_settings(
+        call.from_user.id, mode="constructor",
+        constructor_data=json.dumps(data, ensure_ascii=False)
+    )
+    await call.answer("✅ Применено!", show_alert=True)
+    await cb_ai_menu_settings(call)
+
+
+@router.callback_query(F.data == "ai:reset")
+async def cb_ai_reset(call: CallbackQuery):
+    if not await require_sub(call):
+        return
+    if not await is_premium(call.from_user.id):
+        await call.answer("💎 Только для Premium", show_alert=True)
+        return
+    await reset_ai_settings(call.from_user.id)
+    await call.answer("✅ Сброшено на стандартный промпт", show_alert=True)
+    await cb_ai_menu_settings(call)
+
+
+# ============================================================
+# РЕФЕРАЛКА
+# ============================================================
+
+async def render_ref_panel(msg_or_call, user_id, edit=False):
+    ref_link = f"https://t.me/{BOT_USERNAME}?start=ref_{user_id}"
+    total, purchases = await referral_stats(user_id)
+    earned_hours = total * REF_BONUS_HOURS
+    earned_days = purchases * REF_BONUS_PURCHASE_DAYS
+    premium = await is_premium(user_id)
+    text = (
+        "🎁 <b>Реферальная программа</b>\n─────────────\n"
+        f"🔗 <b>Ваша ссылка:</b>\n<code>{ref_link}</code>\n\n"
+        f"👥 Приглашено: <b>{total}</b>\n"
+        f"💎 Часов за друзей: <b>{earned_hours}</b>\n"
+        f"💰 Дней за покупки: <b>{earned_days}</b>\n"
+        f"Статус: {'💎 Premium' if premium else '🆓 Бесплатный тариф'}\n\n"
+        f"<i>За каждого приглашённого: +{REF_BONUS_HOURS} ч Premium</i>\n"
+        f"<i>За покупку приглашённого: +{REF_BONUS_PURCHASE_DAYS} дн Premium</i>"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📤 Поделиться ссылкой",
+                              url=f"https://t.me/share/url?url={ref_link}&text=Попробуй BobMod!")],
+        [InlineKeyboardButton(text="🏆 Битва рефералов", callback_data="ref:battle")],
+        back_button(),
+    ])
+    if edit:
         try:
-            conn = await bot_ref.get_business_connection(bc)
-            if conn and conn.user:
-                owner_uid = conn.user.id
-                connection_cache[bc] = owner_uid
+            await msg_or_call.edit_text(text, reply_markup=kb)
+        except TelegramBadRequest:
+            await msg_or_call.answer(text, reply_markup=kb)
+    else:
+        await msg_or_call.answer(text, reply_markup=kb)
+
+
+@router.message(Command("ref"))
+async def cmd_ref(message: Message):
+    if not await require_sub(message):
+        return
+    await ensure_user(message.from_user.id, message.from_user.first_name, message.from_user.username)
+    await render_ref_panel(message, message.from_user.id)
+
+
+@router.callback_query(F.data == "menu:ref")
+async def cb_menu_ref(call: CallbackQuery):
+    if not await require_sub(call):
+        return
+    await ensure_user(call.from_user.id, call.from_user.first_name, call.from_user.username)
+    await render_ref_panel(call.message, call.from_user.id, edit=True)
+    await call.answer()
+
+
+@router.callback_query(F.data == "ref:battle")
+async def cb_ref_battle(call: CallbackQuery):
+    if not await require_sub(call):
+        return
+    top = await referral_leaderboard(5, week_only=True)
+    if not top:
+        text = ("🏆 <b>Битва рефералов</b>\n─────────────\n"
+                "На этой неделе пока нет участников.\nСтаньте первым!")
+    else:
+        medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
+        lines = []
+        for i, (uid, name, cnt) in enumerate(top):
+            lines.append(f"{medals[i]} <b>{esc(name)}</b> — {cnt}")
+        text = ("🏆 <b>Битва рефералов</b>\n─────────────\nТоп за эту неделю:\n\n"
+                + "\n".join(lines)
+                + "\n\n🎁 Победитель получает <b>месяц Premium</b>.\n"
+                  "<i>Итоги в понедельник в @bobmodinfo</i>")
+    kb = InlineKeyboardMarkup(inline_keyboard=[back_button("menu:ref")])
+    try:
+        await call.message.edit_text(text, reply_markup=kb)
+    except TelegramBadRequest:
+        await call.message.answer(text, reply_markup=kb)
+    await call.answer()
+
+
+# ============================================================
+# BOB AI
+# ============================================================
+
+@router.callback_query(F.data == "menu:ai")
+async def cb_ai_menu(call: CallbackQuery):
+    if not await require_sub(call):
+        return
+    user_id = call.from_user.id
+    premium = await is_premium(user_id)
+    _, used, limit, _ = await check_limit(user_id)
+    cooldown = AI_COOLDOWN_PREMIUM if premium else AI_COOLDOWN_FREE
+    filled = int((used / limit) * 10) if limit else 0
+    bar = "█" * filled + "░" * (10 - filled)
+    status = "💎 <b>Premium</b>" if premium else "🆓 <b>Бесплатный тариф</b>"
+    text = (
+        "🤖 <b>Bob AI</b>\n─────────────\n"
+        f"Статус: {status}\n"
+        f"Использовано сегодня: <b>{used}/{limit}</b>\n"
+        f"<code>{bar}</code>\n"
+        f"⏱ Задержка между запросами: <b>{cooldown} сек</b>\n\n"
+        f"💎 Premium: <b>{PREMIUM_DAILY_LIMIT} запросов в день</b>\n"
+        f"Цена: <b>{PREMIUM_PRICE_STARS} ⭐</b> на {PREMIUM_DAYS} дней\n\n"
+        f"Использование: <code>.ai вопрос</code> в бизнес-чате"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"⭐ Купить Premium ({PREMIUM_PRICE_STARS}⭐)",
+                              callback_data="buy_premium")],
+        back_button(),
+    ])
+    try:
+        await call.message.edit_text(text, reply_markup=kb)
+    except TelegramBadRequest:
+        await call.message.answer(text, reply_markup=kb)
+    await call.answer()
+
+
+@router.callback_query(F.data == "menu:main")
+async def cb_main(call: CallbackQuery):
+    if not await require_sub(call):
+        return
+    try:
+        await call.message.edit_text("🏠 <b>Главное меню</b>", reply_markup=main_menu())
+    except TelegramBadRequest:
+        await call.message.answer("🏠 <b>Главное меню</b>", reply_markup=main_menu())
+    await call.answer()
+
+
+@router.callback_query(F.data == "menu:help")
+async def cb_help(call: CallbackQuery):
+    if not await require_sub(call):
+        return
+    text = (
+        "<b>📖 Возможности бота</b>\n─────────────\n"
+        "<b>В бизнес-чатах:</b>\n"
+        "<code>.ai</code> · <code>.save</code> · <code>.anim</code> · <code>.qr</code>\n"
+        "<code>.whois</code> · <code>.typing</code> · <code>.mute</code>\n"
+        "<code>.nomute</code> · <code>.note</code> · <code>.id</code> · <code>.ping</code> · <code>.game</code>\n\n"
+        "<b>💎 Premium:</b>\n"
+        f"• {PREMIUM_DAILY_LIMIT} запросов ИИ в день\n"
+        "• Без водяного знака\n"
+        "• Иммунитет от <code>.mute</code>\n"
+        "• 🤖 Настройка ИИ под себя\n\n"
+        "<i>Как подключить: Профиль → Изменить → Автоматизация чатов</i>"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[back_button()])
+    try:
+        await call.message.edit_text(text, reply_markup=kb)
+    except TelegramBadRequest:
+        await call.message.answer(text, reply_markup=kb)
+    await call.answer()
+
+
+@router.callback_query(F.data == "menu:settings")
+async def cb_settings(call: CallbackQuery):
+    if not await require_sub(call):
+        return
+    await render_settings(call.message, call.from_user.id, edit=True)
+    await call.answer()
+
+
+# ============================================================
+# TOGGLES / PROMPTS
+# ============================================================
+
+@router.callback_query(F.data.startswith("toggle:"))
+async def cb_toggle(call: CallbackQuery):
+    if not await require_sub(call):
+        return
+    key = call.data.split(":", 1)[1]
+    s = await get_settings(call.from_user.id)
+    if key not in s:
+        await call.answer("Неизвестный параметр", show_alert=True)
+        return
+    await set_setting(call.from_user.id, key, 0 if s[key] else 1)
+    await render_settings(call.message, call.from_user.id, edit=True)
+    await call.answer("Сохранено")
+
+
+@router.callback_query(F.data.startswith("prompt:"))
+async def cb_prompt(call: CallbackQuery):
+    if not await require_sub(call):
+        return
+    action = call.data.split(":", 1)[1]
+    prompts = {
+        "answer_first_text": "Отправьте текст первого ответа.",
+        "off_hours_text": "Отправьте текст автоответа.",
+        "off_hours": "Отправьте часы в формате <code>ЧЧ:ММ-ЧЧ:ММ</code>.",
+    }
+    if action not in prompts:
+        await call.answer()
+        return
+    pending_inputs[call.from_user.id] = action
+    await call.message.answer(prompts[action])
+    await call.answer()
+
+
+@router.message(Command("cancel"))
+async def cmd_cancel(message: Message):
+    user = message.from_user
+    if not user:
+        return
+    if user.id in pending_ai_input:
+        pending_ai_input.pop(user.id, None)
+        await message.answer("❌ Отменено")
+        return
+    if user.id in pending_inputs:
+        pending_inputs.pop(user.id, None)
+        await message.answer("❌ Отменено")
+        return
+    if user.id == owner_id and owner_id in pending_admin:
+        pending_admin.pop(owner_id, None)
+        await message.answer("❌ Отменено")
+        return
+
+
+@router.message(F.chat.type == "private", ~F.text.startswith("/"))
+async def receive_setting_value(message: Message):
+    user = message.from_user
+    if not user:
+        return
+
+    if user.id in pending_ai_input:
+        task = pending_ai_input.pop(user.id)
+        value = (message.text or "").strip()
+        if task["type"] == "custom_prompt":
+            if len(value) > CUSTOM_PROMPT_MAX:
+                await message.answer(f"⚠️ Слишком длинный промпт (макс. {CUSTOM_PROMPT_MAX}).")
+                pending_ai_input[user.id] = task
+                return
+            if not value:
+                await message.answer("⚠️ Пустой промпт.")
+                pending_ai_input[user.id] = task
+                return
+            await save_ai_settings(user.id, mode="custom", custom_prompt=value)
+            await message.answer("✅ Свой промпт сохранён!")
+        elif task["type"] == "category":
+            cat_key = task["cat"]
+            if len(value) > CUSTOM_CATEGORY_MAX:
+                await message.answer(f"⚠️ Слишком длинный текст (макс. {CUSTOM_CATEGORY_MAX}).")
+                pending_ai_input[user.id] = task
+                return
+            if not value:
+                await message.answer("⚠️ Пустой текст.")
+                pending_ai_input[user.id] = task
+                return
+            ai_s = await get_ai_settings(user.id)
+            try:
+                data = json.loads(ai_s["constructor_data"]) if ai_s["constructor_data"] else {}
+            except Exception:
+                data = {}
+            data[cat_key] = value
+            await save_ai_settings(user.id, mode="constructor",
+                                    constructor_data=json.dumps(data, ensure_ascii=False))
+            await message.answer(f"✅ Сохранено: <b>{esc(value)}</b>")
+        return
+
+    if user.id == owner_id and owner_id in pending_admin:
+        action = pending_admin.pop(owner_id)
+        value = (message.text or "").strip()
+        await handle_admin_input(message, action, value)
+        return
+
+    if user.id not in pending_inputs:
+        return
+    action = pending_inputs.pop(user.id)
+    value = (message.text or "").strip()
+    try:
+        if action == "answer_first_text":
+            await set_setting(user.id, "answer_first_text", value)
+        elif action == "off_hours_text":
+            await set_setting(user.id, "off_hours_text", value)
+        elif action == "off_hours":
+            m = re.fullmatch(r"(\d{2}:\d{2})\s*-\s*(\d{2}:\d{2})", value)
+            if not m:
+                raise ValueError("Неверный формат. Ожидается ЧЧ:ММ-ЧЧ:ММ")
+            for t in m.groups():
+                datetime.strptime(t, "%H:%M")
+            await set_setting(user.id, "off_hours_start", m.group(1))
+            await set_setting(user.id, "off_hours_end", m.group(2))
+        elif action == "timezone":
+            ZoneInfo(value)
+            await set_setting(user.id, "timezone", value)
+        await message.answer("✅ Настройка сохранена")
+    except Exception as e:
+        await message.answer(f"⚠️ Не удалось сохранить: {esc(e)}")
+    await render_settings(message, user.id)
+
+
+# ============================================================
+# TIMEZONES
+# ============================================================
+
+@router.callback_query(F.data == "tz:open")
+async def cb_tz_open(call: CallbackQuery):
+    if not await require_sub(call):
+        return
+    rows = []
+    for i in range(0, len(TIMEZONES), 2):
+        row = []
+        for j in range(2):
+            if i + j < len(TIMEZONES):
+                label, tz = TIMEZONES[i + j]
+                row.append(InlineKeyboardButton(text=label, callback_data=f"tz:set:{tz}"))
+        rows.append(row)
+    rows.append([InlineKeyboardButton(text="✏️ Ввести вручную", callback_data="tz:manual")])
+    rows.append(back_button("menu:settings"))
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
+    try:
+        await call.message.edit_text("🌍 <b>Выберите часовой пояс:</b>", reply_markup=kb)
+    except TelegramBadRequest:
+        await call.message.answer("🌍 <b>Выберите часовой пояс:</b>", reply_markup=kb)
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("tz:set:"))
+async def cb_tz_set(call: CallbackQuery):
+    if not await require_sub(call):
+        return
+    tz = call.data.split(":", 2)[2]
+    try:
+        ZoneInfo(tz)
+    except Exception:
+        await call.answer("Неизвестный часовой пояс", show_alert=True)
+        return
+    await set_setting(call.from_user.id, "timezone", tz)
+    await call.answer(f"Сохранено: {tz}")
+    await render_settings(call.message, call.from_user.id, edit=True)
+
+
+@router.callback_query(F.data == "tz:manual")
+async def cb_tz_manual(call: CallbackQuery):
+    if not await require_sub(call):
+        return
+    pending_inputs[call.from_user.id] = "timezone"
+    await call.message.answer("Отправьте IANA-часовой пояс, например <code>Europe/Moscow</code>.")
+    await call.answer()
+
+
+# ============================================================
+# PAYMENTS
+# ============================================================
+
+@router.callback_query(F.data == "buy_premium")
+async def cb_buy_premium(call: CallbackQuery, bot: Bot):
+    if not await require_sub(call):
+        return
+    try:
+        await bot.send_invoice(
+            chat_id=call.from_user.id,
+            title="Bob AI Premium",
+            description=f"{PREMIUM_DAILY_LIMIT} запросов в день на {PREMIUM_DAYS} дней",
+            payload="premium_30d",
+            provider_token="",
+            currency="XTR",
+            prices=[LabeledPrice(label=f"Premium на {PREMIUM_DAYS} дней",
+                                 amount=PREMIUM_PRICE_STARS)],
+        )
+    except Exception as e:
+        await call.answer(f"Ошибка: {e}", show_alert=True)
+    await call.answer()
+
+
+@router.pre_checkout_query()
+async def pre_checkout(query: PreCheckoutQuery):
+    await query.answer(ok=True)
+
+
+@router.message(F.successful_payment)
+async def payment_ok(message: Message):
+    user_id = message.from_user.id
+    p = message.successful_payment
+    if p.invoice_payload == "premium_30d":
+        until = await grant_premium(user_id, days=PREMIUM_DAYS)
+        await db_execute(
+            "INSERT INTO payments_log(user_id, stars, days, ts) VALUES(?,?,?,?)",
+            (user_id, PREMIUM_PRICE_STARS, PREMIUM_DAYS, utcnow().isoformat())
+        )
+        await message.answer(
+            f"✅ <b>Premium активирован</b>\n\n"
+            f"Теперь вам доступно <b>{PREMIUM_DAILY_LIMIT} запросов в день</b>.\n"
+            f"Действует до: <b>{until.astimezone().strftime('%d.%m.%Y %H:%M')}</b>\n\n"
+            "Спасибо за поддержку!"
+        )
+        try:
+            name = message.from_user.full_name or f"id{user_id}"
+            await bot_ref.send_message(
+                owner_id,
+                f"💰 <b>Новая покупка</b>\n"
+                f"👤 {esc(name)} <code>{user_id}</code>\n"
+                f"⭐ {PREMIUM_PRICE_STARS} звёзд · {PREMIUM_DAYS} дней"
+            )
         except Exception:
             pass
-    if not owner_uid:
-        await call.answer("Не удалось определить владельца", show_alert=True)
-        return
-
-    if kind == "roulette":
-        roulette_games[(chat_id, call.message.message_id)] = 0
-        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
-            text="🔄 Крутить",
-            callback_data=f"roulette:spin:{chat_id}:{call.message.message_id}:{bc}")]])
-        await call.message.edit_text("🔫 <b>Русская рулетка</b>\n6 камер, 1 патрон.", reply_markup=kb)
-    elif kind == "guess":
-        guess_games[(chat_id, call.message.message_id)] = {
-            "number": random.randint(1, 100), "tries": 0, "bc": bc
-        }
-        await call.message.edit_text("🎲 <b>Угадай число</b> от 1 до 100. Пишите в чат.")
-    elif kind == "ttt":
-        ttt_games[(chat_id, call.message.message_id)] = {
-            "board": [""] * 9, "turn": "❌", "owner": owner_uid,
-            "opponent": None, "bc": bc, "ended": False
-        }
-        await render_ttt(call.message, chat_id, call.message.message_id)
-    await call.answer()
-
-
-async def render_ttt(message, chat_id, mid):
-    game = ttt_games[(chat_id, mid)]
-    kb = []
-    for r in range(3):
-        kb.append([InlineKeyboardButton(
-            text=game["board"][r*3+c] or "·",
-            callback_data=f"ttt:move:{chat_id}:{mid}:{r*3+c}"
-        ) for c in range(3)])
-    await message.edit_text(f"⭕❌ Ход: <b>{game['turn']}</b>",
-                            reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
-
-
-@router.callback_query(F.data.startswith("roulette:spin:"))
-async def roulette_spin(call: CallbackQuery):
-    p = call.data.split(":")
-    chat_id, mid = int(p[2]), int(p[3])
-    key = (chat_id, mid)
-    if key not in roulette_games:
-        await call.answer("Игра завершена", show_alert=True)
-        return
-    if random.randint(1, 6) == 1:
-        roulette_games.pop(key, None)
-        await call.message.edit_text("💥 <b>Бах!</b> Игра окончена.")
-    else:
-        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
-            text="🔄 Крутить", callback_data=call.data)]])
-        await call.message.edit_text("😮‍💨 Щёлк. Продолжить?", reply_markup=kb)
-    await call.answer()
-
-
-@router.callback_query(F.data.startswith("ttt:move:"))
-async def ttt_move(call: CallbackQuery):
-    p = call.data.split(":")
-    chat_id, mid, idx = int(p[2]), int(p[3]), int(p[4])
-    key = (chat_id, mid)
-    game = ttt_games.get(key)
-    if not game or game["ended"]:
-        await call.answer("Игра завершена", show_alert=True)
-        return
-    uid = call.from_user.id
-    game_owner = game["owner"]
-    if game["opponent"] is None:
-        if uid == game_owner:
-            await call.answer("Ожидается ход собеседника", show_alert=True)
-            return
-        game["opponent"] = uid
-    elif uid not in {game_owner, game["opponent"]}:
-        await call.answer("Вы не участвуете в игре", show_alert=True)
-        return
-    expected = game_owner if game["turn"] == "❌" else game["opponent"]
-    if uid != expected:
-        await call.answer("Сейчас ход другого игрока", show_alert=True)
-        return
-    if game["board"][idx]:
-        await call.answer("Клетка занята", show_alert=True)
-        return
-    game["board"][idx] = game["turn"]
-    b = game["board"]
-    wins = [(0,1,2),(3,4,5),(6,7,8),(0,3,6),(1,4,7),(2,5,8),(0,4,8),(2,4,6)]
-    winner = next((b[a] for a,c,d in wins if b[a] and b[a]==b[c]==b[d]), None)
-    if winner:
-        game["ended"] = True
-        await call.message.edit_text(f"🏆 Победили <b>{winner}</b>!", reply_markup=None)
-    elif all(b):
-        game["ended"] = True
-        await call.message.edit_text("🤝 Ничья!", reply_markup=None)
-    else:
-        game["turn"] = "⭕" if game["turn"] == "❌" else "❌"
-        await render_ttt(call.message, chat_id, mid)
-    await call.answer()
-
-
-# ---------- Business connection ----------
-@router.business_connection()
-async def business_connection_handler(connection: BusinessConnection, bot: Bot):
-    log.info(
-        "Business connection %s enabled=%s user=%s",
-        connection.id, connection.is_enabled,
-        connection.user.id if connection.user else "?"
-    )
-    if not connection.user:
-        return
-    user_id = connection.user.id
-
-    connection_cache[connection.id] = user_id
-
-    row = await db_fetchone(
-        "SELECT enabled FROM business_connections WHERE id=?", (connection.id,)
-    )
-    prev_enabled = bool(row[0]) if row else None
-
-    await save_connection(connection.id, user_id, 1)
-    await ensure_user(user_id, connection.user.first_name, connection.user.username)
-
-    if prev_enabled == connection.is_enabled:
-        return
-
-    try:
-        if connection.is_enabled:
-            if user_id != owner_id and not await check_subscription(user_id):
-                await bot.send_message(
-                    user_id,
-                    "🔒 <b>Бизнес подключён, но доступ ограничен</b>\n\n"
-                    f"Подпишитесь на канал @{CHANNEL_USERNAME}, чтобы бот начал работать.",
-                    reply_markup=sub_screen_kb()
+        row = await db_fetchone(
+            "SELECT referrer_id, rewarded_purchase FROM referrals WHERE user_id=?", (user_id,)
+        )
+        if row and not row[1]:
+            referrer_id = row[0]
+            new_until = await grant_premium(referrer_id, days=REF_BONUS_PURCHASE_DAYS)
+            await db_execute("UPDATE referrals SET rewarded_purchase=1 WHERE user_id=?", (user_id,))
+            try:
+                await bot_ref.send_message(
+                    referrer_id,
+                    f"💰 <b>+{REF_BONUS_PURCHASE_DAYS} дней Premium</b>\n"
+                    f"Приглашённый вами пользователь оформил подписку.\n"
+                    f"Premium активен до: <b>{new_until.astimezone().strftime('%d.%m.%Y %H:%M')}</b>"
                 )
-            else:
-                await bot.send_message(
-                    user_id,
-                    "✅ <b>BobMod подключён к вашему бизнес-аккаунту</b>\n\n"
-                    "Команды: /start · /settings · /ref"
-                )
-    except Exception as e:
-        log.info("notify business: %s", e)
+            except Exception:
+                pass
 
 
 # ============================================================
-# ENTRY POINT
+# ADMIN PANEL
 # ============================================================
 
-async def main():
-    global bot_ref, db_client
-
-    if not api_token:
-        raise RuntimeError("Не найден API_TOKEN в .env")
-    if owner_id <= 0:
-        raise RuntimeError("Некорректный OWNER_ID в .env")
-    if not TURSO_URL or not TURSO_TOKEN:
-        raise RuntimeError("Не найдены TURSO_DATABASE_URL или TURSO_AUTH_TOKEN в .env")
-
-    db_client = libsql_client.create_client(url=TURSO_URL, auth_token=TURSO_TOKEN)
-    log.info("Connected to Turso: %s", TURSO_URL)
-
-    await init_db()
-
-    bot_ref = Bot(api_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    dp = Dispatcher()
-    dp.include_router(router)
-
-    asyncio.create_task(update_all_business_names())
-    asyncio.create_task(weekly_publish_loop())
-
-    log.info("BobMod started. Owner: %s", owner_id)
+@router.callback_query(F.data == "adm:menu")
+async def cb_adm_menu(call: CallbackQuery):
+    if call.from_user.id != owner_id:
+        return
     try:
-        await dp.start_polling(bot_ref, allowed_updates=dp.resolve_used_update_types() + [
-            "business_connection", "business_message",
-            "edited_business_message", "deleted_business_messages"
-        ])
-    finally:
-        await db_client.close()
+        await call.message.edit_text(
+            "🔐 <b>Админ-панель BobMod</b>\n─────────────\nВыберите раздел:",
+            reply_markup=admin_menu()
+        )
+    except TelegramBadRequest:
+        await call.message.answer(
+            "🔐 <b>Админ-панель BobMod</b>\n─────────────\nВыберите раздел:",
+            reply_markup=admin_menu()
+        )
+    await call.answer()
 
 
-if __name__ == "__main__":
+@router.callback_query(F.data == "adm:stats")
+async def cb_adm_stats(call: CallbackQuery):
+    if call.from_user.id != owner_id:
+        return
+    now = utcnow()
+    day_ago = (now - timedelta(days=1)).isoformat()
+    week_ago = (now - timedelta(days=7)).isoformat()
+    users_total = await db_fetchval("SELECT COUNT(*) FROM users", default=0)
+    users_24h = await db_fetchval("SELECT COUNT(*) FROM users WHERE joined_at >= ?", (day_ago,), 0)
+    users_7d = await db_fetchval("SELECT COUNT(*) FROM users WHERE joined_at >= ?", (week_ago,), 0)
+    users_banned = await db_fetchval("SELECT COUNT(*) FROM users WHERE is_banned=1", default=0)
+    premium_active = await db_fetchval(
+        "SELECT COUNT(*) FROM user_limits WHERE is_premium=1 AND premium_until > ?",
+        (now.isoformat(),), 0
+    )
+    conns = await db_fetchval("SELECT COUNT(*) FROM business_connections WHERE enabled=1", default=0)
+    chats = await db_fetchval("SELECT COUNT(*) FROM contacts", default=0)
+    msgs = await db_fetchval("SELECT COUNT(*) FROM messages", default=0)
+    mutes = await db_fetchval("SELECT COUNT(*) FROM mutes", default=0)
+    refs_total = await db_fetchval("SELECT COUNT(*) FROM referrals", default=0)
+    refs_week = await db_fetchval("SELECT COUNT(*) FROM referrals WHERE joined_at >= ?", (week_ago,), 0)
+    stars_total = await db_fetchval("SELECT COALESCE(SUM(stars),0) FROM payments_log", default=0)
+    purchases = await db_fetchval("SELECT COUNT(*) FROM payments_log", default=0)
+    text = (
+        "📊 <b>Статистика</b>\n─────────────\n"
+        f"👤 Юзеров: <b>{users_total}</b>\n"
+        f"  · за 24ч: {users_24h}\n"
+        f"  · за 7д: {users_7d}\n"
+        f"  · в бане: {users_banned}\n"
+        f"🔗 Бизнес-коннектов: <b>{conns}</b>\n"
+        f"💎 Premium активных: <b>{premium_active}</b>\n\n"
+        f"💬 Чатов: <b>{chats}</b>\n"
+        f"📝 Сообщений: <b>{msgs}</b>\n"
+        f"🔇 Мутов: <b>{mutes}</b>\n\n"
+        f"🎁 Рефералов всего: <b>{refs_total}</b>\n"
+        f"  · за 7д: {refs_week}\n\n"
+        f"💰 Продаж Premium: <b>{purchases}</b>\n"
+        f"⭐ Звёзд всего: <b>{stars_total}</b>"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="adm:stats")],
+        back_button("adm:menu"),
+    ])
     try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
+        await call.message.edit_text(text, reply_markup=kb)
+    except TelegramBadRequest:
+        await call.message.answer(text, reply_markup=kb)
+    await call.answer()
+
+
+@router.callback_query(F.data == "adm:refs")
+async def cb_adm_refs(call: CallbackQuery):
+    if call.from_user.id != owner_id:
+        return
+    top_all = await referral_leaderboard(20, week_only=False)
+    top_week = await referral_leaderboard(10, week_only=True)
+    lines_all = [f"{i}. <b>{esc(name)}</b> — {cnt}" for i, (uid, name, cnt) in enumerate(top_all, 1)]
+    lines_week = [f"{i}. <b>{esc(name)}</b> — {cnt}" for i, (uid, name, cnt) in enumerate(top_week, 1)]
+    text = (
+        "🎁 <b>Рефералы</b>\n─────────────\n<b>За всё время:</b>\n"
+        + ("\n".join(lines_all) if lines_all else "<i>пусто</i>")
+        + "\n\n<b>За эту неделю:</b>\n"
+        + ("\n".join(lines_week) if lines_week else "<i>пусто</i>")
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📢 Отправить топ в канал", callback_data="adm:refs_publish")],
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="adm:refs")],
+        back_button("adm:menu"),
+    ])
+    try:
+        await call.message.edit_text(text, reply_markup=kb)
+    except TelegramBadRequest:
+        await call.message.answer(text, reply_markup=kb)
+    await call.answer()
+
+
+@router.callback_query(F.data == "adm:refs_publish")
+async def cb_adm_refs_publish(call: CallbackQuery):
+    if call.from_user.id != owner_id:
+        return
+    ok = await publish_weekly_top(manual=True)
+    await call.answer("✅ Отправлено в канал" if ok else "❌ Не удалось отправить", show_alert=True)
+
+
+@router.callback_query(F.data == "adm:users")
+async def cb_adm_users(call: CallbackQuery):
+    if call.from_user.id != owner_id:
+        return
+    rows = await db_fetchall("SELECT * FROM users ORDER BY joined_at DESC LIMIT 20")
+    lines = []
+    for row in rows:
+        u = row_to_dict(row, USERS_COLS)
+        name = u["username"] or u["first_name"] or f"id{u['user_id']}"
+        try:
+            d = datetime.fromisoformat(u["joined_at"]).astimezone().strftime("%d.%m")
+        except Exception:
+            d = "?"
+        flag = "🚫" if u["is_banned"] else ""
+        lines.append(f"• <b>{esc(name)}</b> <code>{u['user_id']}</code> {d} {flag}")
+    text = "👥 <b>Последние 20 юзеров</b>\n─────────────\n" + ("\n".join(lines) if lines else "<i>пусто</i>")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔍 Поиск по ID", callback_data="adm:user_find")],
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="adm:users")],
+        back_button("adm:menu"),
+    ])
+    try:
+        await call.message.edit_text(text, reply_markup=kb)
+    except TelegramBadRequest:
+        await call.message.answer(text, reply_markup=kb)
+    await call.answer()
+
+
+@router.callback_query(F.data == "adm:user_find")
+async def cb_adm_user_find(call: CallbackQuery):
+    if call.from_user.id != owner_id:
+        return
+    pending_admin[owner_id] = "find_user"
+    await call.message.answer("Отправьте ID пользователя.")
+    await call.answer()
+
+
+async def show_user_card(chat_target, uid):
+    u, refs, msgs = await get_user_card(uid)
+    if not u:
+        await chat_target.answer(f"Юзер <code>{uid}</code> не найден.")
+        return
+    name = u["username"] or u["first_name"] or "—"
+    premium = await is_premium(uid)
+    
+    spin_row = await db_fetchone("SELECT last_spin, extra_spins FROM spin_cooldowns WHERE user_id=?", (uid,))
+    extra_spins = spin_row[1] if spin_row else 0
+    last_spin_str = "—"
+    if spin_row and spin_row[0]:
+        try:
+            last_spin_str = datetime.fromisoformat(spin_row[0]).astimezone().strftime("%d.%m %H:%M")
+        except Exception:
+            pass
+
+    try:
+        joined = datetime.fromisoformat(u["joined_at"]).astimezone().strftime("%d.%m.%Y %H:%M")
+    except Exception:
+        joined = "—"
+    text = (
+        f"👤 <b>Карточка</b>\n─────────────\n"
+        f"📛 <b>{esc(name)}</b>\n"
+        f"🆔 <code>{uid}</code>\n"
+        f"📅 Регистрация: {esc(joined)}\n"
+        f"💎 Premium: {'✅' if premium else '❌'}\n"
+        f"🎁 Рефералов: <b>{refs}</b>\n"
+        f"📝 Сообщений: <b>{msgs}</b>\n"
+        f"🚫 Бан: {'✅' if u['is_banned'] else '❌'}\n"
+        f"🔗 Реф-бан: {'✅' if u['banned_ref'] else '❌'}\n\n"
+        f"🎰 <b>Рулетка:</b>\n"
+        f"  · Последний спин: {esc(last_spin_str)}\n"
+        f"  · Доп. попыток: <b>{extra_spins}</b>"
+    )
+    rows = [
+        [InlineKeyboardButton(text="➕ Выдать Premium", callback_data=f"adm:grant:{uid}")],
+        [InlineKeyboardButton(text="➖ Снять Premium", callback_data=f"adm:revoke:{uid}")],
+        [InlineKeyboardButton(text=f"🎰 +1 Попытка (сейчас {extra_spins})", callback_data=f"adm:add_spin:{uid}")],
+    ]
+    if u["is_banned"]:
+        rows.append([InlineKeyboardButton(text="✅ Разбанить", callback_data=f"adm:unban:{uid}")])
+    else:
+        rows.append([InlineKeyboardButton(text="🚫 Забанить", callback_data=f"adm:ban:{uid}")])
+    if u["banned_ref"]:
+        rows.append([InlineKeyboardButton(text="🔓 Разбанить реф-ссылку", callback_data=f"adm:unban_ref:{uid}")])
+    else:
+        rows.append([InlineKeyboardButton(text="🔒 Забанить реф-ссылку", callback_data=f"adm:ban_ref:{uid}")])
+    rows.append([InlineKeyboardButton(text="🔄 Сбросить реферал", callback_data=f"adm:reset_ref:{uid}")])
+    rows.append(back_button("adm:users"))
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
+    try:
+        await chat_target.answer(text, reply_markup=kb)
+    except Exception:
         pass
+
+
+@router.callback_query(F.data.startswith("adm:user_card:"))
+async def cb_adm_user_card(call: CallbackQuery):
+    if call.from_user.id != owner_id:
+        return
+    uid = int(call.data.split(":")[2])
+    u, refs, msgs = await get_user_card(uid)
+    if not u:
+        await call.answer("Юзер не найден", show_alert=True)
+        return
+    name = u["username"] or u["first_name"] or "—"
+    premium = await is_premium(uid)
+    
+    spin_row = await db_fetchone("SELECT last_spin, extra_spins FROM spin_cooldowns WHERE user_id=?", (uid,))
+    extra_spins = spin_row[1] if spin_row else 0
+    last_spin_str = "—"
+    if spin_row and spin_row[0]:
+        try:
+            last_spin_str = datetime.fromisoformat(spin_row[0]).astimezone().strftime("%d.%m %H:%M")
+        except Exception:
+            pass
+
+    try:
+        joined = datetime.fromisoformat(u["joined_at"]).astimezone().strftime("%d.%m.%Y %H:%M")
+    except Exception:
+        joined = "—"
+    text = (
+        f"👤 <b>Карточка</b>\n─────────────\n"
+        f"📛 <b>{esc(name)}</b>\n"
+        f"🆔 <code>{uid}</code>\n"
+        f"📅 Регистрация: {esc(joined)}\n"
+        f"💎 Premium: {'✅' if premium else '❌'}\n"
+        f"🎁 Рефералов: <b>{refs}</b>\n"
+        f"📝 Сообщений: <b>{msgs}</b>\n"
+        f"🚫 Бан: {'✅' if u['is_banned'] else '❌'}\n"
+        f"🔗 Реф-бан: {'✅' if u['banned_ref'] else '❌'}\n\n"
+        f"🎰 <b>Рулетка:</b>\n"
+        f"  · Последний спин: {esc(last_spin_str)}\n"
+        f"  · Доп. попыток: <b>{extra_spins}</b>"
+    )
+    rows = [
+        [InlineKeyboardButton(text="➕ Выдать Premium", callback_data=f"adm:grant:{uid}")],
+        [InlineKeyboardButton(text="➖ Снять Premium", callback_data=f"adm:revoke:{uid}")],
+        [InlineKeyboardButton(text=f"🎰 +1 Попытка (сейчас {extra_spins})", callback_data=f"adm:add_spin:{uid}")],
+    ]
+    if u["is_banned"]:
+        rows.append([InlineKeyboardButton(text="✅ Разбанить", callback_data=f"adm:unban:{uid}")])
+    else:
+        rows.append([InlineKeyboardButton(text="🚫 Забанить", callback_data=f"adm:ban:{uid}")])
+    if u["banned_ref"]:
+        rows.append([InlineKeyboardButton(text="🔓 Разбанить реф-ссылку", callback_data=f"adm:unban_ref:{uid}")])
+    else:
+        rows.append([InlineKeyboardButton(text="🔒 Забанить реф-ссылку", callback_data=f"adm:ban_ref:{uid}")])
+    rows.append([InlineKeyboardButton(text="🔄 Сбросить реферал", callback_data=f"adm:reset_ref:{uid}")])
+    rows.append(back_button("adm:users"))
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
+    try:
+        await call.message.edit_text(text, reply_markup=kb)
+    except TelegramBadRequest:
+        await call.message.answer(text, reply_markup=kb)
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("adm:add_spin:"))
+async def cb_adm_add_spin(call: CallbackQuery):
+    if call.from_user.id != owner_id:
+        return
+    uid = int(call.data.split(":")[2])
+    
+    row = await db_fetchone("SELECT 1 FROM spin_cooldowns WHERE user_id=?", (uid,))
+    if row:
+        await db_execute("UPDATE spin_cooldowns SET extra_spins = extra_spins + 1 WHERE user_id=?", (uid,))
+    else:
+        await db_execute("INSERT INTO spin_cooldowns(user_id, last_spin, extra_spins) VALUES(?,?,1)", (uid, "2000-01-01T00:00:00"))
+        
+    await call.answer("✅ Добавлена 1 попытка", show_alert=True)
+    call.data = f"adm:user_card:{uid}"
+    await cb_adm_user_card(call)
+
+
+@router.callback_query(F.data.startswith("adm:grant:"))
+async def cb_adm_grant(call: CallbackQuery):
+    if call.from_user.id != owner_id:
+        return
+    uid = int(call.data.split(":")[2])
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="1 день", callback_data=f"adm:grant_do:{uid}:1")],
+        [InlineKeyboardButton(text="7 дней", callback_data=f"adm:grant_do:{uid}:7")],
+        [InlineKeyboardButton(text="30 дней", callback_data=f"adm:grant_do:{uid}:30")],
+        [InlineKeyboardButton(text="365 дней", callback_data=f"adm:grant_do:{uid}:365")],
+        back_button(f"adm:user_card:{uid}"),
+    ])
+    try:
+        await call.message.edit_text(f"💎 Выдать Premium <code>{uid}</code> на:", reply_markup=kb)
+    except TelegramBadRequest:
+        await call.message.answer(f"💎 Выдать Premium <code>{uid}</code> на:", reply_markup=kb)
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("adm:grant_do:"))
+async def cb_adm_grant_do(call: CallbackQuery):
+    if call.from_user.id != owner_id:
+        return
+    _, _, uid, days = call.data.split(":")
+    uid = int(uid)
+    days = int(days)
+    until = await grant_premium(uid, days=days)
+    await log_admin("grant_premium", uid, f"{days} дней")
+    await call.answer(f"✅ Выдано на {days} дн.", show_alert=True)
+    try:
+        await bot_ref.send_message(
+            uid,
+            f"💎 <b>Вам выдан Premium!</b>\n"
+            f"Срок: {days} дней\n"
+            f"До: <b>{until.astimezone().strftime('%d.%m.%Y %H:%M')}</b>"
+        )
+    except Exception:
+        pass
+    call.data = f"adm:user_card:{uid}"
+    await cb_adm_user_card(call)
+
+
+@router.callback_query(F.data.startswith("adm:revoke:"))
+async def cb_adm_revoke(call: CallbackQuery):
+    if call.from_user.id != owner_id:
+        return
+    uid = int(call.data.split(":")[2])
+    await revoke_premium(uid)
+    await call.answer("✅ Premium снят", show_alert=True)
+    call.data = f"adm:user_card:{uid}"
+    await cb_adm_user_card(call)
+
+
+@router.callback_query(F.data.startswith("adm:ban:"))
+async def cb_adm_ban(call: CallbackQuery):
+    if call.from_user.id != owner_id:
+        return
+    uid = int(call.data.split(":")[2])
+    pending_admin[owner_id] = f"ban_reason:{uid}"
+    await call.message.answer(f"Отправьте причину бана для <code>{uid}</code> (или «-» без причины).")
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("adm:unban:"))
+async def cb_adm_unban(call: CallbackQuery):
+    if call.from_user.id != owner_id:
+        return
+    uid = int(call.data.split(":")[2])
+    await unban_user(uid)
+    await call.answer("✅ Разбанен", show_alert=True)
+    call.data = f"adm:user_card:{uid}"
+    await cb_adm_user_card(call)
+
+
+@router.callback_query(F.data.startswith("adm:ban_ref:"))
+async def cb_adm_ban_ref(call: CallbackQuery):
+    if call.from_user.id != owner_id:
+        return
+    uid = int(call.data.split(":")[2])
+    await ban_ref(uid, True)
+    await call.answer("🔒 Реф-ссылка забанена", show_alert=True)
+    call.data = f"adm:user_card:{uid}"
+    await cb_adm_user_card(call)
+
+
+@router.callback_query(F.data.startswith("adm:unban_ref:"))
+async def cb_adm_unban_ref(call: CallbackQuery):
+    if call.from_user.id != owner_id:
+        return
+    uid = int(call.data.split(":")[2])
+    await ban_ref(uid, False)
+    await call.answer("🔓 Реф-ссылка разбанена", show_alert=True)
+    call.data = f"adm:user_card:{uid}"
+    await cb_adm_user_card(call)
+
+
+@router.callback_query(F.data.startswith("adm:reset_ref:"))
+async def cb_adm_reset_ref(call: CallbackQuery):
+    if call.from_user.id != owner_id:
+        return
+    uid = int(call.data.split(":")[2])
+    await db_execute("DELETE FROM referrals WHERE referrer_id=?", (uid,))
+    await db_execute("DELETE FROM referrals WHERE user_id=?", (uid,))
+    await db_execute("DELETE FROM pending_referrals WHERE referrer_id=?", (uid,))
+    await db_execute("DELETE FROM pending_referrals WHERE user_id=?", (uid,))
+    await log_admin("reset_ref", uid)
+    await call.answer("✅ Реферал сброшен", show_alert=True)
+    call.data = f"adm:user_card:{uid}"
+    await cb_adm_user_card(call)
+
+
+@router.callback_query(F.data == "adm:bans")
+async def cb_adm_bans(call: CallbackQuery):
+    if call.from_user.id != owner_id:
+        return
+    rows = await db_fetchall("SELECT * FROM users WHERE is_banned=1 ORDER BY banned_at DESC LIMIT 30")
+    ref_rows = await db_fetchall("SELECT * FROM users WHERE banned_ref=1 LIMIT 30")
+    lines = []
+    for row in rows:
+        u = row_to_dict(row, USERS_COLS)
+        name = u["username"] or u["first_name"] or f"id{u['user_id']}"
+        reason = u["banned_reason"] or "—"
+        lines.append(f"🚫 <b>{esc(name)}</b> <code>{u['user_id']}</code>\n<i>{esc(reason)[:60]}</i>")
+    ref_lines = []
+    for row in ref_rows:
+        u = row_to_dict(row, USERS_COLS)
+        name = u["username"] or u["first_name"] or f"id{u['user_id']}"
+        ref_lines.append(f"🔒 <b>{esc(name)}</b> <code>{u['user_id']}</code>")
+    text = (
+        "🚫 <b>Баны</b>\n─────────────\n<b>Юзеры:</b>\n"
+        + ("\n".join(lines) if lines else "<i>пусто</i>")
+        + "\n\n<b>Реф-ссылки:</b>\n"
+        + ("\n".join(ref_lines) if ref_lines else "<i>пусто</i>")
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="adm:bans")],
+        back_button("adm:menu"),
+    ])
+    try:
+        await call.message.edit_text(text, reply_markup=kb)
+    except TelegramBadRequest:
+        await call.message.answer(text, reply_markup=kb)
+    await call.answer()
+
+
+@router.callback_query(F.data == "adm:sys")
+async def cb_adm_sys(call: CallbackQuery):
+    if call.from_user.id != owner_id:
+        return
+    users_total = await db_fetchval("SELECT COUNT(*) FROM users", default=0)
+    msgs = await db_fetchval("SELECT COUNT(*) FROM messages", default=0)
+    text = (
+        "⚙️ <b>Система</b>\n─────────────\n"
+        f"💾 БД: <b>Turso Cloud</b>\n"
+        f"🌐 URL: <code>{esc(TURSO_URL[:40])}...</code>\n"
+        f"👥 Юзеров: <b>{users_total}</b>\n"
+        f"📝 Сообщений: <b>{msgs}</b>"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🧹 Очистить старые сообщения", callback_data="adm:cleanup")],
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="adm:sys")],
+        back_button("adm:menu"),
+    ])
+    try:
+        await call.message.edit_text(text, reply_markup=kb)
+    except TelegramBadRequest:
+        await call.message.answer(text, reply_markup=kb)
+    await call.answer()
+
+
+@router.callback_query(F.data == "adm:cleanup")
+async def cb_adm_cleanup(call: CallbackQuery):
+    if call.from_user.id != owner_id:
+        return
+    cutoff = (utcnow() - timedelta(days=30)).isoformat()
+    await db_execute("DELETE FROM messages WHERE date < ?", (cutoff,))
+    await call.answer("✅ Старые сообщения удалены", show_alert=True)
+    await cb_adm_sys(call)
+
+
+async def handle_admin_input(message: Message, action: str, value: str):
+    try:
+        if action == "find_user":
+            try:
+                uid = int(value)
+            except ValueError:
+                await message.answer("⚠️ Нужен числовой ID.")
+                return
+            await show_user_card(message, uid)
+            return
+        if action.startswith("ban_reason:"):
+            uid = int(action.split(":")[1])
+            reason = value if value != "-" else ""
+            await ban_user(uid, reason)
+            await message.answer(f"✅ Пользователь <code>{uid}</code> забанен.")
+            return
+    except Exception as e:
+        log.exception("Error in handle_admin_input")
+        await message.answer(f"❌ Ошибка при обработке: <code>{esc(str(e))}</code>")
+
+
+async def publish_weekly_top(manual=False):
+    top = await referral_leaderboard(5, week_only=True)
+    if not top:
+        if manual:
+            try:
+                await bot_ref.send_message(
+                    f"@{CHANNEL_USERNAME}",
+                    "🏆 <b>Битва рефералов</b>\n\nНа этой неделе пока нет участников."
+                )
+                return True
+            except Exception:
+                return False
+        return False
+    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
+    lines = [f"{medals[i]} <b>{esc(name)}</b> — {cnt}" for i, (uid, name, cnt) in enumerate(top)]
+    winner_name = top[0][1]
+    text = (
+        "🏆 <b>Битва рефералов — итоги недели</b>\n─────────────\n\n"
+        + "\n".join(lines)
+        + f"\n\n🎁 Победитель: <b>{esc(winner_name)}</b> — месяц Premium!"
+    )
+    try:
+        await bot_ref.send_message(f"@{CHANNEL_USERNAME}", text)
+        return True
+    except Exception as e:
+        log.warning("publish top failed: %s", e)
+        return False
+
+
+async def update_all_business_names():
+    while True:
+        try:
+            rows = await db_fetchall(
+                """SELECT bc.id as conn_id, bc.user_id, s.timezone
+                   FROM business_connections bc
+                   JOIN settings s ON s.user_id = bc.user_id
+                   WHERE bc.enabled=1 AND s.time_in_nick_enabled=1"""
+            )
+            for row in rows:
+                connection_id = row[0]
+                user_id = row[1]
+                tz = row[2] or "UTC"
+                try:
+                    base_name = await get_base_name(connection_id)
+                    if not base_name:
+                        try:
+                            info = await bot_ref.get_business_account_name(
+                                business_connection_id=connection_id
+                            )
+                            base_name = info.first_name or f"User{user_id}"
+                        except Exception:
+                            base_name = f"User{user_id}"
+                        await save_base_name(connection_id, base_name)
+                    clock = local_now(tz).strftime("%H:%M")
+                    desired = f"{base_name} [{clock}]"[:64]
+                    try:
+                        async with name_update_lock:
+                            await bot_ref.set_business_account_name(
+                                business_connection_id=connection_id,
+                                first_name=desired
+                            )
+                    except Exception as e:
+                        log.warning("set name for %s failed: %s", user_id, e)
+                except Exception as e:
+                    log.warning("name update for %s error: %s", user_id, e)
+        except Exception as e:
+            log.warning("name loop err: %s", e)
+        await asyncio.sleep(60)
+
+
+async def weekly_publish_loop():
+    while True:
+        try:
+            now = utcnow()
+            days_ahead = (7 - now.weekday()) % 7
+            if days_ahead == 0 and now.hour >= 10:
+                days_ahead = 7
+            target = (now + timedelta(days=days_ahead)).replace(hour=10, minute=0, second=0, microsecond=0)
+            wait = (target - now).total_seconds()
+            if wait < 0:
+                wait = 60
+            await asyncio.sleep(wait)
+            await publish_weekly_top(manual=False)
+        except Exception as e:
+            log.warning("weekly publish err: %s", e)
+            await asyncio.sleep(3600)
