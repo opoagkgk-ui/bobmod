@@ -21,6 +21,7 @@ from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
     BusinessConnection, BusinessMessagesDeleted,
     FSInputFile, BufferedInputFile, LabeledPrice, PreCheckoutQuery,
+    WebAppInfo,
 )
 from dotenv import load_dotenv
 
@@ -226,6 +227,12 @@ async def init_db():
         """CREATE TABLE IF NOT EXISTS ai_settings (
             user_id INTEGER PRIMARY KEY, mode TEXT DEFAULT 'default',
             custom_prompt TEXT, constructor_data TEXT, updated_at TEXT
+        )""",
+        """CREATE TABLE IF NOT EXISTS spin_cooldowns (
+            user_id INTEGER PRIMARY KEY, last_spin TEXT NOT NULL
+        )""",
+        """CREATE TABLE IF NOT EXISTS nomute_chats (
+            chat_id INTEGER PRIMARY KEY, owner_id INTEGER NOT NULL, created_at TEXT
         )""",
     ]
     for stmt in statements:
@@ -867,6 +874,7 @@ async def cb_check_sub(call: CallbackQuery):
 
 def main_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎰 Рулетка", web_app=WebAppInfo(url="https://opoagkgk-ui.github.io/bobhtml/"))],
         [InlineKeyboardButton(text="⚙️ Настройки", callback_data="menu:settings")],
         [InlineKeyboardButton(text="💎 Premium", callback_data="menu:premium")],
         [InlineKeyboardButton(text="🎁 Рефералка", callback_data="menu:ref")],
@@ -946,6 +954,62 @@ async def cmd_start(message: Message, command: Command):
         "<i>Как подключить: Профиль → Изменить → Автоматизация чатов</i>",
         reply_markup=main_menu()
     )
+
+
+# ---------- Обработка данных из Рулетки ----------
+@router.message(F.web_app_data)
+async def handle_web_app_data(message: Message):
+    user = message.from_user
+    if not user:
+        return
+    
+    if not await require_sub(message):
+        return
+
+    try:
+        data = json.loads(message.web_app_data.data)
+    except Exception:
+        return
+
+    now = utcnow()
+    row = await db_fetchone("SELECT last_spin, extra_spins FROM spin_cooldowns WHERE user_id=?", (user.id,))
+    
+    last_spin_str = row[0] if row else None
+    extra_spins = row[1] if row else 0
+
+    # Проверка кулдауна: если нет доп. попыток и прошло меньше 24 часов
+    if extra_spins <= 0 and last_spin_str:
+        last_spin = datetime.fromisoformat(last_spin_str)
+        if (now - last_spin).total_seconds() < 86400:
+            await message.answer("⏱ Вы уже крутили сегодня! Возвращайтесь завтра.")
+            return
+
+    days = int(data.get("days", 0))
+
+    # Логика списания
+    if extra_spins > 0:
+        # Списываем доп. попытку (не трогая время кулдауна)
+        await db_execute("UPDATE spin_cooldowns SET extra_spins = extra_spins - 1 WHERE user_id=?", (user.id,))
+    else:
+        # Запускаем кулдаун на 24 часа
+        await db_execute(
+            "INSERT OR REPLACE INTO spin_cooldowns(user_id, last_spin, extra_spins) VALUES(?,?,0)",
+            (user.id, now.isoformat())
+        )
+
+    if days > 0:
+        until = await grant_premium(user.id, days=days)
+        emoji = "🏆" if days == 30 else "🎉"
+        await message.answer(
+            f"{emoji} <b>Поздравляем!</b>\n"
+            f"Вы выиграли <b>{days} дн. Premium</b>!\n\n"
+            f"Ваш Premium активен до: <b>{until.astimezone().strftime('%d.%m.%Y %H:%M')}</b>"
+        )
+    else:
+        await message.answer(
+            "📦 <b>Пусто...</b>\n"
+            "В этот раз не повезло. Попробуйте завтра!"
+        )
 
 
 @router.message(Command("help"))
@@ -1891,6 +1955,17 @@ async def show_user_card(chat_target, uid):
         return
     name = u["username"] or u["first_name"] or "—"
     premium = await is_premium(uid)
+    
+    # Получаем информацию о попытках
+    spin_row = await db_fetchone("SELECT last_spin, extra_spins FROM spin_cooldowns WHERE user_id=?", (uid,))
+    extra_spins = spin_row[1] if spin_row else 0
+    last_spin_str = "—"
+    if spin_row and spin_row[0]:
+        try:
+            last_spin_str = datetime.fromisoformat(spin_row[0]).astimezone().strftime("%d.%m %H:%M")
+        except Exception:
+            pass
+
     try:
         joined = datetime.fromisoformat(u["joined_at"]).astimezone().strftime("%d.%m.%Y %H:%M")
     except Exception:
@@ -1904,11 +1979,15 @@ async def show_user_card(chat_target, uid):
         f"🎁 Рефералов: <b>{refs}</b>\n"
         f"📝 Сообщений: <b>{msgs}</b>\n"
         f"🚫 Бан: {'✅' if u['is_banned'] else '❌'}\n"
-        f"🔗 Реф-бан: {'✅' if u['banned_ref'] else '❌'}"
+        f"🔗 Реф-бан: {'✅' if u['banned_ref'] else '❌'}\n\n"
+        f"🎰 <b>Рулетка:</b>\n"
+        f"  · Последний спин: {esc(last_spin_str)}\n"
+        f"  · Доп. попыток: <b>{extra_spins}</b>"
     )
     rows = [
         [InlineKeyboardButton(text="➕ Выдать Premium", callback_data=f"adm:grant:{uid}")],
         [InlineKeyboardButton(text="➖ Снять Premium", callback_data=f"adm:revoke:{uid}")],
+        [InlineKeyboardButton(text=f"🎰 +1 Попытка (сейчас {extra_spins})", callback_data=f"adm:add_spin:{uid}")],
     ]
     if u["is_banned"]:
         rows.append([InlineKeyboardButton(text="✅ Разбанить", callback_data=f"adm:unban:{uid}")])
@@ -1938,6 +2017,16 @@ async def cb_adm_user_card(call: CallbackQuery):
         return
     name = u["username"] or u["first_name"] or "—"
     premium = await is_premium(uid)
+    
+    spin_row = await db_fetchone("SELECT last_spin, extra_spins FROM spin_cooldowns WHERE user_id=?", (uid,))
+    extra_spins = spin_row[1] if spin_row else 0
+    last_spin_str = "—"
+    if spin_row and spin_row[0]:
+        try:
+            last_spin_str = datetime.fromisoformat(spin_row[0]).astimezone().strftime("%d.%m %H:%M")
+        except Exception:
+            pass
+
     try:
         joined = datetime.fromisoformat(u["joined_at"]).astimezone().strftime("%d.%m.%Y %H:%M")
     except Exception:
@@ -1951,11 +2040,15 @@ async def cb_adm_user_card(call: CallbackQuery):
         f"🎁 Рефералов: <b>{refs}</b>\n"
         f"📝 Сообщений: <b>{msgs}</b>\n"
         f"🚫 Бан: {'✅' if u['is_banned'] else '❌'}\n"
-        f"🔗 Реф-бан: {'✅' if u['banned_ref'] else '❌'}"
+        f"🔗 Реф-бан: {'✅' if u['banned_ref'] else '❌'}\n\n"
+        f"🎰 <b>Рулетка:</b>\n"
+        f"  · Последний спин: {esc(last_spin_str)}\n"
+        f"  · Доп. попыток: <b>{extra_spins}</b>"
     )
     rows = [
         [InlineKeyboardButton(text="➕ Выдать Premium", callback_data=f"adm:grant:{uid}")],
         [InlineKeyboardButton(text="➖ Снять Premium", callback_data=f"adm:revoke:{uid}")],
+        [InlineKeyboardButton(text=f"🎰 +1 Попытка (сейчас {extra_spins})", callback_data=f"adm:add_spin:{uid}")],
     ]
     if u["is_banned"]:
         rows.append([InlineKeyboardButton(text="✅ Разбанить", callback_data=f"adm:unban:{uid}")])
@@ -1973,6 +2066,24 @@ async def cb_adm_user_card(call: CallbackQuery):
     except TelegramBadRequest:
         await call.message.answer(text, reply_markup=kb)
     await call.answer()
+
+
+@router.callback_query(F.data.startswith("adm:add_spin:"))
+async def cb_adm_add_spin(call: CallbackQuery):
+    if call.from_user.id != owner_id:
+        return
+    uid = int(call.data.split(":")[2])
+    
+    # Проверяем, есть ли запись
+    row = await db_fetchone("SELECT 1 FROM spin_cooldowns WHERE user_id=?", (uid,))
+    if row:
+        await db_execute("UPDATE spin_cooldowns SET extra_spins = extra_spins + 1 WHERE user_id=?", (uid,))
+    else:
+        await db_execute("INSERT INTO spin_cooldowns(user_id, last_spin, extra_spins) VALUES(?,?,1)", (uid, "2000-01-01T00:00:00"))
+        
+    await call.answer("✅ Добавлена 1 попытка", show_alert=True)
+    call.data = f"adm:user_card:{uid}"
+    await cb_adm_user_card(call)
 
 
 @router.callback_query(F.data.startswith("adm:grant:"))
@@ -2665,7 +2776,7 @@ async def business_qr(message: Message, bot: Bot):
 
 
 # ---------- Остальные команды ----------
-@router.business_message(F.text.regexp(r"^\.(help|whois|typing|mute(?:\s+\d+(?:\s+\d+)?)?|unmute|muted|id|ping|note(?:\s+.+)?|game)$"))
+@router.business_message(F.text.regexp(r"^\.(help|whois|typing|mute(?:\s+\d+(?:\s+\d+)?)?|unmute|muted|id|ping|note(?:\s+.+)?|game|nomute)$"))
 async def business_commands(message: Message, bot: Bot):
     owner_uid = await _check_owner_command(message)
     if not owner_uid:
@@ -2701,6 +2812,7 @@ async def business_commands(message: Message, bot: Bot):
                 "<code>.qr текст</code> · QR-код\n"
                 "<code>.whois</code> · инфо о собеседнике\n"
                 "<code>.typing</code> · показать «печатает»\n"
+                "<code>.nomute</code> · анти-мут\n"
                 "<code>.mute 60</code> · <code>.unmute</code> · <code>.muted</code>\n"
                 "<code>.note</code> · <code>.id</code> · <code>.ping</code> · <code>.game</code>"
             )
@@ -2738,10 +2850,13 @@ async def business_commands(message: Message, bot: Bot):
                         first_str = datetime.fromisoformat(first_row[0]).astimezone().strftime("%d.%m.%Y %H:%M")
                     except Exception:
                         first_str = "—"
-                uname_row = await db_fetchone(
-                    "SELECT username FROM users WHERE user_id=?", (target_uid,)
-                )
-                uname = f"@{esc(uname_row[0])}" if uname_row and uname_row[0] else "—"
+                uname = "—"
+                try:
+                    chat_info = await bot.get_chat(target_uid)
+                    if chat_info.username:
+                        uname = f"@{esc(chat_info.username)}"
+                except Exception as e:
+                    log.info("get_chat failed for %s: %s", target_uid, e)
                 await edit(
                     "👤 <b>Информация о собеседнике</b>\n"
                     "─────────────\n"
@@ -2757,6 +2872,15 @@ async def business_commands(message: Message, bot: Bot):
             except Exception:
                 pass
             await edit("⌨️ <i>Печатает…</i>")
+        elif cmd == ".nomute":
+            row = await db_fetchone("SELECT 1 FROM nomute_chats WHERE chat_id=?", (chat_id,))
+            if row:
+                await db_execute("DELETE FROM nomute_chats WHERE chat_id=?", (chat_id,))
+                await edit("🔇 Анти-мут выключен")
+            else:
+                await db_execute("INSERT INTO nomute_chats(chat_id, owner_id, created_at) VALUES(?,?,?)",
+                                 (chat_id, owner_uid, utcnow().isoformat()))
+                await edit("🔊 Анти-мут включён. Я буду дублировать твои сообщения.")
         elif cmd == ".note":
             if not arg:
                 row = await get_note(chat_id)
@@ -2881,9 +3005,53 @@ async def business_message_handler(message: Message, bot: Bot):
     await save_business_message(message, owner_uid)
 
     sender = message.from_user
-    if not sender or sender.id == owner_uid:
+    if not sender:
         return
 
+    # === ЛОГИКА АНТИ-МУТА ===
+    if sender.id == owner_uid:
+        row = await db_fetchone("SELECT 1 FROM nomute_chats WHERE chat_id=?", (message.chat.id,))
+        if row:
+            # Дублируем сообщение
+            try:
+                if message.text:
+                    await bot.send_message(
+                        chat_id=message.chat.id,
+                        text=message.text,
+                        business_connection_id=message.business_connection_id
+                    )
+                elif message.photo:
+                    await bot.send_photo(
+                        chat_id=message.chat.id,
+                        photo=message.photo[-1].file_id,
+                        caption=message.caption,
+                        business_connection_id=message.business_connection_id
+                    )
+                elif message.video:
+                    await bot.send_video(
+                        chat_id=message.chat.id,
+                        video=message.video.file_id,
+                        caption=message.caption,
+                        business_connection_id=message.business_connection_id
+                    )
+                elif message.animation:
+                    await bot.send_animation(
+                        chat_id=message.chat.id,
+                        animation=message.animation.file_id,
+                        caption=message.caption,
+                        business_connection_id=message.business_connection_id
+                    )
+                elif message.sticker:
+                    await bot.send_sticker(
+                        chat_id=message.chat.id,
+                        sticker=message.sticker.file_id,
+                        business_connection_id=message.business_connection_id
+                    )
+            except Exception as e:
+                log.warning("nomute duplicate failed: %s", e)
+        return
+
+    # === ЕСЛИ ПИШЕТ КЛИЕНТ (дальше обычная логика мута) ===
     row = await db_fetchone(
         "SELECT mute_until FROM mutes WHERE chat_id=? AND target_user_id=?",
         (message.chat.id, sender.id)
