@@ -955,7 +955,7 @@ async def cmd_start(message: Message, command: Command):
     )
 
 
-# ---------- РУЛЕТКА (Слот-машина) ----------
+# ---------- РУЛЕТКА (Строгая логика) ----------
 @router.callback_query(F.data == "spin:start")
 async def cb_spin_start(call: CallbackQuery):
     if not await require_sub(call):
@@ -964,6 +964,10 @@ async def cb_spin_start(call: CallbackQuery):
     
     # 1. ПРОВЕРКА КУЛДАУНА
     now = utcnow()
+    can_spin = True
+    next_spin_str = ""
+    extra_spins = 0
+    
     try:
         row = await db_fetchone("SELECT last_spin, extra_spins FROM spin_cooldowns WHERE user_id=?", (user_id,))
         last_spin_str = row[0] if row else None
@@ -971,22 +975,40 @@ async def cb_spin_start(call: CallbackQuery):
 
         if extra_spins <= 0 and last_spin_str:
             last_spin = datetime.fromisoformat(last_spin_str)
-            if (now - last_spin).total_seconds() < 86400:
-                await call.answer("⏱ Вы уже крутили сегодня! Возвращайтесь завтра.", show_alert=True)
-                return
+            elapsed = (now - last_spin).total_seconds()
+            if elapsed < 86400:
+                can_spin = False
+                rem_sec = int(86400 - elapsed)
+                hours = rem_sec // 3600
+                mins = (rem_sec % 3600) // 60
+                next_spin_str = f"{hours} ч {mins} мин."
     except Exception as e:
         log.error(f"Error checking spin cooldown: {e}")
-        extra_spins = 0
+        can_spin = False
+        next_spin_str = "неизвестно"
 
-    # Красивый вывод: лента сверху, стрелка снизу по центру
+    # Если крутить нельзя
+    if not can_spin:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:main")]
+        ])
+        await call.message.edit_text(
+            "🎰 <b>Рулетка BobMod</b>\n"
+            "─────────────\n"
+            f"⏱ <b>Крутить пока нельзя!</b>\n\n"
+            f"Следующая прокрутка через:\n<b>{next_spin_str}</b>",
+            reply_markup=kb
+        )
+        await call.answer("Приходите позже!", show_alert=True)
+        return
+
+    # Если можно — показываем рулетку
     text = (
         "🎰 <b>Рулетка BobMod</b>\n"
         "─────────────\n"
         f"🎟 <b>Доступно попыток:</b> {extra_spins if extra_spins > 0 else '1 (ежедневная)'}\n\n"
-        "<blockquote>"
-        "<code>📦  🎟  💎  👑  🏆</code>\n"
-        "　　　　⬆️"
-        "</blockquote>\n\n"
+        "📦  🎟  💎  👑  🏆\n"
+        "　　　⬆️\n\n"
         "Нажми кнопку ниже, чтобы испытать удачу!"
     )
     
@@ -1007,9 +1029,21 @@ async def cb_spin_roll(call: CallbackQuery, bot: Bot):
     msg_id = call.message.message_id
     chat_id = call.message.chat.id
 
+    # 1. ПОВТОРНАЯ ПРОВЕРКА (защита от двойного клика)
+    now = utcnow()
+    row = await db_fetchone("SELECT last_spin, extra_spins FROM spin_cooldowns WHERE user_id=?", (user_id,))
+    last_spin_str = row[0] if row else None
+    extra_spins = row[1] if row else 0
+
+    if extra_spins <= 0 and last_spin_str:
+        last_spin = datetime.fromisoformat(last_spin_str)
+        if (now - last_spin).total_seconds() < 86400:
+            await call.answer("⏱ Кулдаун ещё не прошёл!", show_alert=True)
+            return
+
     await call.answer("Крутим...")
     
-    # Генерируем приз
+    # 2. ГЕНЕРАЦИЯ ПРИЗА
     rand = random.random() * 100
     if rand < 85:
         prize_idx, days, text, icon = 0, 0, "Пусто", "📦"
@@ -1022,10 +1056,7 @@ async def cb_spin_roll(call: CallbackQuery, bot: Bot):
     else:
         prize_idx, days, text, icon = 4, 30, "30 дней", "🏆"
 
-    # Списание попытки
-    now = utcnow()
-    row = await db_fetchone("SELECT extra_spins FROM spin_cooldowns WHERE user_id=?", (user_id,))
-    extra_spins = row[0] if row else 0
+    # 3. СПИСАНИЕ
     if extra_spins > 0:
         await db_execute("UPDATE spin_cooldowns SET extra_spins = extra_spins - 1 WHERE user_id=?", (user_id,))
         extra_spins -= 1
@@ -1035,48 +1066,42 @@ async def cb_spin_roll(call: CallbackQuery, bot: Bot):
             (user_id, now.isoformat())
         )
 
-    # Начисление награды
+    # 4. НАЧИСЛЕНИЕ
     until = None
     if days > 0:
         until = await grant_premium(user_id, days=days)
 
-    # === АНИМАЦИЯ КРУЧЕНИЯ ===
+    # 5. АНИМАЦИЯ
     all_emojis = ["📦", "🎟", "💎", "👑", "🏆"]
     
     for i in range(5):
         rotated = all_emojis[i:] + all_emojis[:i]
         bar_text = "  ".join(rotated)
-        arrow_line = "　　　⬆️"
         
         try:
             await bot.edit_message_text(
                 chat_id=chat_id, message_id=msg_id,
                 text=f"🎰 <b>Рулетка BobMod</b>\n─────────────\n\n"
-                     f"<blockquote>"
-                     f"<code>{bar_text}</code>\n"
-                     f"{arrow_line}"
-                     f"</blockquote>\n\n"
+                     f"{bar_text}\n"
+                     f"　　　⬆️\n\n"
                      f"<i>Крутим...</i>"
             )
         except Exception:
             pass
         await asyncio.sleep(0.3)
 
-    # === ФИНАЛ: ВЫИГРЫШ ПОД СТРЕЛКОЙ ===
+    # 6. ФИНАЛ
     shift = (prize_idx - 2) % 5
     final_emojis = all_emojis[shift:] + all_emojis[:shift]
     final_bar = "  ".join(final_emojis)
-    final_arrow = "　　　⬆️"
     
     if days > 0:
         emoji = "🏆" if days == 30 else "🎉"
         result_text = (
             f"{emoji} <b>Поздравляем!</b>\n"
             "─────────────\n"
-            f"<blockquote>"
-            f"<code>{final_bar}</code>\n"
-            f"{final_arrow}"
-            f"</blockquote>\n\n"
+            f"{final_bar}\n"
+            f"　　　⬆️\n\n"
             f"Вы выиграли: {icon} <b>{text}</b> Premium!\n\n"
             f"Ваш Premium активен до:\n<b>{until.astimezone().strftime('%d.%m.%Y %H:%M')}</b>\n\n"
             f"<i>Осталось попыток: {extra_spins}</i>"
@@ -1085,10 +1110,8 @@ async def cb_spin_roll(call: CallbackQuery, bot: Bot):
         result_text = (
             "📦 <b>Пусто...</b>\n"
             "─────────────\n"
-            f"<blockquote>"
-            f"<code>{final_bar}</code>\n"
-            f"{final_arrow}"
-            f"</blockquote>\n\n"
+            f"{final_bar}\n"
+            f"　　　⬆️\n\n"
             "В этот раз не повезло. Попробуйте завтра!\n\n"
             f"<i>Осталось попыток: {extra_spins}</i>"
         )
@@ -2392,6 +2415,20 @@ async def handle_admin_input(message: Message, action: str, value: str):
             reason = value if value != "-" else ""
             await ban_user(uid, reason)
             await message.answer(f"✅ Пользователь <code>{uid}</code> забанен.")
+            return
+        if action == "broadcast":
+            # Пересылаем это сообщение всем юзерам
+            users = await db_fetchall("SELECT user_id FROM users")
+            count = 0
+            await message.answer("⏳ Начинаю рассылку...")
+            for row in users:
+                try:
+                    await message.copy_to(chat_id=row[0])
+                    count += 1
+                    await asyncio.sleep(0.05)  # Защита от лимитов Telegram
+                except Exception:
+                    pass
+            await message.answer(f"✅ Рассылка завершена. Отправлено: {count} из {len(users)}")
             return
     except Exception as e:
         log.exception("Error in handle_admin_input")
