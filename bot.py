@@ -6,7 +6,6 @@ import random
 import re
 import shutil
 import tempfile
-import urllib.parse
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from zoneinfo import ZoneInfo
@@ -127,7 +126,7 @@ bot_ref: Bot = None
 db_client: libsql_client.Client = None
 
 
-# ---------------- Turso DB (с защитой от падений) ----------------
+# ---------------- Turso DB ----------------
 async def db_execute(sql: str, args: tuple = ()):
     try:
         return await db_client.execute(sql, args)
@@ -867,6 +866,7 @@ def admin_menu():
         [InlineKeyboardButton(text="📊 Статистика", callback_data="adm:stats")],
         [InlineKeyboardButton(text="🎁 Рефералы", callback_data="adm:refs")],
         [InlineKeyboardButton(text="👥 Пользователи", callback_data="adm:users")],
+        [InlineKeyboardButton(text="📢 Рассылка", callback_data="adm:broadcast")],
         [InlineKeyboardButton(text="🚫 Баны", callback_data="adm:bans")],
         [InlineKeyboardButton(text="⚙️ Система", callback_data="adm:sys")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:main")],
@@ -956,7 +956,7 @@ async def cmd_start(message: Message, command: Command):
     )
 
 
-# ---------- РУЛЕТКА (Запуск) ----------
+# ---------- РУЛЕТКА (Внутри Telegram) ----------
 @router.callback_query(F.data == "spin:start")
 async def cb_spin_start(call: CallbackQuery):
     if not await require_sub(call):
@@ -977,10 +977,35 @@ async def cb_spin_start(call: CallbackQuery):
                 return
     except Exception as e:
         log.error(f"Error checking spin cooldown: {e}")
-        # Если БД тупит, лучше не блокировать
         extra_spins = 0
 
-    # 2. ГЕНЕРАЦИЯ ПРИЗА НА СЕРВЕРЕ
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Крутить", callback_data="spin:roll")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:main")]
+    ])
+    
+    await call.message.edit_text(
+        "🎰 <b>Рулетка BobMod</b>\n\n"
+        "▫️▫️▫️🎯▫️▫️▫️\n\n"
+        "Нажми кнопку ниже, чтобы испытать удачу!\n"
+        "<i>Шансы: 85% пусто, 10% - 1 день, 4% - 3 дня, 0.9% - 10 дней, 0.1% - 30 дней.</i>",
+        reply_markup=kb
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data == "spin:roll")
+async def cb_spin_roll(call: CallbackQuery, bot: Bot):
+    if not await require_sub(call):
+        return
+    user_id = call.from_user.id
+    msg_id = call.message.message_id
+    chat_id = call.message.chat.id
+
+    # Защита от повторных кликов
+    await call.answer("Крутим...")
+    
+    # Генерируем приз
     rand = random.random() * 100
     if rand < 85:
         prize_id, days, text, icon = "lose", 0, "Пусто", "📦"
@@ -993,7 +1018,10 @@ async def cb_spin_start(call: CallbackQuery):
     else:
         prize_id, days, text, icon = "d30", 30, "30 дней", "🏆"
 
-    # 3. СПИСАНИЕ ПОПЫТКИ
+    # Списание попытки (кулдаун)
+    now = utcnow()
+    row = await db_fetchone("SELECT extra_spins FROM spin_cooldowns WHERE user_id=?", (user_id,))
+    extra_spins = row[0] if row else 0
     if extra_spins > 0:
         await db_execute("UPDATE spin_cooldowns SET extra_spins = extra_spins - 1 WHERE user_id=?", (user_id,))
     else:
@@ -1002,28 +1030,57 @@ async def cb_spin_start(call: CallbackQuery):
             (user_id, now.isoformat())
         )
 
-    # 4. НАЧИСЛЕНИЕ НАГРАДЫ (сразу в БД)
+    # Начисление награды
+    until = None
     if days > 0:
-        await grant_premium(user_id, days=days)
+        until = await grant_premium(user_id, days=days)
 
-    # 5. ФОРМИРУЕМ ССЫЛКУ ДЛЯ HTML (чтобы он показал нужную анимацию)
-    payload = json.dumps({"prize_id": prize_id, "days": days, "text": text, "icon": icon}, ensure_ascii=False)
-    encoded_payload = urllib.parse.quote(payload)
-    
-    # Ссылка на твой гитхаб (добавлен ?v=2 для сброса кэша)
-    web_app_url = f"https://opoagkgk-ui.github.io/bobhtml/?v=2&data={encoded_payload}"
-    
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🎰 Открыть рулетку", web_app=WebAppInfo(url=web_app_url))],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:main")]
-    ])
-    
-    await call.message.edit_text(
-        "🎰 <b>Рулетка готова!</b>\n"
-        "<i>Результат уже выбран сервером. Нажми кнопку ниже, чтобы увидеть анимацию.</i>",
-        reply_markup=kb
-    )
-    await call.answer()
+    # Анимация кручения
+    frames = [
+        "▫️🎯▫️▫️▫️▫️▫️",
+        "▫️▫️🎯▫️▫️▫️▫️",
+        "▫️▫️▫️🎯▫️▫️▫️",
+        "▫️▫️▫️▫️▫️🎯▫️",
+    ]
+    for frame in frames:
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id, message_id=msg_id,
+                text=f"🎰 <b>Рулетка BobMod</b>\n\n<b>{frame}</b>\n\n<i>Крутим...</i>"
+            )
+        except Exception:
+            pass
+        await asyncio.sleep(0.3)
+
+    # Результат
+    if days > 0:
+        emoji = "🏆" if days == 30 else "🎉"
+        result_text = (
+            f"{emoji} <b>Поздравляем!</b>\n\n"
+            f"Вы выиграли: {icon} <b>{text}</b> Premium!\n\n"
+            f"Ваш Premium активен до: <b>{until.astimezone().strftime('%d.%m.%Y %H:%M')}</b>"
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:main")]
+        ])
+    else:
+        result_text = (
+            f"📦 <b>Пусто...</b>\n\n"
+            f"В этот раз не повезло. Попробуйте завтра!\n\n"
+            "<i>Кулдаун: 24 часа</i>"
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:main")]
+        ])
+
+    try:
+        await bot.edit_message_text(
+            chat_id=chat_id, message_id=msg_id,
+            text=result_text,
+            reply_markup=kb
+        )
+    except Exception as e:
+        log.error(f"Error editing result message: {e}")
 
 
 @router.message(Command("help"))
@@ -1924,6 +1981,19 @@ async def cb_adm_refs_publish(call: CallbackQuery):
         return
     ok = await publish_weekly_top(manual=True)
     await call.answer("✅ Отправлено в канал" if ok else "❌ Не удалось отправить", show_alert=True)
+
+
+@router.callback_query(F.data == "adm:broadcast")
+async def cb_adm_broadcast(call: CallbackQuery):
+    if call.from_user.id != owner_id:
+        return
+    pending_admin[owner_id] = "broadcast"
+    await call.message.answer(
+        "📢 <b>Режим рассылки</b>\n\n"
+        "Отправьте любое сообщение (текст, фото, видео, гиф), и я перешлю его <b>всем</b> юзерам бота.\n\n"
+        "Для отмены — /cancel"
+    )
+    await call.answer()
 
 
 @router.callback_query(F.data == "adm:users")
@@ -3410,4 +3480,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         pass
-        
