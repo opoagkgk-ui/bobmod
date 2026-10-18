@@ -6,6 +6,7 @@ import random
 import re
 import shutil
 import tempfile
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from zoneinfo import ZoneInfo
@@ -112,6 +113,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 log = logging.getLogger("bobmod")
 router = Router()
 
+# ---------------- State ----------------
 guess_games = {}
 roulette_games = {}
 ttt_games = {}
@@ -125,6 +127,7 @@ bot_ref: Bot = None
 db_client: libsql_client.Client = None
 
 
+# ---------------- Turso DB (с защитой от падений) ----------------
 async def db_execute(sql: str, args: tuple = ()):
     try:
         return await db_client.execute(sql, args)
@@ -846,7 +849,7 @@ async def cb_check_sub(call: CallbackQuery):
 
 def main_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🎰 Рулетка", web_app=WebAppInfo(url="https://opoagkgk-ui.github.io/bobhtml/"))],
+        [InlineKeyboardButton(text="🎰 Рулетка", callback_data="spin:start")],
         [InlineKeyboardButton(text="⚙️ Настройки", callback_data="menu:settings")],
         [InlineKeyboardButton(text="💎 Premium", callback_data="menu:premium")],
         [InlineKeyboardButton(text="🎁 Рефералка", callback_data="menu:ref")],
@@ -953,57 +956,74 @@ async def cmd_start(message: Message, command: Command):
     )
 
 
-# ---------- Обработка данных из Рулетки ----------
-@router.message(F.web_app_data)
-async def handle_web_app_data(message: Message):
-    user = message.from_user
-    if not user:
+# ---------- РУЛЕТКА (Запуск) ----------
+@router.callback_query(F.data == "spin:start")
+async def cb_spin_start(call: CallbackQuery):
+    if not await require_sub(call):
         return
+    user_id = call.from_user.id
     
-    if not await require_sub(message):
-        return
-
+    # 1. ПРОВЕРКА КУЛДАУНА
+    now = utcnow()
     try:
-        data = json.loads(message.web_app_data.data)
-    except Exception:
-        return
-
-    try:
-        now = utcnow()
-        row = await db_fetchone("SELECT last_spin, extra_spins FROM spin_cooldowns WHERE user_id=?", (user.id,))
-        
+        row = await db_fetchone("SELECT last_spin, extra_spins FROM spin_cooldowns WHERE user_id=?", (user_id,))
         last_spin_str = row[0] if row else None
         extra_spins = row[1] if row else 0
 
         if extra_spins <= 0 and last_spin_str:
             last_spin = datetime.fromisoformat(last_spin_str)
             if (now - last_spin).total_seconds() < 86400:
-                await message.answer("⏱ Вы уже крутили сегодня! Возвращайтесь завтра.")
+                await call.answer("⏱ Вы уже крутили сегодня! Возвращайтесь завтра.", show_alert=True)
                 return
-
-        days = int(data.get("days", 0))
-
-        if extra_spins > 0:
-            await db_execute("UPDATE spin_cooldowns SET extra_spins = extra_spins - 1 WHERE user_id=?", (user.id,))
-        else:
-            await db_execute(
-                "INSERT OR REPLACE INTO spin_cooldowns(user_id, last_spin, extra_spins) VALUES(?,?,0)",
-                (user.id, now.isoformat())
-            )
-
-        if days > 0:
-            until = await grant_premium(user.id, days=days)
-            emoji = "🏆" if days == 30 else "🎉"
-            await message.answer(
-                f"{emoji} <b>Поздравляем!</b>\n"
-                f"Вы выиграли <b>{days} дн. Premium</b>!\n\n"
-                f"Ваш Premium активен до: <b>{until.astimezone().strftime('%d.%m.%Y %H:%M')}</b>"
-            )
-        else:
-            await message.answer("📦 <b>Пусто...</b>\nВ этот раз не повезло. Попробуйте завтра!")
     except Exception as e:
-        log.exception("Ошибка в handle_web_app_data")
-        await message.answer(f"❌ Ошибка рулетки: <code>{esc(str(e))}</code>")
+        log.error(f"Error checking spin cooldown: {e}")
+        # Если БД тупит, лучше не блокировать
+        extra_spins = 0
+
+    # 2. ГЕНЕРАЦИЯ ПРИЗА НА СЕРВЕРЕ
+    rand = random.random() * 100
+    if rand < 85:
+        prize_id, days, text, icon = "lose", 0, "Пусто", "📦"
+    elif rand < 95:
+        prize_id, days, text, icon = "d1", 1, "1 день", "🎟️"
+    elif rand < 99:
+        prize_id, days, text, icon = "d3", 3, "3 дня", "💎"
+    elif rand < 99.9:
+        prize_id, days, text, icon = "d10", 10, "10 дней", "👑"
+    else:
+        prize_id, days, text, icon = "d30", 30, "30 дней", "🏆"
+
+    # 3. СПИСАНИЕ ПОПЫТКИ
+    if extra_spins > 0:
+        await db_execute("UPDATE spin_cooldowns SET extra_spins = extra_spins - 1 WHERE user_id=?", (user_id,))
+    else:
+        await db_execute(
+            "INSERT OR REPLACE INTO spin_cooldowns(user_id, last_spin, extra_spins) VALUES(?,?,0)",
+            (user_id, now.isoformat())
+        )
+
+    # 4. НАЧИСЛЕНИЕ НАГРАДЫ (сразу в БД)
+    if days > 0:
+        await grant_premium(user_id, days=days)
+
+    # 5. ФОРМИРУЕМ ССЫЛКУ ДЛЯ HTML (чтобы он показал нужную анимацию)
+    payload = json.dumps({"prize_id": prize_id, "days": days, "text": text, "icon": icon}, ensure_ascii=False)
+    encoded_payload = urllib.parse.quote(payload)
+    
+    # Ссылка на твой гитхаб (добавлен ?v=2 для сброса кэша)
+    web_app_url = f"https://opoagkgk-ui.github.io/bobhtml/?v=2&data={encoded_payload}"
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎰 Открыть рулетку", web_app=WebAppInfo(url=web_app_url))],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:main")]
+    ])
+    
+    await call.message.edit_text(
+        "🎰 <b>Рулетка готова!</b>\n"
+        "<i>Результат уже выбран сервером. Нажми кнопку ниже, чтобы увидеть анимацию.</i>",
+        reply_markup=kb
+    )
+    await call.answer()
 
 
 @router.message(Command("help"))
@@ -3013,7 +3033,6 @@ async def business_message_handler(message: Message, bot: Bot):
     if sender.id == owner_uid:
         row = await db_fetchone("SELECT 1 FROM nomute_chats WHERE chat_id=?", (message.chat.id,))
         if row:
-            # Дублируем сообщение
             try:
                 if message.text:
                     await bot.send_message(
@@ -3391,3 +3410,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         pass
+        
