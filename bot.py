@@ -21,7 +21,6 @@ from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
     BusinessConnection, BusinessMessagesDeleted,
     FSInputFile, BufferedInputFile, LabeledPrice, PreCheckoutQuery,
-    WebAppInfo,
 )
 from dotenv import load_dotenv
 
@@ -956,7 +955,7 @@ async def cmd_start(message: Message, command: Command):
     )
 
 
-# ---------- РУЛЕТКА (Внутри Telegram) ----------
+# ---------- РУЛЕТКА (Слот-машина) ----------
 @router.callback_query(F.data == "spin:start")
 async def cb_spin_start(call: CallbackQuery):
     if not await require_sub(call):
@@ -979,18 +978,24 @@ async def cb_spin_start(call: CallbackQuery):
         log.error(f"Error checking spin cooldown: {e}")
         extra_spins = 0
 
+    # Красивый вывод: лента сверху, стрелка снизу по центру
+    text = (
+        "🎰 <b>Рулетка BobMod</b>\n"
+        "─────────────\n"
+        f"🎟 <b>Доступно попыток:</b> {extra_spins if extra_spins > 0 else '1 (ежедневная)'}\n\n"
+        "<blockquote>"
+        "<code>📦  🎟  💎  👑  🏆</code>\n"
+        "　　　　⬆️"
+        "</blockquote>\n\n"
+        "Нажми кнопку ниже, чтобы испытать удачу!"
+    )
+    
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔄 Крутить", callback_data="spin:roll")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:main")]
     ])
     
-    await call.message.edit_text(
-        "🎰 <b>Рулетка BobMod</b>\n\n"
-        "▫️▫️▫️🎯▫️▫️▫️\n\n"
-        "Нажми кнопку ниже, чтобы испытать удачу!\n"
-        "<i>Шансы: 85% пусто, 10% - 1 день, 4% - 3 дня, 0.9% - 10 дней, 0.1% - 30 дней.</i>",
-        reply_markup=kb
-    )
+    await call.message.edit_text(text, reply_markup=kb)
     await call.answer()
 
 
@@ -1002,28 +1007,28 @@ async def cb_spin_roll(call: CallbackQuery, bot: Bot):
     msg_id = call.message.message_id
     chat_id = call.message.chat.id
 
-    # Защита от повторных кликов
     await call.answer("Крутим...")
     
     # Генерируем приз
     rand = random.random() * 100
     if rand < 85:
-        prize_id, days, text, icon = "lose", 0, "Пусто", "📦"
+        prize_idx, days, text, icon = 0, 0, "Пусто", "📦"
     elif rand < 95:
-        prize_id, days, text, icon = "d1", 1, "1 день", "🎟️"
+        prize_idx, days, text, icon = 1, 1, "1 день", "🎟"
     elif rand < 99:
-        prize_id, days, text, icon = "d3", 3, "3 дня", "💎"
+        prize_idx, days, text, icon = 2, 3, "3 дня", "💎"
     elif rand < 99.9:
-        prize_id, days, text, icon = "d10", 10, "10 дней", "👑"
+        prize_idx, days, text, icon = 3, 10, "10 дней", "👑"
     else:
-        prize_id, days, text, icon = "d30", 30, "30 дней", "🏆"
+        prize_idx, days, text, icon = 4, 30, "30 дней", "🏆"
 
-    # Списание попытки (кулдаун)
+    # Списание попытки
     now = utcnow()
     row = await db_fetchone("SELECT extra_spins FROM spin_cooldowns WHERE user_id=?", (user_id,))
     extra_spins = row[0] if row else 0
     if extra_spins > 0:
         await db_execute("UPDATE spin_cooldowns SET extra_spins = extra_spins - 1 WHERE user_id=?", (user_id,))
+        extra_spins -= 1
     else:
         await db_execute(
             "INSERT OR REPLACE INTO spin_cooldowns(user_id, last_spin, extra_spins) VALUES(?,?,0)",
@@ -1035,44 +1040,63 @@ async def cb_spin_roll(call: CallbackQuery, bot: Bot):
     if days > 0:
         until = await grant_premium(user_id, days=days)
 
-    # Анимация кручения
-    frames = [
-        "▫️🎯▫️▫️▫️▫️▫️",
-        "▫️▫️🎯▫️▫️▫️▫️",
-        "▫️▫️▫️🎯▫️▫️▫️",
-        "▫️▫️▫️▫️▫️🎯▫️",
-    ]
-    for frame in frames:
+    # === АНИМАЦИЯ КРУЧЕНИЯ ===
+    all_emojis = ["📦", "🎟", "💎", "👑", "🏆"]
+    
+    for i in range(5):
+        rotated = all_emojis[i:] + all_emojis[:i]
+        bar_text = "  ".join(rotated)
+        arrow_line = "　　　⬆️"
+        
         try:
             await bot.edit_message_text(
                 chat_id=chat_id, message_id=msg_id,
-                text=f"🎰 <b>Рулетка BobMod</b>\n\n<b>{frame}</b>\n\n<i>Крутим...</i>"
+                text=f"🎰 <b>Рулетка BobMod</b>\n─────────────\n\n"
+                     f"<blockquote>"
+                     f"<code>{bar_text}</code>\n"
+                     f"{arrow_line}"
+                     f"</blockquote>\n\n"
+                     f"<i>Крутим...</i>"
             )
         except Exception:
             pass
         await asyncio.sleep(0.3)
 
-    # Результат
+    # === ФИНАЛ: ВЫИГРЫШ ПОД СТРЕЛКОЙ ===
+    shift = (prize_idx - 2) % 5
+    final_emojis = all_emojis[shift:] + all_emojis[:shift]
+    final_bar = "  ".join(final_emojis)
+    final_arrow = "　　　⬆️"
+    
     if days > 0:
         emoji = "🏆" if days == 30 else "🎉"
         result_text = (
-            f"{emoji} <b>Поздравляем!</b>\n\n"
+            f"{emoji} <b>Поздравляем!</b>\n"
+            "─────────────\n"
+            f"<blockquote>"
+            f"<code>{final_bar}</code>\n"
+            f"{final_arrow}"
+            f"</blockquote>\n\n"
             f"Вы выиграли: {icon} <b>{text}</b> Premium!\n\n"
-            f"Ваш Premium активен до: <b>{until.astimezone().strftime('%d.%m.%Y %H:%M')}</b>"
+            f"Ваш Premium активен до:\n<b>{until.astimezone().strftime('%d.%m.%Y %H:%M')}</b>\n\n"
+            f"<i>Осталось попыток: {extra_spins}</i>"
         )
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:main")]
-        ])
     else:
         result_text = (
-            f"📦 <b>Пусто...</b>\n\n"
-            f"В этот раз не повезло. Попробуйте завтра!\n\n"
-            "<i>Кулдаун: 24 часа</i>"
+            "📦 <b>Пусто...</b>\n"
+            "─────────────\n"
+            f"<blockquote>"
+            f"<code>{final_bar}</code>\n"
+            f"{final_arrow}"
+            f"</blockquote>\n\n"
+            "В этот раз не повезло. Попробуйте завтра!\n\n"
+            f"<i>Осталось попыток: {extra_spins}</i>"
         )
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:main")]
-        ])
 
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:main")]
+    ])
+    
     try:
         await bot.edit_message_text(
             chat_id=chat_id, message_id=msg_id,
