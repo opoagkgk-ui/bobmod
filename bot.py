@@ -1,4 +1,5 @@
 import asyncio
+import difflib
 import json
 import logging
 import os
@@ -409,6 +410,20 @@ def local_now(tz_name="UTC"):
 def esc(s):
     return (str(s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
 
+PE_GEM_PREMIUM = "<tg-emoji emoji-id='5445223416917422632'>💎</tg-emoji> Premium"
+
+_PE_IDS = {
+    "🌐": "5444858026869679390", "🎭": "5444921463536641665", "📏": "5444921463536641665",
+    "🗣": "5444921463536641665", "😊": "5445223416917422632", "🎯": "5445223416917422632",
+    "🧩": "5445223416917422632",
+}
+
+def pe(text):
+    """Подставляет премиум-эмодзи в заголовок категории конструктора (только для текста сообщений)."""
+    for ch, eid in _PE_IDS.items():
+        text = text.replace(ch, f"<tg-emoji emoji-id='{eid}'>{ch}</tg-emoji>", 1)
+    return text
+
 def watermark():
     return f"\n\n<i>via @{BOT_USERNAME}</i>"
 
@@ -469,13 +484,14 @@ async def get_user_prompt(user_id: int) -> str:
             log.warning("constructor parse error: %s", e)
     return DEFAULT_PROMPT
 
-async def ask_ai(prompt: str, user_id: int = None) -> str:
-    system_prompt = DEFAULT_PROMPT
-    if user_id:
-        try:
-            system_prompt = await get_user_prompt(user_id)
-        except Exception as e:
-            log.warning("get_user_prompt failed: %s", e)
+async def ask_ai(prompt: str, user_id: int = None, system_prompt: str = None) -> str:
+    if system_prompt is None:
+        system_prompt = DEFAULT_PROMPT
+        if user_id:
+            try:
+                system_prompt = await get_user_prompt(user_id)
+            except Exception as e:
+                log.warning("get_user_prompt failed: %s", e)
     last_err = None
     errors_log = []
     for p in AI_PROVIDERS:
@@ -918,18 +934,20 @@ async def forward_replied_media(message: Message, owner_uid: int, bot: Bot):
     r = message.reply_to_message
     if not r or not r.from_user or r.from_user.id == owner_uid:
         return
-    # Срабатываем ТОЛЬКО если ответ владельца начинается с триггера (по умолчанию ".")
-    reply_text = (message.text or message.caption or "").strip()
-    if not reply_text.startswith(SAVE_TRIGGER):
-        return
+    # Срабатывает на ЛЮБОЙ ответ владельца на чужое медиа (текст ответа не важен).
+    # Одноразовые фото/видео доступны только если ответить ДО того, как их откроешь.
     _, ctype, fid = message_payload(r)
     if ctype not in ("photo", "video", "voice", "video_note", "animation") or not fid:
-        # Отладка: показываем владельцу, что именно Telegram передал боту вместо медиа
+        # Тихо пропускаем обычные ответы на текст, стикеры, файлы и т.п.
+        if r.text or r.caption or ctype != "text":
+            return
+        # Сообщение вообще без распознанного содержимого (похоже на одноразовое):
+        # отладка — показываем владельцу, что именно Telegram передал боту
         try:
             raw = r.model_dump_json(exclude_none=True)[:3500]
             await bot.send_message(
                 owner_uid,
-                "⚠️ Медиа в сообщении не найдено. Telegram передал боту вот что:\n"
+                "<tg-emoji emoji-id='5445265116754897405'>⚠️</tg-emoji> Медиа в сообщении не найдено. Telegram передал боту вот что:\n"
                 f"<pre>{esc(raw)}</pre>",
             )
         except Exception as e:
@@ -948,7 +966,7 @@ async def forward_replied_media(message: Message, owner_uid: int, bot: Bot):
                "video_note": "mp4", "animation": "mp4"}[ctype]
         file = BufferedInputFile(data, filename=f"saved.{ext}")
         caption = (
-            "💾 <b>Сохранено</b>\n"
+            "<tg-emoji emoji-id='5445265116754897405'>💾</tg-emoji> <b>Сохранено</b>\n"
             f"👤 От: <b>{esc(r.from_user.full_name)}</b> <code>{r.from_user.id}</code>"
         )
         if ctype == "photo":
@@ -1064,6 +1082,7 @@ def main_menu():
         [InlineKeyboardButton(text="💎 Premium", callback_data="menu:premium")],
         [InlineKeyboardButton(text="🎁 Рефералка", callback_data="menu:ref")],
         [InlineKeyboardButton(text="🤖 Bob AI", callback_data="menu:ai")],
+        [InlineKeyboardButton(text="🎮 Игры с ИИ", callback_data="ag:menu")],
         [InlineKeyboardButton(text="📖 Возможности", callback_data="menu:help")],
     ])
 
@@ -1127,7 +1146,7 @@ async def cmd_start(message: Message, command: Command):
         await db_execute("DELETE FROM pending_referrals WHERE user_id=?", (user.id,))
 
     premium = await is_premium(user.id)
-    status = "💎 Premium" if premium else "🆓 Бесплатный тариф"
+    status = "<tg-emoji emoji-id='5445223416917422632'>💎</tg-emoji> Premium" if premium else "🆓 Бесплатный тариф"
     
     # === СТАТУС РУЛЕТКИ: при ошибке БД не обещаем доступную попытку ===
     spin_msg = ""
@@ -1331,13 +1350,16 @@ async def cmd_help(message: Message):
     if not await require_sub(message):
         return
     await message.answer(
-        "<b>📖 Возможности бота</b>\n"
+        "<b><tg-emoji emoji-id='5445094086862205639'>📖</tg-emoji> Возможности бота</b>\n"
         "─────────────\n"
         "<b>Команды в бизнес-чатах:</b>\n"
         "<code>.ai вопрос</code> — запрос к ИИ\n"
         "<code>.save</code> (ответом на ссылку) — загрузка видео\n"
         "<code>.anim текст</code> — анимация текста\n"
         "<code>.qr текст</code> — QR-код\n"
+        "<code>.stt</code> (ответом на голосовое) — расшифровка в ЛС (💎 Premium)\n"
+        "<code>.tr en текст</code> — перевод (ответом — перевод в ЛС)\n"
+        "<code>.sticker</code> (ответом на фото) — сделать стикер\n"
         "<code>.whois</code> — информация о собеседнике\n"
         "<code>.typing</code> — показать «печатает»\n"
         "<code>.nomute</code> — анти-мут\n"
@@ -1345,12 +1367,13 @@ async def cmd_help(message: Message):
         "<code>.note</code> · <code>.id</code> · <code>.ping</code> · <code>.game</code>\n\n"
         "<b>В личных сообщениях:</b>\n"
         "/start · /settings · /ref · /stats\n\n"
-        "<b>💎 Premium даёт:</b>\n"
+        "<b><tg-emoji emoji-id='5445223416917422632'>💎</tg-emoji> Premium даёт:</b>\n"
         f"• {PREMIUM_DAILY_LIMIT} запросов ИИ в день (вместо {FREE_DAILY_LIMIT})\n"
         f"• Задержка {AI_COOLDOWN_PREMIUM} сек (вместо {AI_COOLDOWN_FREE})\n"
         "• Без водяного знака\n"
         "• Иммунитет от <code>.mute</code>\n"
-        "• 🤖 Настройка ИИ под себя\n\n"
+        "• <tg-emoji emoji-id='5445223416917422632'>🤖</tg-emoji> Настройка ИИ под себя\n"
+        "• 🎙 Расшифровка голосовых (<code>.stt</code>)\n\n"
         "<i>Как подключить: Профиль → Изменить → Автоматизация чатов</i>",
         reply_markup=main_menu()
     )
@@ -1375,7 +1398,7 @@ async def cmd_admin(message: Message):
 
 async def render_settings(msg_or_call, user_id, edit=False):
     s = await get_settings(user_id)
-    text = "⚙️ <b>Настройки BobMod</b>\n─────────────\nВыберите раздел для настройки:"
+    text = "<tg-emoji emoji-id='5445223416917422632'>⚙️</tg-emoji> <b>Настройки BobMod</b>\n─────────────\nВыберите раздел для настройки:"
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"💬 Первый ответ: {'✅' if s['answer_first_enabled'] else '❌'}",
                               callback_data="toggle:answer_first_enabled")],
@@ -1414,13 +1437,14 @@ async def cb_premium(call: CallbackQuery):
 
     if not premium:
         text = (
-            "💎 <b>Premium</b>\n─────────────\n"
+            "<tg-emoji emoji-id='5445223416917422632'>💎</tg-emoji> <b>Premium</b>\n─────────────\n"
             "Что даёт Premium:\n"
             f"• <b>{PREMIUM_DAILY_LIMIT} запросов ИИ в день</b> (вместо {FREE_DAILY_LIMIT})\n"
             f"• Задержка <b>{AI_COOLDOWN_PREMIUM} сек</b> (вместо {AI_COOLDOWN_FREE})\n"
             "• Без водяного знака в ответах\n"
             "• Иммунитет от <code>.mute</code>\n"
-            "• 🤖 <b>Настройка ИИ под себя</b>\n\n"
+            "• <tg-emoji emoji-id='5445223416917422632'>🤖</tg-emoji> <b>Настройка ИИ под себя</b>\n"
+            "• 🎙 <b>Расшифровка голосовых</b> (<code>.stt</code>)\n\n"
             f"Цена: <b>{PREMIUM_PRICE_STARS} ⭐</b> на {PREMIUM_DAYS} дней"
         )
         kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -1432,14 +1456,15 @@ async def cb_premium(call: CallbackQuery):
         until = await get_premium_until(user_id)
         until_str = until.astimezone().strftime("%d.%m.%Y %H:%M") if until else "—"
         text = (
-            "💎 <b>Premium</b>\n─────────────\n"
+            "<tg-emoji emoji-id='5445223416917422632'>💎</tg-emoji> <b>Premium</b>\n─────────────\n"
             f"✅ Активен до: <b>{until_str}</b>\n\n"
             "Что вам доступно:\n"
             f"• <b>{PREMIUM_DAILY_LIMIT} запросов ИИ в день</b>\n"
             f"• Задержка <b>{AI_COOLDOWN_PREMIUM} сек</b>\n"
             "• Без водяного знака\n"
             "• Иммунитет от <code>.mute</code>\n"
-            "• 🤖 <b>Настройка ИИ под себя</b>"
+            "• <tg-emoji emoji-id='5445223416917422632'>🤖</tg-emoji> <b>Настройка ИИ под себя</b>\n"
+            "• 🎙 <b>Расшифровка голосовых</b> (<code>.stt</code>)"
         )
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🤖 Настройка ИИ", callback_data="ai:menu")],
@@ -1474,7 +1499,7 @@ async def cb_ai_menu_settings(call: CallbackQuery):
     preview_short = preview[:200] + ("..." if len(preview) > 200 else "")
 
     text = (
-        "🤖 <b>Настройка ИИ</b>\n─────────────\n"
+        "<tg-emoji emoji-id='5445223416917422632'>🤖</tg-emoji> <b>Настройка ИИ</b>\n─────────────\n"
         f"Текущий режим: <b>{mode_names.get(mode, 'Стандартный')}</b>\n\n"
         f"<b>Что видит ИИ сейчас:</b>\n<i>{esc(preview_short)}</i>"
     )
@@ -1502,7 +1527,7 @@ async def cb_ai_custom(call: CallbackQuery):
     ai_s = await get_ai_settings(call.from_user.id)
     current = ai_s["custom_prompt"] or "—"
     text = (
-        "✏️ <b>Свой промпт</b>\n─────────────\n"
+        "<tg-emoji emoji-id='5447635509205559163'>✏️</tg-emoji> <b>Свой промпт</b>\n─────────────\n"
         "Напишите системный промпт — то, как ИИ должен себя вести.\n\n"
         "<b>Примеры:</b>\n"
         "• <i>Ты мой личный помощник, отвечай кратко и по делу</i>\n"
@@ -1531,7 +1556,7 @@ async def cb_ai_custom_edit(call: CallbackQuery):
         return
     pending_ai_input[call.from_user.id] = {"type": "custom_prompt"}
     await call.message.answer(
-        f"✏️ Отправьте текст системного промпта (до {CUSTOM_PROMPT_MAX} символов).\n\n"
+        f"<tg-emoji emoji-id='5447635509205559163'>✏️</tg-emoji> Отправьте текст системного промпта (до {CUSTOM_PROMPT_MAX} символов).\n\n"
         "Для отмены — /cancel"
     )
     await call.answer()
@@ -1550,9 +1575,9 @@ async def cb_ai_constructor(call: CallbackQuery):
     except Exception:
         data = {}
     text = (
-        "🧩 <b>Конструктор промпта</b>\n─────────────\n"
+        "<tg-emoji emoji-id='5445223416917422632'>🧩</tg-emoji> <b>Конструктор промпта</b>\n─────────────\n"
         "Выберите параметры по категориям.\n"
-        "В каждой можно выбрать готовое или нажать «✏️ Другое».\n\n"
+        "В каждой можно выбрать готовое или нажать «<tg-emoji emoji-id='5447635509205559163'>✏️</tg-emoji> Другое».\n\n"
         "<i>Когда закончите — нажмите «✅ Применить»</i>"
     )
     rows = []
@@ -1595,7 +1620,7 @@ async def cb_ai_category(call: CallbackQuery):
         data = {}
     current = data.get(cat_key)
     text = (
-        f"{cat['title']}\n─────────────\n"
+        f"{pe(cat['title'])}\n─────────────\n"
         f"Текущее: <b>{esc(current) if current else '—'}</b>\n\n"
         "Выберите вариант:"
     )
@@ -1670,7 +1695,7 @@ async def cb_ai_cat_other(call: CallbackQuery):
     cat = CONSTRUCTOR_CATEGORIES[cat_key]
     pending_ai_input[call.from_user.id] = {"type": "category", "cat": cat_key}
     await call.message.answer(
-        f"{cat['title']}\n\n"
+        f"{pe(cat['title'])}\n\n"
         f"Напишите свой вариант (до {CUSTOM_CATEGORY_MAX} символов).\n"
         "Для отмены — /cancel"
     )
@@ -1723,12 +1748,12 @@ async def render_ref_panel(msg_or_call, user_id, edit=False):
     earned_days = purchases * REF_BONUS_PURCHASE_DAYS
     premium = await is_premium(user_id)
     text = (
-        "🎁 <b>Реферальная программа</b>\n─────────────\n"
-        f"🔗 <b>Ваша ссылка:</b>\n<code>{ref_link}</code>\n\n"
+        "<tg-emoji emoji-id='5445223416917422632'>🎁</tg-emoji> <b>Реферальная программа</b>\n─────────────\n"
+        f"<tg-emoji emoji-id='5445354937405958522'>🔗</tg-emoji> <b>Ваша ссылка:</b>\n<code>{ref_link}</code>\n\n"
         f"👥 Приглашено: <b>{total}</b>\n"
-        f"💎 Часов за друзей: <b>{earned_hours}</b>\n"
+        f"<tg-emoji emoji-id='5445223416917422632'>💎</tg-emoji> Часов за друзей: <b>{earned_hours}</b>\n"
         f"💰 Дней за покупки: <b>{earned_days}</b>\n"
-        f"Статус: {'💎 Premium' if premium else '🆓 Бесплатный тариф'}\n\n"
+        f"Статус: {PE_GEM_PREMIUM if premium else '🆓 Бесплатный тариф'}\n\n"
         f"<i>За каждого приглашённого: +{REF_BONUS_HOURS} ч Premium</i>\n"
         f"<i>За покупку приглашённого: +{REF_BONUS_PURCHASE_DAYS} дн Premium</i>"
     )
@@ -1779,7 +1804,7 @@ async def cb_ref_battle(call: CallbackQuery):
             lines.append(f"{medals[i]} <b>{esc(name)}</b> — {cnt}")
         text = ("🏆 <b>Битва рефералов</b>\n─────────────\nТоп за эту неделю:\n\n"
                 + "\n".join(lines)
-                + "\n\n🎁 Победитель получает <b>месяц Premium</b>.\n"
+                + "\n\n<tg-emoji emoji-id='5445223416917422632'>🎁</tg-emoji> Победитель получает <b>месяц Premium</b>.\n"
                   "<i>Итоги в понедельник в @bobmodinfo</i>")
     kb = InlineKeyboardMarkup(inline_keyboard=[back_button("menu:ref")])
     try:
@@ -1803,14 +1828,14 @@ async def cb_ai_menu(call: CallbackQuery):
     cooldown = AI_COOLDOWN_PREMIUM if premium else AI_COOLDOWN_FREE
     filled = int((used / limit) * 10) if limit else 0
     bar = "█" * filled + "░" * (10 - filled)
-    status = "💎 <b>Premium</b>" if premium else "🆓 <b>Бесплатный тариф</b>"
+    status = "<tg-emoji emoji-id='5445223416917422632'>💎</tg-emoji> <b>Premium</b>" if premium else "🆓 <b>Бесплатный тариф</b>"
     text = (
-        "🤖 <b>Bob AI</b>\n─────────────\n"
+        "<tg-emoji emoji-id='5445223416917422632'>🤖</tg-emoji> <b>Bob AI</b>\n─────────────\n"
         f"Статус: {status}\n"
         f"Использовано сегодня: <b>{used}/{limit}</b>\n"
         f"<code>{bar}</code>\n"
         f"⏱ Задержка между запросами: <b>{cooldown} сек</b>\n\n"
-        f"💎 Premium: <b>{PREMIUM_DAILY_LIMIT} запросов в день</b>\n"
+        f"<tg-emoji emoji-id='5445223416917422632'>💎</tg-emoji> Premium: <b>{PREMIUM_DAILY_LIMIT} запросов в день</b>\n"
         f"Цена: <b>{PREMIUM_PRICE_STARS} ⭐</b> на {PREMIUM_DAYS} дней\n\n"
         f"Использование: <code>.ai вопрос</code> в бизнес-чате"
     )
@@ -1831,9 +1856,9 @@ async def cb_main(call: CallbackQuery):
     if not await require_sub(call):
         return
     try:
-        await call.message.edit_text("🏠 <b>Главное меню</b>", reply_markup=main_menu())
+        await call.message.edit_text("<tg-emoji emoji-id='5444858026869679390'>🏠</tg-emoji> <b>Главное меню</b>", reply_markup=main_menu())
     except TelegramBadRequest:
-        await call.message.answer("🏠 <b>Главное меню</b>", reply_markup=main_menu())
+        await call.message.answer("<tg-emoji emoji-id='5444858026869679390'>🏠</tg-emoji> <b>Главное меню</b>", reply_markup=main_menu())
     await call.answer()
 
 
@@ -1842,16 +1867,17 @@ async def cb_help(call: CallbackQuery):
     if not await require_sub(call):
         return
     text = (
-        "<b>📖 Возможности бота</b>\n─────────────\n"
+        "<b><tg-emoji emoji-id='5445094086862205639'>📖</tg-emoji> Возможности бота</b>\n─────────────\n"
         "<b>В бизнес-чатах:</b>\n"
-        "<code>.ai</code> · <code>.save</code> · <code>.anim</code> · <code>.qr</code>\n"
+        "<code>.ai</code> · <code>.save</code> · <code>.anim</code> · <code>.qr</code> · <code>.stt</code> · <code>.tr</code> · <code>.sticker</code>\n"
         "<code>.whois</code> · <code>.typing</code> · <code>.mute</code>\n"
         "<code>.nomute</code> · <code>.note</code> · <code>.id</code> · <code>.ping</code> · <code>.game</code>\n\n"
-        "<b>💎 Premium:</b>\n"
+        "<b><tg-emoji emoji-id='5445223416917422632'>💎</tg-emoji> Premium:</b>\n"
         f"• {PREMIUM_DAILY_LIMIT} запросов ИИ в день\n"
         "• Без водяного знака\n"
         "• Иммунитет от <code>.mute</code>\n"
-        "• 🤖 Настройка ИИ под себя\n\n"
+        "• <tg-emoji emoji-id='5445223416917422632'>🤖</tg-emoji> Настройка ИИ под себя\n"
+        "• 🎙 Расшифровка голосовых (<code>.stt</code>)\n\n"
         "<i>Как подключить: Профиль → Изменить → Автоматизация чатов</i>"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[back_button()])
@@ -1911,6 +1937,10 @@ async def cmd_cancel(message: Message):
     user = message.from_user
     if not user:
         return
+    if user.id in ai_games:
+        ai_games.pop(user.id, None)
+        await message.answer("❌ Игра остановлена")
+        return
     if user.id in pending_ai_input:
         pending_ai_input.pop(user.id, None)
         await message.answer("❌ Отменено")
@@ -1936,11 +1966,11 @@ async def receive_setting_value(message: Message):
         value = (message.text or "").strip()
         if task["type"] == "custom_prompt":
             if len(value) > CUSTOM_PROMPT_MAX:
-                await message.answer(f"⚠️ Слишком длинный промпт (макс. {CUSTOM_PROMPT_MAX}).")
+                await message.answer(f"<tg-emoji emoji-id='5445265116754897405'>⚠️</tg-emoji> Слишком длинный промпт (макс. {CUSTOM_PROMPT_MAX}).")
                 pending_ai_input[user.id] = task
                 return
             if not value:
-                await message.answer("⚠️ Пустой промпт.")
+                await message.answer("<tg-emoji emoji-id='5445265116754897405'>⚠️</tg-emoji> Пустой промпт.")
                 pending_ai_input[user.id] = task
                 return
             await save_ai_settings(user.id, mode="custom", custom_prompt=value)
@@ -1948,11 +1978,11 @@ async def receive_setting_value(message: Message):
         elif task["type"] == "category":
             cat_key = task["cat"]
             if len(value) > CUSTOM_CATEGORY_MAX:
-                await message.answer(f"⚠️ Слишком длинный текст (макс. {CUSTOM_CATEGORY_MAX}).")
+                await message.answer(f"<tg-emoji emoji-id='5445265116754897405'>⚠️</tg-emoji> Слишком длинный текст (макс. {CUSTOM_CATEGORY_MAX}).")
                 pending_ai_input[user.id] = task
                 return
             if not value:
-                await message.answer("⚠️ Пустой текст.")
+                await message.answer("<tg-emoji emoji-id='5445265116754897405'>⚠️</tg-emoji> Пустой текст.")
                 pending_ai_input[user.id] = task
                 return
             ai_s = await get_ai_settings(user.id)
@@ -1964,6 +1994,18 @@ async def receive_setting_value(message: Message):
             await save_ai_settings(user.id, mode="constructor",
                                     constructor_data=json.dumps(data, ensure_ascii=False))
             await message.answer(f"✅ Сохранено: <b>{esc(value)}</b>")
+        return
+
+    game = ai_games.get(user.id)
+    if game and game.get("kind") in ("qz_wait", "gw"):
+        value = (message.text or "").strip()
+        if not value:
+            return
+        if game["kind"] == "qz_wait":
+            ai_games.pop(user.id, None)
+            await start_quiz(message, user.id, value[:60])
+        else:
+            await gw_answer(message, user.id, value)
         return
 
     if user.id == owner_id and owner_id in pending_admin:
@@ -1994,7 +2036,7 @@ async def receive_setting_value(message: Message):
             await set_setting(user.id, "timezone", value)
         await message.answer("✅ Настройка сохранена")
     except Exception as e:
-        await message.answer(f"⚠️ Не удалось сохранить: {esc(e)}")
+        await message.answer(f"<tg-emoji emoji-id='5445265116754897405'>⚠️</tg-emoji> Не удалось сохранить: {esc(e)}")
     await render_settings(message, user.id)
 
 
@@ -2122,6 +2164,436 @@ async def payment_ok(message: Message):
 
 
 # ============================================================
+# ИГРЫ С ИИ (1 на 1: ИИ ведущий, вы играете)
+# ============================================================
+
+ai_games = {}  # user_id -> состояние текущей игры
+
+GAME_SYSTEM = "Ты ведущий игр. Отвечай строго валидным JSON, без пояснений и без markdown."
+QUIZ_TOPICS = {
+    "general": "Общие знания", "movies": "Кино и сериалы", "games": "Видеоигры",
+    "history": "История", "science": "Наука", "music": "Музыка", "sport": "Спорт",
+}
+
+# <pure>
+def extract_json(text):
+    text = (text or "").strip()
+    text = re.sub(r"^```(?:json)?|```$", "", text, flags=re.M).strip()
+    starts = [i for i in (text.find("["), text.find("{")) if i != -1]
+    if not starts:
+        raise ValueError("в ответе нет JSON")
+    end = max(text.rfind("]"), text.rfind("}"))
+    return json.loads(text[min(starts):end + 1])
+
+
+def norm_answer(s):
+    s = (s or "").lower().replace("ё", "е")
+    return re.sub(r"[^\w\s]", "", s).strip()
+
+
+def is_close_answer(guess, word):
+    g, w = norm_answer(guess), norm_answer(word)
+    if not g or not w:
+        return False
+    if g == w:
+        return True
+    return difflib.SequenceMatcher(None, g, w).ratio() >= 0.85
+
+
+def parse_quiz(raw):
+    data = extract_json(raw)
+    if isinstance(data, dict):
+        data = data.get("questions") or data.get("items") or []
+    out = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        q = str(item.get("q") or "").strip()
+        opts = [str(o).strip() for o in (item.get("options") or [])][:4]
+        ans = item.get("answer")
+        if not q or len(opts) != 4 or not isinstance(ans, int) or not 0 <= ans < 4:
+            continue
+        correct = opts[ans]
+        random.shuffle(opts)
+        out.append({"q": q, "options": opts, "correct": opts.index(correct),
+                    "fact": str(item.get("fact") or "").strip()})
+    if len(out) < 3:
+        raise ValueError("ИИ вернул слишком мало вопросов")
+    return out[:5]
+
+
+def parse_words(raw):
+    data = extract_json(raw)
+    if isinstance(data, dict):
+        data = data.get("words") or data.get("items") or []
+    out = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        word = str(item.get("word") or "").strip()
+        hints = [str(h).strip() for h in (item.get("hints") or []) if str(h).strip()][:3]
+        if not word or len(hints) < 3:
+            continue
+        if any(norm_answer(word) in norm_answer(h) for h in hints):
+            continue  # подсказка не должна содержать само слово
+        out.append({"word": word, "hints": hints})
+    if len(out) < 3:
+        raise ValueError("ИИ вернул слишком мало слов")
+    return out[:5]
+
+
+def parse_td(raw):
+    data = extract_json(raw)
+    if not isinstance(data, dict):
+        raise ValueError("неверный формат")
+    truth = [str(x).strip() for x in (data.get("truth") or []) if str(x).strip()]
+    dare = [str(x).strip() for x in (data.get("dare") or []) if str(x).strip()]
+    if len(truth) < 3 or len(dare) < 3:
+        raise ValueError("ИИ вернул слишком мало заданий")
+    return {"truth": truth, "dare": dare}
+
+
+def quiz_text(st, picked=None, reveal=False):
+    i = st["i"]
+    q = st["qs"][i]
+    lines = [f"🧠 <b>Вопрос {i + 1}/{len(st['qs'])}</b> · {esc(st['topic'])}",
+             "─────────────", esc(q["q"]), ""]
+    for k, o in enumerate(q["options"]):
+        mark = ""
+        if reveal:
+            if k == q["correct"]:
+                mark = " ✅"
+            elif k == picked:
+                mark = " ❌"
+        lines.append(f"<b>{'ABCD'[k]}.</b> {esc(o)}{mark}")
+    if reveal and q["fact"]:
+        lines += ["", f"💡 <i>{esc(q['fact'])}</i>"]
+    return "\n".join(lines)
+
+
+def words_text(st):
+    w = st["words"][st["i"]]
+    hints = "\n".join(f"{k + 1}. {esc(h)}" for k, h in enumerate(w["hints"][:st["hints"]]))
+    return (f"🔤 <b>Слово {st['i'] + 1}/{len(st['words'])}</b> · очки: <b>{st['score']}</b>\n"
+            "─────────────\n"
+            f"Букв в слове: <b>{len(w['word'])}</b>\n\n"
+            f"<b>Подсказки:</b>\n{hints}\n\n"
+            "<i>Напишите ответ сообщением. Меньше подсказок — больше очков (3 → 1).</i>")
+# </pure>
+
+
+def ag_back_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Игры", callback_data="ag:menu")]
+    ])
+
+
+def ag_menu_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🧠 Викторина", callback_data="ag:qz")],
+        [InlineKeyboardButton(text="🔤 Угадай слово по подсказкам", callback_data="ag:gw")],
+        [InlineKeyboardButton(text="🎭 Правда или действие", callback_data="ag:td")],
+        back_button(),
+    ])
+
+
+async def ag_edit(call, text, kb=None):
+    try:
+        await call.message.edit_text(text, reply_markup=kb)
+    except TelegramBadRequest:
+        try:
+            await call.message.answer(text, reply_markup=kb)
+        except Exception:
+            pass
+
+
+async def ag_send(target, text, kb=None):
+    if isinstance(target, CallbackQuery):
+        await ag_edit(target, text, kb)
+    else:
+        await target.answer(text, reply_markup=kb)
+
+
+async def ag_notify(target, text):
+    msg = target.message if isinstance(target, CallbackQuery) else target
+    try:
+        await msg.answer(text, reply_markup=ag_back_kb())
+    except Exception:
+        pass
+
+
+async def ag_quota_error(user_id):
+    ok, seconds = await check_cooldown(user_id)
+    if not ok:
+        return f"⏱ Подождите {seconds} сек. перед новым раундом."
+    can, used, limit, _ = await check_limit(user_id)
+    if not can:
+        return f"⚠️ Лимит ИИ исчерпан ({used}/{limit}). Один раунд = 1 запрос. Premium: /start → 💎 Premium"
+    return None
+
+
+async def ag_generate(target, user_id, prompt, parser, fail_text):
+    """Один запрос к ИИ на раунд. Квота списывается только при успехе."""
+    err = await ag_quota_error(user_id)
+    if err:
+        await ag_notify(target, err)
+        return None
+    try:
+        data = parser(await ask_ai(prompt, system_prompt=GAME_SYSTEM))
+    except Exception as e:
+        log.warning("game generation failed: %s", e)
+        await ag_notify(target, fail_text)
+        return None
+    await increment_usage(user_id)
+    return data
+
+
+async def start_quiz(target, user_id, topic):
+    err = await ag_quota_error(user_id)
+    if err:
+        await ag_notify(target, err)
+        return
+    await ag_send(target, f"🧠 <b>Викторина</b> · {esc(topic)}\n\n<i>ИИ придумывает вопросы…</i>")
+    prompt = (
+        f"Придумай 5 вопросов викторины на тему «{topic}». Уровень средний, вопросы интересные, "
+        "ответ однозначный и проверяемый. Верни JSON-массив из 5 объектов вида "
+        '{"q": "вопрос", "options": ["вариант1", "вариант2", "вариант3", "вариант4"], '
+        '"answer": индекс правильного варианта от 0 до 3, "fact": "короткий интересный факт"}. '
+        f"Язык: русский. Случайное число для разнообразия: {random.randint(1, 10**6)}."
+    )
+    qs = await ag_generate(target, user_id, prompt, parse_quiz,
+                           "⚠️ Не удалось получить вопросы. Попробуйте ещё раз.")
+    if not qs:
+        return
+    st = {"kind": "qz", "topic": topic, "qs": qs, "i": 0, "score": 0, "answered": False}
+    ai_games[user_id] = st
+    await ag_send(target, quiz_text(st), quiz_kb())
+
+
+def quiz_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=l, callback_data=f"ag:qza:{k}") for k, l in enumerate("ABCD")],
+        [InlineKeyboardButton(text="🛑 Закончить", callback_data="ag:menu")],
+    ])
+
+
+def words_kb(st):
+    rows = []
+    if st["hints"] < 3:
+        rows.append([InlineKeyboardButton(text="💡 Ещё подсказка", callback_data="ag:gwh")])
+    rows.append([InlineKeyboardButton(text="🏳️ Сдаюсь", callback_data="ag:gwg")])
+    rows.append([InlineKeyboardButton(text="🛑 Выйти", callback_data="ag:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def td_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🗣 Правда", callback_data="ag:tdp:truth"),
+         InlineKeyboardButton(text="🎬 Действие", callback_data="ag:tdp:dare")],
+        [InlineKeyboardButton(text="⬅️ Игры", callback_data="ag:menu")],
+    ])
+
+
+async def start_words(target, user_id):
+    err = await ag_quota_error(user_id)
+    if err:
+        await ag_notify(target, err)
+        return
+    await ag_send(target, "🔤 <b>Угадай слово</b>\n\n<i>ИИ загадывает слова…</i>")
+    prompt = (
+        "Загадай 5 разных слов (существительные, известные большинству людей). Для каждого дай 3 подсказки "
+        "от сложной к простой, не содержащие само слово и однокоренные слова. Верни JSON-массив объектов "
+        '{"word": "слово", "hints": ["подсказка1", "подсказка2", "подсказка3"]}. '
+        f"Язык: русский. Случайное число для разнообразия: {random.randint(1, 10**6)}."
+    )
+    words = await ag_generate(target, user_id, prompt, parse_words,
+                              "⚠️ Не удалось загрузить слова. Попробуйте ещё раз.")
+    if not words:
+        return
+    st = {"kind": "gw", "words": words, "i": 0, "score": 0, "hints": 1, "waiting": True}
+    ai_games[user_id] = st
+    await ag_send(target, words_text(st), words_kb(st))
+
+
+async def gw_answer(message, user_id, guess):
+    st = ai_games.get(user_id)
+    if not st or st.get("kind") != "gw" or not st.get("waiting"):
+        return
+    w = st["words"][st["i"]]
+    if not is_close_answer(guess, w["word"]):
+        await message.answer("❌ Не то. Попробуйте ещё или возьмите подсказку.")
+        return
+    pts = max(1, 4 - st["hints"])
+    st["score"] += pts
+    st["waiting"] = False
+    last = st["i"] + 1 >= len(st["words"])
+    await message.answer(
+        f"✅ <b>Верно!</b> Это «{esc(w['word'])}». +{pts} очк.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+            text="🏁 Итоги" if last else "➡️ Дальше", callback_data="ag:gwn")]])
+    )
+
+
+async def start_td(target, user_id):
+    await ag_send(target, "🎭 <b>Правда или действие</b>\n\n<i>ИИ готовит задания…</i>")
+    data = await td_generate(target, user_id)
+    if not data:
+        return
+    ai_games[user_id] = {"kind": "td", "truth": data["truth"], "dare": data["dare"]}
+    await ag_send(target, "🎭 <b>Правда или действие</b>\n─────────────\nВыбирайте:", td_kb())
+
+
+async def td_generate(target, user_id):
+    prompt = (
+        "Придумай 8 вопросов «Правда» и 8 заданий «Действие» для весёлой игры. Вопросы интересные и личные, "
+        "но не пошлые и не обидные. Задания безопасные, смешные, выполнимые дома или в переписке "
+        "(без опасных, неприличных или унизительных действий). Верни JSON "
+        '{"truth": ["..."], "dare": ["..."]}. '
+        f"Язык: русский. Случайное число для разнообразия: {random.randint(1, 10**6)}."
+    )
+    return await ag_generate(target, user_id, prompt, parse_td,
+                             "⚠️ Не удалось получить задания. Попробуйте ещё раз.")
+
+
+@router.callback_query(F.data.startswith("ag:"))
+async def cb_ag(call: CallbackQuery):
+    if not await require_sub(call):
+        return
+    await call.answer()
+    uid = call.from_user.id
+    parts = call.data.split(":")
+    act = parts[1] if len(parts) > 1 else ""
+    st = ai_games.get(uid)
+
+    if act == "menu":
+        ai_games.pop(uid, None)
+        await ag_edit(
+            call,
+            "🎮 <b>Игры с ИИ</b>\n─────────────\n"
+            "ИИ придумывает вопросы и задания, вы отвечаете один на один.\n"
+            "<i>Один раунд = 1 запрос к ИИ из дневного лимита.</i>",
+            ag_menu_kb()
+        )
+        return
+
+    if act == "qz":
+        names = list(QUIZ_TOPICS.items())
+        rows = []
+        for i in range(0, len(names), 2):
+            rows.append([InlineKeyboardButton(text=n, callback_data=f"ag:qzt:{k}") for k, n in names[i:i + 2]])
+        rows.append([InlineKeyboardButton(text="✏️ Своя тема", callback_data="ag:qzc")])
+        rows.append([InlineKeyboardButton(text="⬅️ Игры", callback_data="ag:menu")])
+        await ag_edit(call, "🧠 <b>Викторина</b>\n─────────────\nВыберите тему:",
+                      InlineKeyboardMarkup(inline_keyboard=rows))
+        return
+
+    if act == "qzt":
+        key = parts[2] if len(parts) > 2 else "general"
+        await start_quiz(call, uid, QUIZ_TOPICS.get(key, "Общие знания"))
+        return
+
+    if act == "qzc":
+        ai_games[uid] = {"kind": "qz_wait"}
+        await call.message.answer("✏️ Напишите тему викторины (до 60 символов).\nОтмена — /cancel")
+        return
+
+    if act == "qzr":
+        topic = st.get("topic") if st else None
+        await start_quiz(call, uid, topic or "Общие знания")
+        return
+
+    if act == "qza" and st and st.get("kind") == "qz" and not st["answered"]:
+        try:
+            picked = int(parts[2])
+        except (IndexError, ValueError):
+            return
+        st["answered"] = True
+        if picked == st["qs"][st["i"]]["correct"]:
+            st["score"] += 1
+        last = st["i"] + 1 >= len(st["qs"])
+        await ag_edit(
+            call, quiz_text(st, picked=picked, reveal=True),
+            InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+                text="🏁 Итоги" if last else "➡️ Дальше", callback_data="ag:qzn")]])
+        )
+        return
+
+    if act == "qzn" and st and st.get("kind") == "qz" and st["answered"]:
+        if st["i"] + 1 >= len(st["qs"]):
+            score, total = st["score"], len(st["qs"])
+            st["kind"] = "qz_done"
+            mood = "🏆 Идеально!" if score == total else ("👍 Неплохо!" if score >= 3 else "🙂 В следующий раз повезёт!")
+            await ag_edit(
+                call, f"🏁 <b>Итоги викторины</b>\n─────────────\nПравильных ответов: <b>{score}/{total}</b>\n{mood}",
+                InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="🔄 Новый раунд", callback_data="ag:qzr")],
+                    [InlineKeyboardButton(text="⬅️ Игры", callback_data="ag:menu")],
+                ])
+            )
+        else:
+            st["i"] += 1
+            st["answered"] = False
+            await ag_edit(call, quiz_text(st), quiz_kb())
+        return
+
+    if act == "gw" and len(parts) == 2:
+        await start_words(call, uid)
+        return
+
+    if act == "gwh" and st and st.get("kind") == "gw" and st.get("waiting"):
+        if st["hints"] < 3:
+            st["hints"] += 1
+        await ag_edit(call, words_text(st), words_kb(st))
+        return
+
+    if act == "gwg" and st and st.get("kind") == "gw" and st.get("waiting"):
+        st["waiting"] = False
+        last = st["i"] + 1 >= len(st["words"])
+        await ag_edit(
+            call, f"🏳️ Это было слово: <b>{esc(st['words'][st['i']]['word'])}</b>",
+            InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+                text="🏁 Итоги" if last else "➡️ Дальше", callback_data="ag:gwn")]])
+        )
+        return
+
+    if act == "gwn" and st and st.get("kind") == "gw" and not st.get("waiting"):
+        if st["i"] + 1 >= len(st["words"]):
+            score = st["score"]
+            ai_games.pop(uid, None)
+            await ag_edit(
+                call, f"🏁 <b>Итоги</b>\n─────────────\nВы набрали <b>{score}</b> из 15 очков.",
+                InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="🔄 Новый раунд", callback_data="ag:gw")],
+                    [InlineKeyboardButton(text="⬅️ Игры", callback_data="ag:menu")],
+                ])
+            )
+        else:
+            st["i"] += 1
+            st["hints"] = 1
+            st["waiting"] = True
+            await ag_send(call.message, words_text(st), words_kb(st))
+        return
+
+    if act == "td" and len(parts) == 2:
+        await start_td(call, uid)
+        return
+
+    if act == "tdp" and st and st.get("kind") == "td":
+        key = parts[2] if len(parts) > 2 and parts[2] in ("truth", "dare") else "truth"
+        if not st[key]:
+            data = await td_generate(call, uid)
+            if not data:
+                return
+            st["truth"], st["dare"] = data["truth"], data["dare"]
+        item = st[key].pop(0)
+        title = "🗣 <b>Правда</b>" if key == "truth" else "🎬 <b>Действие</b>"
+        await ag_edit(call, f"{title}\n─────────────\n{esc(item)}", td_kb())
+        return
+
+    await ag_edit(call, "⌛ Игра устарела. Выберите заново:", ag_menu_kb())
+
+
+# ============================================================
 # ADMIN PANEL
 # ============================================================
 
@@ -2166,17 +2638,17 @@ async def cb_adm_stats(call: CallbackQuery):
     stars_total = await db_fetchval("SELECT COALESCE(SUM(stars),0) FROM payments_log", default=0)
     purchases = await db_fetchval("SELECT COUNT(*) FROM payments_log", default=0)
     text = (
-        "📊 <b>Статистика</b>\n─────────────\n"
+        "<tg-emoji emoji-id='5445265116754897405'>📊</tg-emoji> <b>Статистика</b>\n─────────────\n"
         f"👤 Юзеров: <b>{users_total}</b>\n"
         f"  · за 24ч: {users_24h}\n"
         f"  · за 7д: {users_7d}\n"
         f"  · в бане: {users_banned}\n"
-        f"🔗 Бизнес-коннектов: <b>{conns}</b>\n"
-        f"💎 Premium активных: <b>{premium_active}</b>\n\n"
-        f"💬 Чатов: <b>{chats}</b>\n"
-        f"📝 Сообщений: <b>{msgs}</b>\n"
-        f"🔇 Мутов: <b>{mutes}</b>\n\n"
-        f"🎁 Рефералов всего: <b>{refs_total}</b>\n"
+        f"<tg-emoji emoji-id='5445354937405958522'>🔗</tg-emoji> Бизнес-коннектов: <b>{conns}</b>\n"
+        f"<tg-emoji emoji-id='5445223416917422632'>💎</tg-emoji> Premium активных: <b>{premium_active}</b>\n\n"
+        f"<tg-emoji emoji-id='5444921463536641665'>💬</tg-emoji> Чатов: <b>{chats}</b>\n"
+        f"<tg-emoji emoji-id='5447635509205559163'>📝</tg-emoji> Сообщений: <b>{msgs}</b>\n"
+        f"<tg-emoji emoji-id='5445267294303314527'>🔇</tg-emoji> Мутов: <b>{mutes}</b>\n\n"
+        f"<tg-emoji emoji-id='5445223416917422632'>🎁</tg-emoji> Рефералов всего: <b>{refs_total}</b>\n"
         f"  · за 7д: {refs_week}\n\n"
         f"💰 Продаж Premium: <b>{purchases}</b>\n"
         f"⭐ Звёзд всего: <b>{stars_total}</b>"
@@ -2201,7 +2673,7 @@ async def cb_adm_refs(call: CallbackQuery):
     lines_all = [f"{i}. <b>{esc(name)}</b> — {cnt}" for i, (uid, name, cnt) in enumerate(top_all, 1)]
     lines_week = [f"{i}. <b>{esc(name)}</b> — {cnt}" for i, (uid, name, cnt) in enumerate(top_week, 1)]
     text = (
-        "🎁 <b>Рефералы</b>\n─────────────\n<b>За всё время:</b>\n"
+        "<tg-emoji emoji-id='5445223416917422632'>🎁</tg-emoji> <b>Рефералы</b>\n─────────────\n<b>За всё время:</b>\n"
         + ("\n".join(lines_all) if lines_all else "<i>пусто</i>")
         + "\n\n<b>За эту неделю:</b>\n"
         + ("\n".join(lines_week) if lines_week else "<i>пусто</i>")
@@ -2252,7 +2724,7 @@ async def cb_adm_users(call: CallbackQuery):
             d = datetime.fromisoformat(u["joined_at"]).astimezone().strftime("%d.%m")
         except Exception:
             d = "?"
-        flag = "🚫" if u["is_banned"] else ""
+        flag = "<tg-emoji emoji-id='5445267294303314527'>🚫</tg-emoji>" if u["is_banned"] else ""
         lines.append(f"• <b>{esc(name)}</b> <code>{u['user_id']}</code> {d} {flag}")
     text = "👥 <b>Последние 20 юзеров</b>\n─────────────\n" + ("\n".join(lines) if lines else "<i>пусто</i>")
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -2301,14 +2773,14 @@ async def show_user_card(chat_target, uid):
         joined = "—"
     text = (
         f"👤 <b>Карточка</b>\n─────────────\n"
-        f"📛 <b>{esc(name)}</b>\n"
+        f"<tg-emoji emoji-id='5445265116754897405'>📛</tg-emoji> <b>{esc(name)}</b>\n"
         f"🆔 <code>{uid}</code>\n"
         f"📅 Регистрация: {esc(joined)}\n"
-        f"💎 Premium: {'✅' if premium else '❌'}\n"
-        f"🎁 Рефералов: <b>{refs}</b>\n"
-        f"📝 Сообщений: <b>{msgs}</b>\n"
-        f"🚫 Бан: {'✅' if u['is_banned'] else '❌'}\n"
-        f"🔗 Реф-бан: {'✅' if u['banned_ref'] else '❌'}\n\n"
+        f"<tg-emoji emoji-id='5445223416917422632'>💎</tg-emoji> Premium: {'✅' if premium else '❌'}\n"
+        f"<tg-emoji emoji-id='5445223416917422632'>🎁</tg-emoji> Рефералов: <b>{refs}</b>\n"
+        f"<tg-emoji emoji-id='5447635509205559163'>📝</tg-emoji> Сообщений: <b>{msgs}</b>\n"
+        f"<tg-emoji emoji-id='5445267294303314527'>🚫</tg-emoji> Бан: {'✅' if u['is_banned'] else '❌'}\n"
+        f"<tg-emoji emoji-id='5445354937405958522'>🔗</tg-emoji> Реф-бан: {'✅' if u['banned_ref'] else '❌'}\n\n"
         f"🎰 <b>Рулетка:</b>\n"
         f"  · Последний спин: {esc(last_spin_str)}\n"
         f"  · Доп. попыток: <b>{extra_spins}</b>"
@@ -2364,14 +2836,14 @@ async def cb_adm_user_card(call: CallbackQuery):
         joined = "—"
     text = (
         f"👤 <b>Карточка</b>\n─────────────\n"
-        f"📛 <b>{esc(name)}</b>\n"
+        f"<tg-emoji emoji-id='5445265116754897405'>📛</tg-emoji> <b>{esc(name)}</b>\n"
         f"🆔 <code>{uid}</code>\n"
         f"📅 Регистрация: {esc(joined)}\n"
-        f"💎 Premium: {'✅' if premium else '❌'}\n"
-        f"🎁 Рефералов: <b>{refs}</b>\n"
-        f"📝 Сообщений: <b>{msgs}</b>\n"
-        f"🚫 Бан: {'✅' if u['is_banned'] else '❌'}\n"
-        f"🔗 Реф-бан: {'✅' if u['banned_ref'] else '❌'}\n\n"
+        f"<tg-emoji emoji-id='5445223416917422632'>💎</tg-emoji> Premium: {'✅' if premium else '❌'}\n"
+        f"<tg-emoji emoji-id='5445223416917422632'>🎁</tg-emoji> Рефералов: <b>{refs}</b>\n"
+        f"<tg-emoji emoji-id='5447635509205559163'>📝</tg-emoji> Сообщений: <b>{msgs}</b>\n"
+        f"<tg-emoji emoji-id='5445267294303314527'>🚫</tg-emoji> Бан: {'✅' if u['is_banned'] else '❌'}\n"
+        f"<tg-emoji emoji-id='5445354937405958522'>🔗</tg-emoji> Реф-бан: {'✅' if u['banned_ref'] else '❌'}\n\n"
         f"🎰 <b>Рулетка:</b>\n"
         f"  · Последний спин: {esc(last_spin_str)}\n"
         f"  · Доп. попыток: <b>{extra_spins}</b>"
@@ -2436,9 +2908,9 @@ async def cb_adm_grant(call: CallbackQuery):
         back_button(f"adm:user_card:{uid}"),
     ])
     try:
-        await call.message.edit_text(f"💎 Выдать Premium <code>{uid}</code> на:", reply_markup=kb)
+        await call.message.edit_text(f"<tg-emoji emoji-id='5445223416917422632'>💎</tg-emoji> Выдать Premium <code>{uid}</code> на:", reply_markup=kb)
     except TelegramBadRequest:
-        await call.message.answer(f"💎 Выдать Premium <code>{uid}</code> на:", reply_markup=kb)
+        await call.message.answer(f"<tg-emoji emoji-id='5445223416917422632'>💎</tg-emoji> Выдать Premium <code>{uid}</code> на:", reply_markup=kb)
     await call.answer()
 
 
@@ -2455,7 +2927,7 @@ async def cb_adm_grant_do(call: CallbackQuery):
     try:
         await bot_ref.send_message(
             uid,
-            f"💎 <b>Вам выдан Premium!</b>\n"
+            f"<tg-emoji emoji-id='5445223416917422632'>💎</tg-emoji> <b>Вам выдан Premium!</b>\n"
             f"Срок: {days} дней\n"
             f"До: <b>{until.astimezone().strftime('%d.%m.%Y %H:%M')}</b>"
         )
@@ -2545,14 +3017,14 @@ async def cb_adm_bans(call: CallbackQuery):
         u = row_to_dict(row, USERS_COLS)
         name = u["username"] or u["first_name"] or f"id{u['user_id']}"
         reason = u["banned_reason"] or "—"
-        lines.append(f"🚫 <b>{esc(name)}</b> <code>{u['user_id']}</code>\n<i>{esc(reason)[:60]}</i>")
+        lines.append(f"<tg-emoji emoji-id='5445267294303314527'>🚫</tg-emoji> <b>{esc(name)}</b> <code>{u['user_id']}</code>\n<i>{esc(reason)[:60]}</i>")
     ref_lines = []
     for row in ref_rows:
         u = row_to_dict(row, USERS_COLS)
         name = u["username"] or u["first_name"] or f"id{u['user_id']}"
         ref_lines.append(f"🔒 <b>{esc(name)}</b> <code>{u['user_id']}</code>")
     text = (
-        "🚫 <b>Баны</b>\n─────────────\n<b>Юзеры:</b>\n"
+        "<tg-emoji emoji-id='5445267294303314527'>🚫</tg-emoji> <b>Баны</b>\n─────────────\n<b>Юзеры:</b>\n"
         + ("\n".join(lines) if lines else "<i>пусто</i>")
         + "\n\n<b>Реф-ссылки:</b>\n"
         + ("\n".join(ref_lines) if ref_lines else "<i>пусто</i>")
@@ -2575,11 +3047,11 @@ async def cb_adm_sys(call: CallbackQuery):
     users_total = await db_fetchval("SELECT COUNT(*) FROM users", default=0)
     msgs = await db_fetchval("SELECT COUNT(*) FROM messages", default=0)
     text = (
-        "⚙️ <b>Система</b>\n─────────────\n"
-        f"💾 БД: <b>Turso Cloud</b>\n"
-        f"🌐 URL: <code>{esc(TURSO_URL[:40])}...</code>\n"
+        "<tg-emoji emoji-id='5445223416917422632'>⚙️</tg-emoji> <b>Система</b>\n─────────────\n"
+        f"<tg-emoji emoji-id='5445265116754897405'>💾</tg-emoji> БД: <b>Turso Cloud</b>\n"
+        f"<tg-emoji emoji-id='5444858026869679390'>🌐</tg-emoji> URL: <code>{esc(TURSO_URL[:40])}...</code>\n"
         f"👥 Юзеров: <b>{users_total}</b>\n"
-        f"📝 Сообщений: <b>{msgs}</b>"
+        f"<tg-emoji emoji-id='5447635509205559163'>📝</tg-emoji> Сообщений: <b>{msgs}</b>"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🧹 Очистить старые сообщения", callback_data="adm:cleanup")],
@@ -2609,7 +3081,7 @@ async def handle_admin_input(message: Message, action: str, value: str):
             try:
                 uid = int(value)
             except ValueError:
-                await message.answer("⚠️ Нужен числовой ID.")
+                await message.answer("<tg-emoji emoji-id='5445265116754897405'>⚠️</tg-emoji> Нужен числовой ID.")
                 return
             await show_user_card(message, uid)
             return
@@ -2657,7 +3129,7 @@ async def publish_weekly_top(manual=False):
     text = (
         "🏆 <b>Битва рефералов — итоги недели</b>\n─────────────\n\n"
         + "\n".join(lines)
-        + f"\n\n🎁 Победитель: <b>{esc(winner_name)}</b> — месяц Premium!"
+        + f"\n\n<tg-emoji emoji-id='5445223416917422632'>🎁</tg-emoji> Победитель: <b>{esc(winner_name)}</b> — месяц Premium!"
     )
     try:
         await bot_ref.send_message(f"@{CHANNEL_USERNAME}", text)
@@ -2887,7 +3359,7 @@ async def business_save(message: Message, bot: Bot):
     if not match:
         await bot.edit_message_text(
             chat_id=message.chat.id, message_id=message.message_id,
-            text="⚠️ Ответьте командой <code>.save</code> на сообщение со ссылкой.",
+            text="<tg-emoji emoji-id='5445265116754897405'>⚠️</tg-emoji> Ответьте командой <code>.save</code> на сообщение со ссылкой.",
             business_connection_id=message.business_connection_id
         )
         return
@@ -2895,7 +3367,7 @@ async def business_save(message: Message, bot: Bot):
     url = match.group(0).rstrip(".,)")
     await bot.edit_message_text(
         chat_id=message.chat.id, message_id=message.message_id,
-        text="📥 <i>Загружаю видео…</i>",
+        text="<tg-emoji emoji-id='5445265116754897405'>📥</tg-emoji> <i>Загружаю видео…</i>",
         business_connection_id=message.business_connection_id
     )
 
@@ -2907,7 +3379,7 @@ async def business_save(message: Message, bot: Bot):
         size_mb = os.path.getsize(filepath) / 1024 / 1024
         if size_mb > DOWNLOAD_MAX_MB:
             raise RuntimeError(f"Файл слишком большой ({size_mb:.1f} МБ)")
-        caption = f"🎬 <b>{esc(title) or 'Видео'}</b>"
+        caption = f"<tg-emoji emoji-id='5444858026869679390'>🎬</tg-emoji> <b>{esc(title) or 'Видео'}</b>"
         caption = with_watermark(caption, premium)
         await bot.send_video(
             chat_id=message.chat.id,
@@ -2926,7 +3398,7 @@ async def business_save(message: Message, bot: Bot):
         log.error("save failed: %s", e)
         await bot.edit_message_text(
             chat_id=message.chat.id, message_id=message.message_id,
-            text=f"⚠️ Не удалось загрузить: <code>{esc(str(e)[:200])}</code>",
+            text=f"<tg-emoji emoji-id='5445265116754897405'>⚠️</tg-emoji> Не удалось загрузить: <code>{esc(str(e)[:200])}</code>",
             business_connection_id=message.business_connection_id
         )
     finally:
@@ -2945,7 +3417,7 @@ async def business_anim(message: Message, bot: Bot):
     if not text:
         await bot.edit_message_text(
             chat_id=message.chat.id, message_id=message.message_id,
-            text="⚠️ Использование: <code>.anim текст</code>",
+            text="<tg-emoji emoji-id='5445265116754897405'>⚠️</tg-emoji> Использование: <code>.anim текст</code>",
             business_connection_id=message.business_connection_id
         )
         return
@@ -3028,9 +3500,9 @@ async def business_ai(message: Message, bot: Bot):
         ])
         await bot.edit_message_text(
             chat_id=chat_id, message_id=message.message_id,
-            text=(f"⚠️ <b>Лимит исчерпан</b>\n"
+            text=(f"<tg-emoji emoji-id='5445265116754897405'>⚠️</tg-emoji> <b>Лимит исчерпан</b>\n"
                   f"Использовано: <b>{used}/{limit}</b>\n\n"
-                  f"Оформить Premium: /start → 💎 Premium"),
+                  f"Оформить Premium: /start → <tg-emoji emoji-id='5445223416917422632'>💎</tg-emoji> Premium"),
             business_connection_id=bc, reply_markup=kb
         )
         return
@@ -3039,7 +3511,7 @@ async def business_ai(message: Message, bot: Bot):
     if not prompt:
         await bot.edit_message_text(
             chat_id=chat_id, message_id=message.message_id,
-            text=f"🤖 Использование: <code>.ai вопрос</code>\n"
+            text=f"<tg-emoji emoji-id='5445223416917422632'>🤖</tg-emoji> Использование: <code>.ai вопрос</code>\n"
                  f"Осталось запросов: <b>{limit - used}</b>",
             business_connection_id=bc
         )
@@ -3047,7 +3519,7 @@ async def business_ai(message: Message, bot: Bot):
 
     try:
         thinking = await bot.send_message(
-            chat_id=chat_id, text="🤖 <i>Обрабатываю запрос…</i>",
+            chat_id=chat_id, text="<tg-emoji emoji-id='5445223416917422632'>🤖</tg-emoji> <i>Обрабатываю запрос…</i>",
             business_connection_id=bc
         )
     except Exception as e:
@@ -3062,7 +3534,7 @@ async def business_ai(message: Message, bot: Bot):
     try:
         answer = await ask_ai(prompt, user_id=owner_uid)
         answer = answer[:4000]
-        text = f"🤖 {esc(answer)}"
+        text = f"<tg-emoji emoji-id='5445223416917422632'>🤖</tg-emoji> {esc(answer)}"
         text = with_watermark(text, premium)
         await bot.edit_message_text(
             chat_id=chat_id, message_id=thinking.message_id,
@@ -3074,7 +3546,7 @@ async def business_ai(message: Message, bot: Bot):
         try:
             await bot.edit_message_text(
                 chat_id=chat_id, message_id=thinking.message_id,
-                text=f"⚠️ Ошибка: <code>{esc(str(e)[:200])}</code>",
+                text=f"<tg-emoji emoji-id='5445265116754897405'>⚠️</tg-emoji> Ошибка: <code>{esc(str(e)[:200])}</code>",
                 business_connection_id=bc
             )
         except Exception:
@@ -3095,7 +3567,7 @@ async def business_qr(message: Message, bot: Bot):
     if not text:
         await bot.edit_message_text(
             chat_id=message.chat.id, message_id=message.message_id,
-            text="⚠️ Использование: <code>.qr текст или ссылка</code>",
+            text="<tg-emoji emoji-id='5445265116754897405'>⚠️</tg-emoji> Использование: <code>.qr текст или ссылка</code>",
             business_connection_id=bc
         )
         return
@@ -3104,7 +3576,7 @@ async def business_qr(message: Message, bot: Bot):
         buf = BytesIO()
         qrcode.make(text).save(buf, format="PNG")
         buf.seek(0)
-        caption = f"🔳 QR-код: <code>{esc(text[:200])}</code>"
+        caption = f"<tg-emoji emoji-id='5445265116754897405'>🔳</tg-emoji> QR-код: <code>{esc(text[:200])}</code>"
         caption = with_watermark(caption, premium)
         await bot.send_photo(
             chat_id=message.chat.id,
@@ -3119,15 +3591,261 @@ async def business_qr(message: Message, bot: Bot):
     except ImportError:
         await bot.edit_message_text(
             chat_id=message.chat.id, message_id=message.message_id,
-            text="⚠️ Требуется пакет <code>qrcode[pil]</code>.",
+            text="<tg-emoji emoji-id='5445265116754897405'>⚠️</tg-emoji> Требуется пакет <code>qrcode[pil]</code>.",
             business_connection_id=bc
         )
     except Exception as e:
         await bot.edit_message_text(
             chat_id=message.chat.id, message_id=message.message_id,
-            text=f"⚠️ Ошибка: <code>{esc(str(e)[:200])}</code>",
+            text=f"<tg-emoji emoji-id='5445265116754897405'>⚠️</tg-emoji> Ошибка: <code>{esc(str(e)[:200])}</code>",
             business_connection_id=bc
         )
+
+
+# ---------- .stt (расшифровка голосовых) ----------
+STT_MAX_MB = 20
+
+
+async def transcribe_audio(data: bytes, filename: str) -> str:
+    key = os.getenv("GROQ_API_KEY", "").strip()
+    if not key:
+        raise RuntimeError("Не задан GROQ_API_KEY")
+    async with httpx.AsyncClient(timeout=90) as client:
+        r = await client.post(
+            "https://api.groq.com/openai/v1/audio/transcriptions",
+            headers={"Authorization": f"Bearer {key}"},
+            files={"file": (filename, data)},
+            data={"model": "whisper-large-v3-turbo", "response_format": "json", "temperature": "0"},
+        )
+    if r.status_code != 200:
+        raise RuntimeError(f"Groq HTTP {r.status_code}: {r.text[:150]}")
+    return (r.json().get("text") or "").strip()
+
+
+@router.business_message(F.text.regexp(r"^\.stt\s*$"))
+async def business_stt(message: Message, bot: Bot):
+    owner_uid = await _check_owner_command(message)
+    if not owner_uid:
+        return
+    await save_business_message(message, owner_uid)
+
+    bc = message.business_connection_id
+    chat_id = message.chat.id
+
+    async def edit(text):
+        try:
+            await bot.edit_message_text(chat_id=chat_id, message_id=message.message_id,
+                                        text=text, business_connection_id=bc)
+        except Exception as e:
+            log.warning("stt edit: %s", e)
+
+    if not await is_premium(owner_uid):
+        await edit("<tg-emoji emoji-id='5445223416917422632'>💎</tg-emoji> Расшифровка голосовых доступна только с <b>Premium</b>. Оформить: /start → Premium")
+        return
+
+    r = message.reply_to_message
+    _, ctype, fid = message_payload(r) if r else ("", "", None)
+    if ctype not in ("voice", "video_note", "audio") or not fid:
+        await edit("<tg-emoji emoji-id='5445265116754897405'>⚠️</tg-emoji> Ответьте командой <code>.stt</code> на голосовое сообщение или кружок.")
+        return
+
+    ok, seconds = await check_cooldown(owner_uid)
+    if not ok:
+        await edit(f"⏱ <b>Подождите {seconds} сек.</b>")
+        return
+    can, used, limit, premium = await check_limit(owner_uid)
+    if not can:
+        await edit(f"<tg-emoji emoji-id='5445265116754897405'>⚠️</tg-emoji> <b>Лимит исчерпан</b> ({used}/{limit}). Premium: /start")
+        return
+
+    media = r.voice or r.video_note or r.audio
+    if media and getattr(media, "file_size", 0) and media.file_size > STT_MAX_MB * 1024 * 1024:
+        await edit(f"<tg-emoji emoji-id='5445265116754897405'>⚠️</tg-emoji> Файл слишком большой (макс. {STT_MAX_MB} МБ).")
+        return
+
+    await edit("🎙 <i>Расшифровываю…</i>")
+    try:
+        buf = BytesIO()
+        await bot.download(fid, destination=buf)
+        ext = "mp4" if ctype == "video_note" else "ogg"
+        text = await transcribe_audio(buf.getvalue(), f"voice.{ext}")
+        await increment_usage(owner_uid)
+        sender = r.from_user.full_name if r.from_user else "—"
+        if text:
+            result = (f"🎙 <b>Расшифровка</b> · {esc(sender)}\n─────────────\n{esc(text[:3800])}")
+        else:
+            result = f"🎙 <b>{esc(sender)}</b>: речь не распознана."
+        result = with_watermark(result, premium)
+        try:
+            await bot.send_message(owner_uid, result)
+            try:
+                await bot.delete_business_messages(business_connection_id=bc,
+                                                   message_ids=[message.message_id])
+            except Exception:
+                pass
+        except Exception:
+            await edit(result)
+    except Exception as e:
+        log.error("stt failed: %s", e)
+        await edit(f"<tg-emoji emoji-id='5445265116754897405'>⚠️</tg-emoji> Не удалось расшифровать: <code>{esc(str(e)[:200])}</code>")
+
+
+# ---------- .tr (перевод) ----------
+LANG_NAMES = {
+    "ru": "русский", "en": "английский", "de": "немецкий", "es": "испанский", "fr": "французский",
+    "it": "итальянский", "pt": "португальский", "tr": "турецкий", "uk": "украинский",
+    "pl": "польский", "zh": "китайский", "ja": "японский", "ko": "корейский",
+    "ar": "арабский", "kk": "казахский", "be": "белорусский", "fi": "финский",
+}
+TR_SYSTEM = (
+    "Ты профессиональный переводчик. Переводи точно, сохраняя тон и смысл. "
+    "Отвечай ТОЛЬКО переводом, без пояснений, кавычек и комментариев."
+)
+
+
+@router.business_message(F.text.regexp(r"^\.tr(\s+.+)?$"))
+async def business_tr(message: Message, bot: Bot):
+    owner_uid = await _check_owner_command(message)
+    if not owner_uid:
+        return
+    await save_business_message(message, owner_uid)
+
+    bc = message.business_connection_id
+    chat_id = message.chat.id
+
+    async def edit(text):
+        try:
+            await bot.edit_message_text(chat_id=chat_id, message_id=message.message_id,
+                                        text=text, business_connection_id=bc)
+        except Exception as e:
+            log.warning("tr edit: %s", e)
+
+    usage = ("<tg-emoji emoji-id='5445265116754897405'>⚠️</tg-emoji> Использование:\n"
+             "<code>.tr en привет</code> — заменит сообщение переводом\n"
+             "<code>.tr</code> или <code>.tr en</code> ответом на сообщение — перевод придёт вам в ЛС (по умолчанию на русский)")
+    raw = (message.text or "")[3:].strip()
+    reply = message.reply_to_message
+    if reply:
+        src = (reply.text or reply.caption or "").strip()
+        token = raw.split()[0].lower() if raw else "ru"
+        to_dm = True
+    else:
+        parts = raw.split(maxsplit=1)
+        if len(parts) < 2:
+            await edit(usage)
+            return
+        token, src, to_dm = parts[0].lower(), parts[1].strip(), False
+    if token in LANG_NAMES:
+        lang = LANG_NAMES[token]
+    elif token.isalpha() and len(token) <= 20:
+        lang = token
+    else:
+        await edit(usage)
+        return
+    if not src:
+        await edit("<tg-emoji emoji-id='5445265116754897405'>⚠️</tg-emoji> В сообщении нет текста для перевода.")
+        return
+
+    ok, seconds = await check_cooldown(owner_uid)
+    if not ok:
+        await edit(f"⏱ <b>Подождите {seconds} сек.</b>")
+        return
+    can, used, limit, premium = await check_limit(owner_uid)
+    if not can:
+        await edit(f"<tg-emoji emoji-id='5445265116754897405'>⚠️</tg-emoji> <b>Лимит исчерпан</b> ({used}/{limit}). Premium: /start")
+        return
+
+    if not to_dm:
+        await edit("<tg-emoji emoji-id='5444858026869679390'>🌐</tg-emoji> <i>Перевожу…</i>")
+    try:
+        translated = (await ask_ai(f"Переведи на язык: {lang}.\n\nТекст:\n{src[:3000]}",
+                                   system_prompt=TR_SYSTEM))[:3800]
+        await increment_usage(owner_uid)
+    except Exception as e:
+        log.error("tr failed: %s", e)
+        await edit(f"<tg-emoji emoji-id='5445265116754897405'>⚠️</tg-emoji> Ошибка перевода: <code>{esc(str(e)[:200])}</code>")
+        return
+
+    if to_dm:
+        sender = reply.from_user.full_name if reply.from_user else "—"
+        try:
+            await bot.send_message(
+                owner_uid,
+                f"<tg-emoji emoji-id='5444858026869679390'>🌐</tg-emoji> <b>Перевод → {esc(lang)}</b> · {esc(sender)}\n"
+                f"─────────────\n{esc(translated)}"
+            )
+            try:
+                await bot.delete_business_messages(business_connection_id=bc,
+                                                   message_ids=[message.message_id])
+            except Exception:
+                pass
+        except Exception:
+            await edit(esc(translated))
+    else:
+        await edit(with_watermark(esc(translated), premium))
+
+
+# ---------- .sticker ----------
+def _make_sticker_webp(data: bytes) -> bytes:
+    from PIL import Image
+    img = Image.open(BytesIO(data)).convert("RGBA")
+    w, h = img.size
+    scale = 512 / max(w, h)
+    img = img.resize((max(1, round(w * scale)), max(1, round(h * scale))), Image.LANCZOS)
+    quality = 90
+    while True:
+        out = BytesIO()
+        img.save(out, "WEBP", quality=quality)
+        if out.tell() <= 500 * 1024 or quality <= 40:
+            return out.getvalue()
+        quality -= 10
+
+
+@router.business_message(F.text.regexp(r"^\.(sticker|стикер)\s*$"))
+async def business_sticker(message: Message, bot: Bot):
+    owner_uid = await _check_owner_command(message)
+    if not owner_uid:
+        return
+    await save_business_message(message, owner_uid)
+
+    bc = message.business_connection_id
+    chat_id = message.chat.id
+
+    async def edit(text):
+        try:
+            await bot.edit_message_text(chat_id=chat_id, message_id=message.message_id,
+                                        text=text, business_connection_id=bc)
+        except Exception as e:
+            log.warning("sticker edit: %s", e)
+
+    r = message.reply_to_message
+    fid = None
+    if r and r.photo:
+        fid = r.photo[-1].file_id
+    elif r and r.document and (r.document.mime_type or "").startswith("image/"):
+        fid = r.document.file_id
+    if not fid:
+        await edit("<tg-emoji emoji-id='5445265116754897405'>⚠️</tg-emoji> Ответьте командой <code>.sticker</code> на фото или картинку.")
+        return
+    try:
+        buf = BytesIO()
+        await bot.download(fid, destination=buf)
+        webp = await asyncio.to_thread(_make_sticker_webp, buf.getvalue())
+        await bot.send_sticker(
+            chat_id=chat_id,
+            sticker=BufferedInputFile(webp, filename="sticker.webp"),
+            business_connection_id=bc
+        )
+        try:
+            await bot.delete_business_messages(business_connection_id=bc,
+                                               message_ids=[message.message_id])
+        except Exception:
+            pass
+    except ImportError:
+        await edit("<tg-emoji emoji-id='5445265116754897405'>⚠️</tg-emoji> Нужен пакет <code>Pillow</code>.")
+    except Exception as e:
+        log.error("sticker failed: %s", e)
+        await edit(f"<tg-emoji emoji-id='5445265116754897405'>⚠️</tg-emoji> Не удалось: <code>{esc(str(e)[:200])}</code>")
 
 
 # ---------- Остальные команды ----------
@@ -3159,12 +3877,15 @@ async def business_commands(message: Message, bot: Bot):
     try:
         if cmd == ".help":
             await edit(
-                "🤖 <b>BobMod команды</b>\n"
+                "<tg-emoji emoji-id='5445223416917422632'>🤖</tg-emoji> <b>BobMod команды</b>\n"
                 "─────────────\n"
                 "<code>.ai вопрос</code> · запрос к ИИ\n"
                 "<code>.save</code> (ответом) · загрузка видео\n"
                 "<code>.anim текст</code> · анимация\n"
                 "<code>.qr текст</code> · QR-код\n"
+                "<code>.stt</code> (ответом) · расшифровка голосового (💎 Premium)\n"
+                "<code>.tr en текст</code> · перевод\n"
+                "<code>.sticker</code> (ответом на фото) · стикер\n"
                 "<code>.whois</code> · инфо о собеседнике\n"
                 "<code>.typing</code> · показать «печатает»\n"
                 "<code>.nomute</code> · анти-мут\n"
@@ -3177,7 +3898,7 @@ async def business_commands(message: Message, bot: Bot):
             await edit(
                 f"🆔 ID чата: <code>{chat_id}</code>\n"
                 f"👤 Ваш ID: <code>{message.from_user.id}</code>\n"
-                f"🔗 Соединение: <code>{esc(bc)}</code>"
+                f"<tg-emoji emoji-id='5445354937405958522'>🔗</tg-emoji> Соединение: <code>{esc(bc)}</code>"
             )
         elif cmd == ".whois":
             row = await db_fetchone(
@@ -3215,11 +3936,11 @@ async def business_commands(message: Message, bot: Bot):
                 await edit(
                     "👤 <b>Информация о собеседнике</b>\n"
                     "─────────────\n"
-                    f"📛 Имя: <b>{esc(target_name)}</b>\n"
+                    f"<tg-emoji emoji-id='5445265116754897405'>📛</tg-emoji> Имя: <b>{esc(target_name)}</b>\n"
                     f"🆔 ID: <code>{target_uid}</code>\n"
-                    f"🔗 Username: {uname}\n"
+                    f"<tg-emoji emoji-id='5445354937405958522'>🔗</tg-emoji> Username: {uname}\n"
                     f"📅 Первый контакт: {esc(first_str)}\n"
-                    f"💬 Сообщений: <b>{msg_count}</b>"
+                    f"<tg-emoji emoji-id='5444921463536641665'>💬</tg-emoji> Сообщений: <b>{msg_count}</b>"
                 )
         elif cmd == ".typing":
             try:
@@ -3231,22 +3952,22 @@ async def business_commands(message: Message, bot: Bot):
             row = await db_fetchone("SELECT 1 FROM nomute_chats WHERE chat_id=?", (chat_id,))
             if row:
                 await db_execute("DELETE FROM nomute_chats WHERE chat_id=?", (chat_id,))
-                await edit("🔇 Анти-мут выключен")
+                await edit("<tg-emoji emoji-id='5445267294303314527'>🔇</tg-emoji> Анти-мут выключен")
             else:
                 await db_execute("INSERT INTO nomute_chats(chat_id, owner_id, created_at) VALUES(?,?,?)",
                                  (chat_id, owner_uid, utcnow().isoformat()))
-                await edit("🔊 Анти-мут включён. Я буду дублировать твои сообщения.")
+                await edit("<tg-emoji emoji-id='5444921463536641665'>🔊</tg-emoji> Анти-мут включён. Я буду дублировать твои сообщения.")
         elif cmd == ".note":
             if not arg:
                 row = await get_note(chat_id)
                 if row and row[0]:
-                    await edit(f"📝 {esc(row[0])}")
+                    await edit(f"<tg-emoji emoji-id='5447635509205559163'>📝</tg-emoji> {esc(row[0])}")
                 else:
-                    await edit("📝 Заметок нет.")
+                    await edit("<tg-emoji emoji-id='5447635509205559163'>📝</tg-emoji> Заметок нет.")
             else:
                 full_note = (arg + " " + arg2).strip() if arg2 else arg
                 await set_note(chat_id, full_note)
-                await edit(f"📝 Заметка сохранена: {esc(full_note)}")
+                await edit(f"<tg-emoji emoji-id='5447635509205559163'>📝</tg-emoji> Заметка сохранена: {esc(full_note)}")
         elif cmd.startswith(".mute"):
             tokens = (arg + " " + arg2).split()
             seconds = 60
@@ -3268,7 +3989,7 @@ async def business_commands(message: Message, bot: Bot):
                     (chat_id, owner_uid)
                 )
                 if not row:
-                    await edit("⚠️ Укажите ID: <code>.mute 60 123456</code>")
+                    await edit("<tg-emoji emoji-id='5445265116754897405'>⚠️</tg-emoji> Укажите ID: <code>.mute 60 123456</code>")
                     return
                 target = row[0]
 
@@ -3281,7 +4002,7 @@ async def business_commands(message: Message, bot: Bot):
                 "INSERT OR REPLACE INTO mutes(chat_id,target_user_id,mute_until) VALUES(?,?,?)",
                 (chat_id, target, until.isoformat())
             )
-            await edit(f"🔇 Пользователь заглушён на {seconds} сек.")
+            await edit(f"<tg-emoji emoji-id='5445267294303314527'>🔇</tg-emoji> Пользователь заглушён на {seconds} сек.")
         elif cmd == ".unmute":
             row = await db_fetchone(
                 "SELECT user_id FROM messages WHERE chat_id=? AND user_id IS NOT NULL "
@@ -3291,14 +4012,14 @@ async def business_commands(message: Message, bot: Bot):
             if row:
                 await db_execute("DELETE FROM mutes WHERE chat_id=? AND target_user_id=?",
                                  (chat_id, row[0]))
-            await edit("🔊 Мут снят")
+            await edit("<tg-emoji emoji-id='5444921463536641665'>🔊</tg-emoji> Мут снят")
         elif cmd == ".muted":
             rows = await db_fetchall(
                 "SELECT target_user_id, mute_until FROM mutes WHERE chat_id=? AND mute_until > ?",
                 (chat_id, utcnow().isoformat())
             )
             if not rows:
-                await edit("🔊 Активных мутов нет")
+                await edit("<tg-emoji emoji-id='5444921463536641665'>🔊</tg-emoji> Активных мутов нет")
             else:
                 lines = []
                 for uid, until in rows:
@@ -3307,7 +4028,7 @@ async def business_commands(message: Message, bot: Bot):
                     except Exception:
                         t = "—"
                     lines.append(f"• <code>{uid}</code> до {t}")
-                await edit("🔇 <b>Активные муты</b>\n" + "\n".join(lines))
+                await edit("<tg-emoji emoji-id='5445267294303314527'>🔇</tg-emoji> <b>Активные муты</b>\n" + "\n".join(lines))
         elif cmd == ".game":
             await edit(
                 "🎮 <b>Выберите игру</b>",
@@ -3428,7 +4149,7 @@ async def business_message_handler(message: Message, bot: Bot):
                 try:
                     notice = await bot.send_message(
                         chat_id=message.chat.id,
-                        text=f"🔇 <i>Вы в муте до {until.astimezone().strftime('%H:%M:%S')}</i>",
+                        text=f"<tg-emoji emoji-id='5445267294303314527'>🔇</tg-emoji> <i>Вы в муте до {until.astimezone().strftime('%H:%M:%S')}</i>",
                         business_connection_id=message.business_connection_id
                     )
                     async def _del():
@@ -3478,13 +4199,51 @@ async def business_message_handler(message: Message, bot: Bot):
 
     if s["forward_to_owner_enabled"]:
         try:
-            head = f"📥 <b>{esc(sender.full_name)}</b> <code>{sender.id}</code>"
+            head = f"<tg-emoji emoji-id='5445265116754897405'>📥</tg-emoji> <b>{esc(sender.full_name)}</b> <code>{sender.id}</code>"
             if message.text or message.caption:
                 await bot.send_message(owner_uid, f"{head}\n\n{esc(message.text or message.caption)}")
             else:
                 await bot.send_message(owner_uid, head)
         except Exception as e:
             log.info("forward: %s", e)
+
+
+# ---------- Изменённые сообщения ----------
+@router.edited_business_message()
+async def business_edited_handler(message: Message, bot: Bot):
+    owner_uid = await _resolve_owner(message)
+    if not owner_uid or not message.from_user:
+        return
+    old = await find_message(message.chat.id, message.message_id)
+    if not old:
+        await save_business_message(message, owner_uid)
+        return
+    new_text, _, fid = message_payload(message)
+    old_text = old["text"] or ""
+    if new_text == old_text:
+        return
+    await db_execute(
+        "UPDATE messages SET text=?, media_file_id=COALESCE(?, media_file_id) WHERE id=?",
+        (new_text, fid, old["id"])
+    )
+    if old["is_outgoing"]:
+        return
+    try:
+        stamp = datetime.fromisoformat(old["date"]).astimezone().strftime("%d.%m.%Y %H:%M:%S")
+    except Exception:
+        stamp = "—"
+    try:
+        await bot.send_message(
+            owner_uid,
+            "<tg-emoji emoji-id='5447635509205559163'>✏️</tg-emoji> <b>Сообщение изменено</b>\n"
+            "─────────────\n"
+            f"👤 От: <b>{esc(old['user_name'])}</b> <code>{old['user_id']}</code>\n"
+            f"🕐 Отправлено: {esc(stamp)}\n\n"
+            f"<b>Было:</b>\n{esc(old_text[:1500] or '—')}\n\n"
+            f"<b>Стало:</b>\n{esc(new_text[:1500] or '—')}"
+        )
+    except Exception as e:
+        log.warning("edited notify: %s", e)
 
 
 # ---------- Удалённые сообщения ----------
@@ -3516,12 +4275,12 @@ async def business_deleted_handler(event: BusinessMessagesDeleted, bot: Bot):
         except Exception:
             pass
         caption = (
-            "🗑 <b>Удалённое сообщение</b>\n"
+            "<tg-emoji emoji-id='5445267294303314527'>🗑</tg-emoji> <b>Удалённое сообщение</b>\n"
             "─────────────\n"
-            f"💬 Чат: <code>{event.chat.id}</code>\n"
+            f"<tg-emoji emoji-id='5444921463536641665'>💬</tg-emoji> Чат: <code>{event.chat.id}</code>\n"
             f"👤 От: <b>{esc(row['user_name'])}</b> <code>{row['user_id']}</code>\n"
             f"🕐 Время: {esc(stamp)}\n"
-            f"📎 Тип: <i>{esc(row['content_type'])}</i>\n\n"
+            f"<tg-emoji emoji-id='5445354937405958522'>📎</tg-emoji> Тип: <i>{esc(row['content_type'])}</i>\n\n"
             f"{esc(row['text'] or '—')}"
         )
         try:
@@ -3656,7 +4415,7 @@ async def ttt_move(call: CallbackQuery):
         await call.message.edit_text(f"🏆 Победили <b>{winner}</b>!", reply_markup=None)
     elif all(b):
         game["ended"] = True
-        await call.message.edit_text("🤝 Ничья!", reply_markup=None)
+        await call.message.edit_text("<tg-emoji emoji-id='5445324421663320898'>🤝</tg-emoji> Ничья!", reply_markup=None)
     else:
         game["turn"] = "⭕" if game["turn"] == "❌" else "❌"
         await render_ttt(call.message, chat_id, mid)
